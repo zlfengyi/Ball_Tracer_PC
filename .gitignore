@@ -1,0 +1,56 @@
+# ============================================================
+# Ball Tracer PC — .gitignore
+# ============================================================
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+.venv/
+venv/
+env/
+
+# ── IDE ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS ──
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ── 大型二进制 / SDK ──
+SDK_Development/
+yolo_model/*.engine
+yolo_model/*.engine.bak
+yolo_model/*.onnx
+yolo_model/*.pt
+
+# ── 标定图片（40GB+） ──
+calibration/images/
+
+# ── 运行输出（视频、JSON 日志） ──
+tracker_output/
+capture_test_output/
+test_car_output/
+test_trinocular_output/
+benchmark_frames/
+benchmark_results/
+curve3_output/
+
+# ── 历史遗留 ──
+benchmark_reports_legacy/
+
+# ── 测试图片 ──
+yolo_test_imgs/
+
+# ── Claude Code 临时文件 ──
+.claude/
