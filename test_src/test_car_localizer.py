@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-车辆 AprilTag 3D 定位测试。
+车辆 AprilTag 3D 实时定位测试（三目）。
 
-从双目相机采集同步图片，检测 AprilTag，三角测量得到 3D 位置，
-打印结果并保存标注图片。
+从三目相机持续采集同步图片，检测 AprilTag，三角测量得到 3D 位置，
+实时打印结果。Ctrl+C 停止。
 
 用法：
-  python test_src/test_car_localizer.py [--count 10] [--interval 0.5]
-                                         [--output test_car_output]
+  python test_src/test_car_localizer.py
+  python test_src/test_car_localizer.py --exposure 10000 --gain 25
 """
 
 import argparse
@@ -23,145 +23,88 @@ import cv2
 import numpy as np
 
 from src import SyncCapture, frame_to_numpy
-from src.car_localizer import CarLocalizer, CarDetection, CarLoc
-
-
-def draw_apriltag(
-    image: np.ndarray,
-    det: CarDetection,
-    color: tuple[int, int, int] = (0, 255, 0),
-) -> None:
-    """在图像上绘制 AprilTag 角点、中心和 ID。"""
-    corners = det.corners.astype(int)
-    # 画四边形
-    for i in range(4):
-        pt1 = tuple(corners[i])
-        pt2 = tuple(corners[(i + 1) % 4])
-        cv2.line(image, pt1, pt2, color, 2)
-    # 画中心
-    cx, cy = int(det.cx), int(det.cy)
-    cv2.circle(image, (cx, cy), 5, (0, 0, 255), -1)
-    # 标 ID
-    cv2.putText(
-        image, f"id={det.tag_id}",
-        (cx + 10, cy - 10),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2,
-    )
+from src.car_localizer import CarLocalizer, CarLoc
 
 
 def main():
-    parser = argparse.ArgumentParser(description="车辆 AprilTag 3D 定位测试")
-    parser.add_argument("--count", type=int, default=10, help="采集帧数 (默认 10)")
-    parser.add_argument("--interval", type=float, default=0.5, help="采集间隔秒 (默认 0.5)")
-    parser.add_argument("--output", type=str, default="test_car_output", help="输出目录")
-    parser.add_argument("--exposure", type=float, default=24000.0,
-                        help="曝光时间 μs (默认 24000，比球追踪的 1800 亮很多)")
-    parser.add_argument("--gain", type=float, default=10.0,
-                        help="增益 dB (默认 10)")
+    parser = argparse.ArgumentParser(description="车辆 AprilTag 3D 实时定位（三目）")
+    parser.add_argument("--exposure", type=float, default=0,
+                        help="曝光时间 μs (默认 0=使用 camera.json)")
+    parser.add_argument("--gain", type=float, default=-1,
+                        help="增益 dB (默认 -1=使用 camera.json)")
     args = parser.parse_args()
 
-    output_dir = _PROJECT_ROOT / args.output
-    output_dir.mkdir(parents=True, exist_ok=True)
-
     print("=" * 60)
-    print("Step 6.2 — 车辆 AprilTag 3D 定位测试")
+    print("  DEV 10 — 三目车辆 AprilTag 实时定位")
     print("=" * 60)
 
-    print("\n[1/3] 初始化 CarLocalizer...")
+    print("\n[1/2] 初始化 CarLocalizer (multi_calib.json)...")
     localizer = CarLocalizer()
-    serial_left = localizer.serial_left
-    serial_right = localizer.serial_right
-    print(f"  左相机: {serial_left}, 右相机: {serial_right}")
+    print(f"  相机: {localizer.serials}")
 
-    print(f"[2/3] 打开同步相机 (曝光={args.exposure}μs, 增益={args.gain}dB)...")
-    with SyncCapture.from_config(exposure_us=args.exposure, gain_db=args.gain) as cap:
+    overrides = {}
+    if args.exposure > 0:
+        overrides["exposure_us"] = args.exposure
+    if args.gain >= 0:
+        overrides["gain_db"] = args.gain
+    print(f"[2/2] 打开同步相机 (曝光={args.exposure if args.exposure > 0 else 'default'}μs, "
+          f"增益={args.gain if args.gain >= 0 else 'default'}dB)...")
+    with SyncCapture.from_config(**overrides) as cap:
         sync_sns = cap.sync_serials
         print(f"  同步相机: {sync_sns}")
-
-        if serial_left not in sync_sns or serial_right not in sync_sns:
-            print(f"*** 错误: 标定相机 {serial_left}/{serial_right} "
-                  f"不在同步列表 {sync_sns} 中 ***")
-            return 1
-
         print("  等待稳定 (1s)...")
         time.sleep(1.0)
 
-        print(f"\n[3/3] 开始采集 {args.count} 帧 (间隔 {args.interval}s)...\n")
+        print(f"\n开始实时定位，Ctrl+C 停止...\n")
+        print(f"{'帧':>4s}  {'相机':>12s}  {'X':>8s}  {'Y':>8s}  {'Z':>8s}  "
+              f"{'误差':>6s}  {'延迟':>6s}")
+        print("-" * 65)
 
+        frame_count = 0
+        success_count = 0
         results: list[CarLoc] = []
-        last_img_left = None
-        last_img_right = None
-        last_det_left: list[CarDetection] = []
-        last_det_right: list[CarDetection] = []
 
-        for i in range(args.count):
-            frames = cap.get_frames(timeout_s=2.0)
-            if frames is None:
-                print(f"  [{i+1}/{args.count}] 超时")
-                continue
+        try:
+            while True:
+                frames = cap.get_frames(timeout_s=1.0)
+                if frames is None:
+                    continue
 
-            t_pc = time.perf_counter()
-            img_left = frame_to_numpy(frames[serial_left])
-            img_right = frame_to_numpy(frames[serial_right])
+                frame_count += 1
+                t_pc = time.perf_counter()
 
-            dets_left = localizer.detect(img_left)
-            dets_right = localizer.detect(img_right)
+                # 解码图像
+                images = {}
+                for sn, f in frames.items():
+                    if sn in localizer.serials:
+                        images[sn] = frame_to_numpy(f)
 
-            last_img_left = img_left
-            last_img_right = img_right
-            last_det_left = dets_left
-            last_det_right = dets_right
+                # 定位
+                t0 = time.perf_counter()
+                car_loc = localizer.locate(images, t=t_pc)
+                dt_ms = (time.perf_counter() - t0) * 1000
 
-            # 按 tag_id 匹配
-            ids_right = {d.tag_id: d for d in dets_right}
-            matched = False
-            for d1 in dets_left:
-                if d1.tag_id in ids_right:
-                    d2 = ids_right[d1.tag_id]
-                    car_loc = localizer.triangulate(d1, d2, t=t_pc)
+                if car_loc is not None:
+                    success_count += 1
                     results.append(car_loc)
-                    matched = True
+                    cams = "+".join(s[-3:] for s in car_loc.cameras_used)
                     print(
-                        f"  [{i+1}/{args.count}] tag={car_loc.tag_id}  "
-                        f"pos=({car_loc.x:.0f}, {car_loc.y:.0f}, {car_loc.z:.0f}) mm  "
-                        f"reproj={car_loc.reprojection_error:.1f}px"
+                        f"{frame_count:4d}  {cams:>12s}  "
+                        f"{car_loc.x:8.0f}  {car_loc.y:8.0f}  {car_loc.z:8.0f}  "
+                        f"{car_loc.reprojection_error:5.1f}px  "
+                        f"{dt_ms:5.1f}ms"
                     )
+                else:
+                    if frame_count % 30 == 0:
+                        print(f"{frame_count:4d}  {'---':>12s}  未检测到")
 
-            if not matched:
-                nl, nr = len(dets_left), len(dets_right)
-                ids_l = [d.tag_id for d in dets_left]
-                ids_r = [d.tag_id for d in dets_right]
-                print(
-                    f"  [{i+1}/{args.count}] 未匹配  "
-                    f"L={nl} {ids_l}  R={nr} {ids_r}"
-                )
-
-            if i < args.count - 1:
-                # 排空帧直到下次采集
-                t_next = time.monotonic() + args.interval
-                while time.monotonic() < t_next:
-                    cap.get_frames(timeout_s=0.05)
-                    time.sleep(0.01)
-
-    # ── 保存标注图片 ──
-    if last_img_left is not None:
-        annotated_left = last_img_left.copy()
-        annotated_right = last_img_right.copy()
-        for d in last_det_left:
-            draw_apriltag(annotated_left, d, (0, 255, 0))
-        for d in last_det_right:
-            draw_apriltag(annotated_right, d, (0, 165, 255))
-
-        stitched = np.hstack([annotated_left, annotated_right])
-        half = cv2.resize(stitched, (stitched.shape[1] // 2, stitched.shape[0] // 2))
-        save_path = output_dir / "car_detection.png"
-        cv2.imwrite(str(save_path), half)
-        print(f"\n标注图片已保存: {save_path}")
+        except KeyboardInterrupt:
+            print(f"\n\n停止。")
 
     # ── 统计 ──
     print(f"\n{'=' * 60}")
-    print(f"  总帧数:      {args.count}")
-    print(f"  成功定位:    {len(results)}")
+    print(f"  总帧数:   {frame_count}")
+    print(f"  成功定位: {success_count} ({100*success_count/max(frame_count,1):.0f}%)")
 
     if results:
         xs = np.array([r.x for r in results])
@@ -170,14 +113,19 @@ def main():
         errs = np.array([r.reprojection_error for r in results])
 
         print(f"\n  3D 坐标统计 (mm):")
-        print(f"    X: mean={xs.mean():.1f}  std={xs.std():.1f}  "
-              f"range=[{xs.min():.1f}, {xs.max():.1f}]")
-        print(f"    Y: mean={ys.mean():.1f}  std={ys.std():.1f}  "
-              f"range=[{ys.min():.1f}, {ys.max():.1f}]")
-        print(f"    Z: mean={zs.mean():.1f}  std={zs.std():.1f}  "
-              f"range=[{zs.min():.1f}, {zs.max():.1f}]")
-        print(f"    重投影误差: mean={errs.mean():.2f}px  "
-              f"max={errs.max():.2f}px")
+        print(f"    X: mean={xs.mean():.1f}  std={xs.std():.1f}")
+        print(f"    Y: mean={ys.mean():.1f}  std={ys.std():.1f}")
+        print(f"    Z: mean={zs.mean():.1f}  std={zs.std():.1f}")
+        print(f"    重投影误差: mean={errs.mean():.2f}px  max={errs.max():.2f}px")
+
+        # 统计每种相机组合出现频次
+        combo_count = {}
+        for r in results:
+            key = "+".join(sorted(r.cameras_used))
+            combo_count[key] = combo_count.get(key, 0) + 1
+        print(f"\n  相机组合:")
+        for combo, cnt in sorted(combo_count.items(), key=lambda x: -x[1]):
+            print(f"    {combo}: {cnt} 帧")
 
     print(f"{'=' * 60}")
     return 0

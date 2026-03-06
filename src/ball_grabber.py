@@ -128,8 +128,8 @@ class Frame:
     exposure_time: float = 0.0   # 曝光时间 μs（fExposureTime）
     lost_packet: int = 0         # 本帧丢包数（nLostPacket）
     arrival_mono: float = 0.0    # time.monotonic() 到达时刻
-    arrival_perf: float = 0.0    # time.perf_counter() 到达时刻（与 exposure_start_pc 同轴）
-    exposure_start_pc: float = 0.0  # 曝光开始时刻（PC perf_counter 时间轴，秒）
+    arrival_perf: float = 0.0    # time.time() 到达时刻（与 exposure_start_pc 同轴）
+    exposure_start_pc: float = 0.0  # 曝光开始时刻（PC epoch 时间轴，秒）
 
 
 # ───────────────── 时间校准 ─────────────────
@@ -141,11 +141,11 @@ _TICK_FREQ = 100_000_000
 
 def calibrate_time_offset(cam: Any) -> float:
     """
-    校准 PC 时间与相机设备时间的偏移量。
+    校准 PC epoch 时间与相机设备时间的偏移量。
 
     通过 GevTimestampControlLatch 锁存设备时间戳并与 PC 时间比对。
     返回 offset（秒），使得:
-        曝光时刻_PC = dev_timestamp / TICK_FREQ + offset
+        曝光时刻_epoch = dev_timestamp / TICK_FREQ + offset
 
     为减少网络延迟误差，取 3 次中往返最短的一次。
     """
@@ -155,9 +155,9 @@ def calibrate_time_offset(cam: Any) -> float:
     best_rtt = float("inf")
 
     for _ in range(3):
-        t_before = time.perf_counter()
+        t_before = time.time()
         cam.MV_CC_SetCommandValue("GevTimestampControlLatch")
-        t_after = time.perf_counter()
+        t_after = time.time()
 
         val = MVCC_INTVALUE_EX()
         ret = cam.MV_CC_GetIntValueEx("GevTimestampValue", val)
@@ -259,6 +259,7 @@ def open_camera(
     roi_offset_y: int = 0,
     roi_height: int = 0,
     roi_width: int = 0,
+    binning: int = 1,
     _st_dev_list=None,
 ) -> Any:
     """
@@ -314,7 +315,35 @@ def open_camera(
             except Exception:
                 pass
 
-        # ── 全画幅 ROI 重置 ──
+        # ── Binning（像素合并，降低分辨率但保持 FOV）──
+        # 必须在 full_frame 之前设置，因为 binning 会改变 WidthMax/HeightMax
+        if binning > 1:
+            # 先缩小 Width/Height 以免超出 binning 后的最大值
+            try:
+                cam.MV_CC_SetIntValue("OffsetX", 0)
+                cam.MV_CC_SetIntValue("OffsetY", 0)
+                cam.MV_CC_SetIntValue("Width", 16)
+                cam.MV_CC_SetIntValue("Height", 16)
+            except Exception:
+                pass
+            try:
+                cam.MV_CC_SetEnumValueByString("BinningHorizontalMode", "Average")
+            except Exception:
+                pass
+            try:
+                cam.MV_CC_SetEnumValueByString("BinningVerticalMode", "Average")
+            except Exception:
+                pass
+            try:
+                cam.MV_CC_SetIntValue("BinningHorizontal", binning)
+            except Exception:
+                pass
+            try:
+                cam.MV_CC_SetIntValue("BinningVertical", binning)
+            except Exception:
+                pass
+
+        # ── 全画幅 ROI 重置（binning 后的最大分辨率）──
         if full_frame:
             try:
                 cam.MV_CC_SetIntValue("OffsetX", 0)
@@ -457,7 +486,7 @@ class ImageGrabber(threading.Thread):
     """
     单相机抓取器：后台取流入队（最大 10 张），提供 get_frame() 取图出队。
 
-    自动校准 PC 与设备时钟偏移，每帧计算 exposure_start_pc（PC perf_counter 时间轴）。
+    自动校准 PC 与设备时钟偏移，每帧计算 exposure_start_pc（PC epoch 时间轴）。
     周期性校准在独立后台线程执行，不阻塞取帧热循环。
     """
 
@@ -473,7 +502,7 @@ class ImageGrabber(threading.Thread):
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._recalib_every = recalib_every
-        self._time_offset: float = 0.0       # PC perf_counter - dev_time（秒）
+        self._time_offset: float = 0.0       # PC epoch - dev_time（秒）
         self._calib_thread: Optional[threading.Thread] = None
 
     def run(self) -> None:
@@ -497,7 +526,7 @@ class ImageGrabber(threading.Thread):
 
             try:
                 arrival = time.monotonic()
-                arrival_pc = time.perf_counter()
+                arrival_pc = time.time()
                 info = st_frame.stFrameInfo
                 w = int(info.nExtendWidth) if info.nExtendWidth else int(info.nWidth)
                 h = int(info.nExtendHeight) if info.nExtendHeight else int(info.nHeight)
@@ -658,6 +687,7 @@ class SyncCapture:
                     roi_offset_y=params.get("roi_offset_y", 0),
                     roi_height=params.get("roi_height", 0),
                     roi_width=params.get("roi_width", 0),
+                    binning=params.get("binning", 1),
                     _st_dev_list=st_dev_list,
                 )
 

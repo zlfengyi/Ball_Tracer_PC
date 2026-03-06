@@ -3,21 +3,22 @@
 网球定位与实验视频保存 (DEVELOP_LIST 步骤 4.5)。
 
 完整管线流程：
-  1. SyncCapture 双目同步拍摄（硬件触发，30fps）
-  2. BallDetector YOLO 批量检测左右图像中的网球（全分辨率）
-  3. 若左右各检测到 1 个网球 → BallLocalizer.triangulate() 三角测量得到 3D 位置
-  4. 将 3D 位置送入 Curve3Tracker 进行轨迹追踪与击球点预测
-  5. 左右图像 + 检测/追踪结果 交给后台写入线程：
+  1. SyncCapture 三目同步拍摄（硬件触发，30fps）
+  2. TileManager 为每台相机选择 800x800 切片（跟踪/搜索模式）
+  3. BallDetector YOLO 批量检测切片中的网球
+  4. 若 ≥2 台相机各检测到 1 个网球 → BallLocalizer.triangulate() 多视图三角测量得到 3D 位置
+  5. 将 3D 位置送入 Curve3Tracker 进行轨迹追踪与击球点预测
+  6. 图像 + 检测/追踪结果 交给后台写入线程：
      - 缩小到半分辨率
-     - 标注（检测框、曝光时间、3D 坐标、curve3 状态）
+     - 标注（检测框、切片区域框、曝光时间、3D 坐标、curve3 状态）
      - VideoWriter 编码写入
      主线程不等待写入完成，立刻处理下一帧。
-  6. JSON 结果日志在结束后保存
+  7. JSON 结果日志在结束后保存
 
 性能设计：
-  - YOLO 推理在全分辨率图上运行，不降分辨率
+  - YOLO 推理在 800x800 切片上运行（跟踪模式：追踪球位置；搜索模式：轮询预定义区域）
   - 图像缩放、标注绘制、MJPG 编码全部在后台线程完成
-  - 主线程只做：取帧 → Bayer解码 → YOLO → 三角测量 → curve3 → 入队
+  - 主线程只做：取帧 → Bayer解码 → 分片 → YOLO → 三角测量 → curve3 → 入队
 
 用法：
   python run_tracker.py [--duration 60] [--no-video] [--output-dir tracker_output]
@@ -33,11 +34,14 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import math
 import queue
+import socket
+import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -56,6 +60,8 @@ from src import (
     BallDetection,
     BallLocalizer,
     Ball3D,
+    CarLocalizer,
+    CarLoc,
 )
 from src.curve3 import (
     BallObservation,
@@ -63,6 +69,7 @@ from src.curve3 import (
     TrackerState,
     TrackerResult,
 )
+from src.tile_manager import TileManager, TileRect
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -70,10 +77,13 @@ from src.curve3 import (
 # ══════════════════════════════════════════════════════════════════════════
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
-FONT_SCALE = 0.55
-FONT_THICKNESS = 1
-BOX_COLOR_LEFT = (0, 255, 0)       # 绿色 — 左相机检测框
-BOX_COLOR_RIGHT = (0, 165, 255)    # 橙色 — 右相机检测框
+FONT_SCALE = 1.1
+FONT_THICKNESS = 2
+BOX_COLORS = [
+    (0, 255, 0),       # 绿色 — 1号相机
+    (0, 165, 255),     # 橙色 — 2号相机
+    (255, 100, 100),   # 蓝色 — 3号相机
+]
 TEXT_COLOR = (255, 255, 255)        # 白色文字
 TEXT_3D_COLOR = (0, 255, 255)       # 黄色 — 3D 坐标
 STATE_COLORS = {
@@ -93,15 +103,16 @@ STATE_COLORS = {
 @dataclass
 class WriteJob:
     """主线程投递给写入线程的工作包。"""
-    img_left: np.ndarray           # 全分辨率左图
-    img_right: np.ndarray          # 全分辨率右图
-    det_left: list[BallDetection]  # 左图检测结果（全分辨率坐标）
-    det_right: list[BallDetection] # 右图检测结果（全分辨率坐标）
-    exposure_wall: float             # wall clock 时间 (time.time() 轴)
+    images: dict[str, np.ndarray]              # {序列号: 全分辨率图像}
+    detections: dict[str, list[BallDetection]] # {序列号: 检测结果列表}
+    serials: list[str]                         # 相机序列号顺序
+    exposure_wall: float                       # wall clock 时间
     ball3d: Optional[Ball3D]
     tracker_result: TrackerResult
     frame_idx: int
-    latency_ms: float                # 从曝光到 YOLO 出结果的延迟 (ms)
+    latency_ms: float
+    tiles: dict[str, TileRect] = field(default_factory=dict)  # 当前帧切片区域
+    car_loc: Optional[CarLoc] = None
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -130,69 +141,89 @@ def _draw_detections(
 
 
 def annotate_frame(
-    img_left: np.ndarray,
-    img_right: np.ndarray,
-    det_left: list[BallDetection],
-    det_right: list[BallDetection],
+    images: dict[str, np.ndarray],
+    detections: dict[str, list[BallDetection]],
+    serials: list[str],
     exposure_wall: float,
     ball3d: Ball3D | None,
     tracker_result: TrackerResult,
     frame_idx: int,
     latency_ms: float = 0.0,
+    tiles: dict[str, TileRect] | None = None,
+    car_loc: CarLoc | None = None,
+    cam_scales: dict[str, tuple[float, float]] | None = None,
 ) -> np.ndarray:
     """
-    拼接左右图像并标注检测结果和追踪状态。
+    拼接多台相机图像并标注检测结果和追踪状态。
 
     接收的图像已经是半分辨率，检测框坐标也已缩放。
-
-    标注布局（从上到下）：
-      行1: 帧号 + 曝光开始时间（PC perf_counter 轴，秒）
-      行2: 左右检测数量
-      行3: 3D 坐标 + 重投影误差（仅当三角测量成功时显示，黄色）
-      行4: Curve3 追踪状态 + predict-hit-pos 详情（颜色随状态变化）
-      底部: "LEFT" / "RIGHT" 标识 + 分隔线
     """
-    left = img_left.copy()
-    right = img_right.copy()
+    panels = []
+    for i, sn in enumerate(serials):
+        if sn not in images:
+            continue
+        img = images[sn].copy()
+        color = BOX_COLORS[i % len(BOX_COLORS)]
+        dets = detections.get(sn, [])
+        _draw_detections(img, dets, color)
+        # 切片区域框
+        if tiles and sn in tiles:
+            t = tiles[sn]
+            cv2.rectangle(img, (t.x, t.y), (t.x + t.w, t.y + t.h),
+                          (255, 255, 0), 2)
+        # AprilTag 标记（像素坐标按相机实际缩放比例转换）
+        if car_loc and sn in car_loc.pixels:
+            px, py = car_loc.pixels[sn]
+            sx, sy = cam_scales.get(sn, (0.5, 0.5)) if cam_scales else (0.5, 0.5)
+            cx, cy = int(px * sx), int(py * sy)
+            cv2.drawMarker(img, (cx, cy), (0, 200, 255),
+                           cv2.MARKER_DIAMOND, 20, 2)
+        # 相机标签
+        cv2.putText(img, sn[-3:], (10, img.shape[0] - 15),
+                    FONT, 1.0, color, 2)
+        panels.append(img)
 
-    _draw_detections(left, det_left, BOX_COLOR_LEFT)
-    _draw_detections(right, det_right, BOX_COLOR_RIGHT)
+    if not panels:
+        return np.zeros((100, 100, 3), dtype=np.uint8)
 
-    stitched = np.hstack([left, right])
+    stitched = np.hstack(panels)
     h, w = stitched.shape[:2]
-    left_w = img_left.shape[1]
 
-    y = 22
+    # 画分隔线
+    panel_w = panels[0].shape[1]
+    for i in range(1, len(panels)):
+        x = panel_w * i
+        cv2.line(stitched, (x, 0), (x, h), (100, 100, 100), 1)
 
-    cv2.putText(
-        stitched,
+    # 从底部向上绘制文字信息
+    line_h = 40
+    # 先收集所有要绘制的行（从上到下的逻辑顺序）
+    lines: list[tuple[str, tuple[int, int, int]]] = []
+
+    lines.append((
         f"#{frame_idx}  {datetime.datetime.fromtimestamp(exposure_wall).strftime('%H:%M:%S.%f')[:-3]}"
         f"  lat={latency_ms:.0f}ms",
-        (10, y), FONT, FONT_SCALE, TEXT_COLOR, FONT_THICKNESS,
-    )
-    y += 22
+        TEXT_COLOR,
+    ))
 
-    cv2.putText(
-        stitched,
-        f"det: L={len(det_left)} R={len(det_right)}",
-        (10, y), FONT, FONT_SCALE, TEXT_COLOR, FONT_THICKNESS,
+    det_str = "  ".join(
+        f"{sn[-3:]}={len(detections.get(sn, []))}"
+        for sn in serials
     )
-    y += 22
+    lines.append((f"det: {det_str}", TEXT_COLOR))
 
     if ball3d is not None:
-        cv2.putText(
-            stitched,
+        cams = "+".join(s[-3:] for s in ball3d.cameras_used)
+        lines.append((
             f"3D: ({ball3d.x:.0f}, {ball3d.y:.0f}, {ball3d.z:.0f}) mm  "
             f"reproj={ball3d.reprojection_error:.1f}px  "
-            f"conf={ball3d.confidence:.2f}",
-            (10, y), FONT, FONT_SCALE, TEXT_3D_COLOR, FONT_THICKNESS,
-        )
-        y += 22
+            f"cams={cams}  conf={ball3d.confidence:.2f}",
+            TEXT_3D_COLOR,
+        ))
 
     state = tracker_result.state
     state_color = STATE_COLORS.get(state, TEXT_COLOR)
     state_str = f"curve3: {state.value}"
-
     pred = tracker_result.prediction
     if pred is not None:
         lead_ms = (pred.ht - pred.ct) * 1000
@@ -200,17 +231,49 @@ def annotate_frame(
             f"  hit=({pred.x:.0f}, {pred.y:.0f}, {pred.z:.0f}) "
             f"stage={pred.stage} lead={lead_ms:.0f}ms"
         )
+    lines.append((state_str, state_color))
 
-    cv2.putText(
-        stitched, state_str,
-        (10, y), FONT, FONT_SCALE, state_color, FONT_THICKNESS,
-    )
+    if car_loc is not None:
+        cams = "+".join(s[-3:] for s in car_loc.cameras_used)
+        lines.append((
+            f"car: ({car_loc.x:.0f}, {car_loc.y:.0f}, {car_loc.z:.0f}) mm  "
+            f"yaw={math.degrees(car_loc.yaw):.1f}deg  "
+            f"reproj={car_loc.reprojection_error:.1f}px  cams={cams}",
+            (0, 200, 255),
+        ))
 
-    cv2.putText(stitched, "LEFT", (10, h - 10), FONT, 0.5, BOX_COLOR_LEFT, 1)
-    cv2.putText(stitched, "RIGHT", (left_w + 10, h - 10), FONT, 0.5, BOX_COLOR_RIGHT, 1)
-    cv2.line(stitched, (left_w, 0), (left_w, h), (100, 100, 100), 1)
+    # 从底部向上绘制
+    y = h - 15
+    for text, color in reversed(lines):
+        cv2.putText(stitched, text, (10, y), FONT, FONT_SCALE, color, FONT_THICKNESS)
+        y -= line_h
 
     return stitched
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  YOLO 批量检测（处理 engine batch size 限制）
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _yolo_detect_n(detector, img_list, engine_batch):
+    """按 engine 支持的 batch size 拆分调用 YOLO。"""
+    if len(img_list) <= engine_batch:
+        padded = img_list[:]
+        while len(padded) < engine_batch:
+            padded.append(padded[-1])
+        results = detector.detect_batch(padded)
+        return results[:len(img_list)]
+
+    detections_list = []
+    for i in range(0, len(img_list), engine_batch):
+        batch = img_list[i:i + engine_batch]
+        actual_n = len(batch)
+        while len(batch) < engine_batch:
+            batch.append(batch[-1])
+        r = detector.detect_batch(batch)
+        detections_list.extend(r[:actual_n])
+    return detections_list
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -222,8 +285,6 @@ class VideoWriterThread:
     """
     后台线程：接收 WriteJob → 缩放到半分辨率 → 标注 → 编码写入视频。
 
-    主线程通过 submit(job) 投递工作，不阻塞。
-    写入线程从队列中取出工作，顺序处理。
     队列满时（maxsize=30，即 1 秒缓冲），丢弃最旧的帧以避免主线程阻塞。
     """
 
@@ -232,12 +293,14 @@ class VideoWriterThread:
         video_path: str,
         frame_w: int,
         frame_h: int,
+        n_cams: int,
         fps: float = 30.0,
         display: bool = False,
     ):
         self._video_path = video_path
         self._half_w = frame_w // 2
         self._half_h = frame_h // 2
+        self._n_cams = n_cams
         self._display = display
         self._queue: queue.Queue[WriteJob | None] = queue.Queue(maxsize=30)
         self._stopped = False
@@ -246,7 +309,7 @@ class VideoWriterThread:
         fourcc = cv2.VideoWriter_fourcc(*"MJPG")
         self._writer = cv2.VideoWriter(
             video_path, fourcc, fps,
-            (self._half_w * 2, self._half_h),
+            (self._half_w * n_cams, self._half_h),
         )
 
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -257,7 +320,6 @@ class VideoWriterThread:
         try:
             self._queue.put_nowait(job)
         except queue.Full:
-            # 丢弃队列头部最旧的帧，腾出空间
             try:
                 self._queue.get_nowait()
                 self._drop_count += 1
@@ -270,7 +332,7 @@ class VideoWriterThread:
 
     def stop(self) -> int:
         """通知线程停止，等待队列排空，释放资源。返回丢弃帧数。"""
-        self._queue.put(None)  # 哨兵
+        self._queue.put(None)
         self._thread.join(timeout=10.0)
         self._writer.release()
         if self._display:
@@ -286,30 +348,44 @@ class VideoWriterThread:
 
     def _process(self, job: WriteJob) -> None:
         """缩放 → 缩放检测坐标 → 标注 → 写入视频。"""
-        half_left = cv2.resize(job.img_left, (self._half_w, self._half_h))
-        half_right = cv2.resize(job.img_right, (self._half_w, self._half_h))
+        half_images = {}
+        cam_scales = {}  # {sn: (sx, sy)} — 每台相机实际缩放比例
+        for sn in job.serials:
+            if sn in job.images:
+                orig_h, orig_w = job.images[sn].shape[:2]
+                half_images[sn] = cv2.resize(
+                    job.images[sn], (self._half_w, self._half_h))
+                cam_scales[sn] = (self._half_w / orig_w,
+                                  self._half_h / orig_h)
 
-        det_left_h = [
-            BallDetection(
-                x=d.x / 2, y=d.y / 2, confidence=d.confidence,
-                x1=d.x1 / 2, y1=d.y1 / 2, x2=d.x2 / 2, y2=d.y2 / 2,
+        half_dets = {}
+        for sn in job.serials:
+            sx, sy = cam_scales.get(sn, (0.5, 0.5))
+            half_dets[sn] = [
+                BallDetection(
+                    x=d.x * sx, y=d.y * sy, confidence=d.confidence,
+                    x1=d.x1 * sx, y1=d.y1 * sy, x2=d.x2 * sx, y2=d.y2 * sy,
+                )
+                for d in job.detections.get(sn, [])
+            ]
+
+        # 缩放切片区域到半分辨率（使用每台相机的实际缩放比例）
+        half_tiles = {}
+        for sn, t in job.tiles.items():
+            sx, sy = cam_scales.get(sn, (0.5, 0.5))
+            half_tiles[sn] = TileRect(
+                x=int(t.x * sx), y=int(t.y * sy),
+                w=int(t.w * sx), h=int(t.h * sy),
             )
-            for d in job.det_left
-        ]
-        det_right_h = [
-            BallDetection(
-                x=d.x / 2, y=d.y / 2, confidence=d.confidence,
-                x1=d.x1 / 2, y1=d.y1 / 2, x2=d.x2 / 2, y2=d.y2 / 2,
-            )
-            for d in job.det_right
-        ]
 
         annotated = annotate_frame(
-            half_left, half_right,
-            det_left_h, det_right_h,
+            half_images, half_dets, job.serials,
             job.exposure_wall, job.ball3d,
             job.tracker_result, job.frame_idx,
             latency_ms=job.latency_ms,
+            tiles=half_tiles,
+            car_loc=job.car_loc,
+            cam_scales=cam_scales,
         )
 
         self._writer.write(annotated)
@@ -347,23 +423,51 @@ def main() -> int:
 
     # ── 初始化组件 ──────────────────────────────────────────────────────
     print("=" * 60)
-    print("Step 4.5 — 网球定位与实验视频保存")
+    print("网球定位与实验视频保存")
     print("=" * 60)
 
-    print("\n[1/4] 初始化 BallDetector (YOLO)...")
+    print("\n[1/5] 初始化 BallDetector (YOLO)...")
     detector = BallDetector()
     print(f"  模型: {detector.model_path}")
 
-    print("[2/4] 初始化 BallLocalizer (立体标定)...")
+    print("[2/5] 初始化 BallLocalizer (多目标定)...")
     localizer = BallLocalizer(detector=detector)
-    serial_left = localizer.serial_left
-    serial_right = localizer.serial_right
-    print(f"  左相机: {serial_left}, 右相机: {serial_right}")
+    # 面板顺序：243（俯视）在最左，285、402 在右
+    _display_order = ["DA8199243", "DA8199285", "DA8199402"]
+    cam_serials = sorted(
+        localizer.serials,
+        key=lambda sn: _display_order.index(sn)
+        if sn in _display_order else 999,
+    )
+    print(f"  相机: {cam_serials}")
 
-    print("[3/4] 初始化 Curve3Tracker...")
+    print("[3/5] 初始化 Curve3Tracker...")
     tracker = Curve3Tracker()
     print(f"  ideal_hit_z={tracker.ideal_hit_z}mm, cor={tracker.cor}, "
           f"cor_xy={tracker.cor_xy}")
+
+    print("[4/5] 初始化 CarLocalizer (AprilTag)...")
+    car_localizer = CarLocalizer()
+    print(f"  相机: {car_localizer.serials}")
+
+    # ── ROS2 桥接子进程（UDP → /pc_car_loc topic）──
+    _udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    _udp_addr = ("127.0.0.1", 5858)
+    _ros2_proc: subprocess.Popen | None = None
+    _ros2_bat = _ROOT / "ros2" / "run_car_loc.bat"
+    if _ros2_bat.exists():
+        try:
+            _ros2_proc = subprocess.Popen(
+                [str(_ros2_bat)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            )
+            print(f"  ROS2 桥接已启动 (PID={_ros2_proc.pid})")
+        except Exception as e:
+            print(f"  ROS2 桥接启动失败: {e}")
+    else:
+        print(f"  ROS2 桥接脚本不存在，跳过: {_ros2_bat}")
 
     # ── 日志容器 ────────────────────────────────────────────────────────
     log_observations: list[dict] = []
@@ -372,14 +476,15 @@ def main() -> int:
     log_state_transitions: list[dict] = []
 
     # ── 打开同步相机 ────────────────────────────────────────────────────
-    print("[4/4] 打开同步相机...")
+    print("[5/5] 打开同步相机...")
     with SyncCapture.from_config() as cap:
         sync_sns = cap.sync_serials
         print(f"  同步相机: {sync_sns}")
 
-        if serial_left not in sync_sns or serial_right not in sync_sns:
-            print(f"*** 错误: 标定相机 {serial_left}/{serial_right} "
-                  f"不在同步列表 {sync_sns} 中 ***")
+        # 确认标定相机在同步列表中
+        missing = [sn for sn in cam_serials if sn not in sync_sns]
+        if missing:
+            print(f"*** 错误: 标定相机 {missing} 不在同步列表 {sync_sns} 中 ***")
             return 1
 
         print("  等待相机稳定 (1s)...")
@@ -390,17 +495,51 @@ def main() -> int:
             print("*** 错误: 无法获取初始帧 ***")
             return 1
 
-        img_sample = frame_to_numpy(first_frames[serial_left])
+        # 获取每台相机的分辨率
+        camera_sizes = {}
+        for sn in cam_serials:
+            if sn in first_frames:
+                img_tmp = frame_to_numpy(first_frames[sn])
+                camera_sizes[sn] = (img_tmp.shape[1], img_tmp.shape[0])
+        img_sample = frame_to_numpy(first_frames[cam_serials[0]])
         frame_h, frame_w = img_sample.shape[:2]
+        n_cams = len(cam_serials)
         print(f"  单帧分辨率: {frame_w}x{frame_h}, "
-              f"视频输出分辨率: {frame_w}x{frame_h // 2}")
+              f"视频输出分辨率: {frame_w // 2 * n_cams}x{frame_h // 2}")
 
-        # ── YOLO 预热（TensorRT 首次推理很慢，先跑几次让引擎稳定）──
+        # 初始化分片管理器
+        tile_mgr = TileManager(camera_sizes)
+        for sn in cam_serials:
+            n_tiles = tile_mgr.get_search_tile_count(sn)
+            sz = camera_sizes.get(sn, (0, 0))
+            print(f"  {sn[-3:]}: {sz[0]}x{sz[1]} → {n_tiles} 搜索切片")
+
+        # ── YOLO 预热 + 自动检测 batch size ──
         print("  YOLO 预热中...")
-        warmup_img = frame_to_numpy(first_frames[serial_left])
-        for _ in range(5):
-            detector.detect_batch([warmup_img, warmup_img])
-        print("  预热完成")
+        # 用切片大小的图像预热（匹配实际推理输入）
+        ts = tile_mgr._tile_size
+        warmup_img = img_sample[:ts, :ts] if (
+            img_sample.shape[0] >= ts and img_sample.shape[1] >= ts
+        ) else img_sample
+
+        engine_batch = n_cams
+        for try_batch in [n_cams, n_cams - 1, 2, 1]:
+            try:
+                detector.detect_batch([warmup_img] * try_batch)
+                engine_batch = try_batch
+                break
+            except Exception:
+                continue
+
+        for _ in range(4):
+            _yolo_detect_n(detector, [warmup_img] * n_cams, engine_batch)
+
+        if engine_batch >= n_cams:
+            print(f"  预热完成（batch={engine_batch}，单次推理）")
+        else:
+            n_calls = math.ceil(n_cams / engine_batch)
+            print(f"  预热完成（engine batch={engine_batch}，"
+                  f"需 {n_calls} 次推理处理 {n_cams} 张图）")
 
         # ── 后台写入线程 ───────────────────────────────────────────────
         writer_thread: VideoWriterThread | None = None
@@ -408,28 +547,23 @@ def main() -> int:
         if not args.no_video:
             writer_thread = VideoWriterThread(
                 str(video_path), frame_w, frame_h,
-                fps=30.0, display=args.display,
+                n_cams=n_cams, fps=30.0, display=args.display,
             )
             print(f"  视频输出: {video_path}")
 
         # ── 主循环 ────────────────────────────────────────────────────
-        #   主线程只做: 取帧 → Bayer解码 → YOLO推理 → 三角测量 → curve3
-        #   标注/缩放/视频编码全部交给后台线程
-        # ──────────────────────────────────────────────────────────────
         frame_idx = 0
         t_start = time.monotonic()
-        # perf_counter → wall clock 转换基准
-        _pc_epoch = time.perf_counter()
-        _wall_epoch = time.time()
+        _wall_epoch = time.time()  # 记录启动时间（用于 JSON 日志）
         prev_state = TrackerState.IDLE
         timeout_count = 0
         _t_decode_sum = 0.0
         _t_yolo_sum = 0.0
 
         print(f"\n{'*' * 60}")
-        print(f"  ✓ 预热完成，开始追踪！（{args.duration}s）按 Ctrl+C 提前结束")
+        print(f"  预热完成，开始追踪！（{args.duration}s）按 Ctrl+C 提前结束")
         print(f"{'*' * 60}\n")
-        print("\a", end="", flush=True)  # 蜂鸣提示音
+        print("\a", end="", flush=True)
 
         try:
             while time.monotonic() - t_start < args.duration:
@@ -438,38 +572,66 @@ def main() -> int:
                     timeout_count += 1
                     continue
 
-                frame_left = frames[serial_left]
-                frame_right = frames[serial_right]
-
                 # ── Bayer 解码（全分辨率）──
                 _t0 = time.perf_counter()
-                img_left = frame_to_numpy(frame_left)
-                img_right = frame_to_numpy(frame_right)
+                images = {}
+                for sn in cam_serials:
+                    if sn in frames:
+                        images[sn] = frame_to_numpy(frames[sn])
                 _t1 = time.perf_counter()
                 _t_decode_sum += _t1 - _t0
 
-                exposure_pc = (
-                    frame_left.exposure_start_pc
-                    + frame_right.exposure_start_pc
-                ) / 2.0
-                # perf_counter → wall clock 转换
-                exposure_wall = _wall_epoch + (exposure_pc - _pc_epoch)
+                exp_starts = [
+                    frames[sn].exposure_start_pc
+                    for sn in cam_serials if sn in frames
+                ]
+                exposure_pc = sum(exp_starts) / len(exp_starts)
+                exposure_wall = exposure_pc  # exposure_pc 已是 epoch 时间
 
-                # ── YOLO 批量检测（全分辨率）──
-                det_left, det_right = detector.detect_batch(
-                    [img_left, img_right])
+                # ── YOLO 分片检测 ──
+                img_sns = [sn for sn in cam_serials if sn in images]
+                frame_tiles: dict[str, TileRect] = {}
+                tile_imgs = []
+                for sn in img_sns:
+                    crop, tile_rect = tile_mgr.get_tile(
+                        sn, images[sn], exposure_pc)
+                    tile_imgs.append(crop)
+                    frame_tiles[sn] = tile_rect
+
+                det_results = _yolo_detect_n(
+                    detector, tile_imgs, engine_batch)
                 _t2 = time.perf_counter()
                 _t_yolo_sum += _t2 - _t1
 
-                # 延迟 = YOLO 出结果时间 - 曝光时间（都在 perf_counter 轴）
-                latency_ms = (_t2 - exposure_pc) * 1000.0
+                latency_ms = (time.time() - exposure_pc) * 1000.0
+
+                # 映射检测坐标回全图 + 整理
+                all_detections: dict[str, list[BallDetection]] = {}
+                for i, sn in enumerate(img_sns):
+                    all_detections[sn] = [
+                        TileManager.map_detection_to_full(
+                            d, frame_tiles[sn])
+                        for d in det_results[i]
+                    ]
 
                 # ── 三角测量 + Curve3 更新 ──
                 ball3d: Ball3D | None = None
                 tracker_result: TrackerResult
 
-                if len(det_left) == 1 and len(det_right) == 1:
-                    ball3d = localizer.triangulate(det_left[0], det_right[0])
+                # 收集恰好检测到 1 个网球的相机
+                good_dets = {
+                    sn: dets[0]
+                    for sn, dets in all_detections.items()
+                    if len(dets) == 1
+                }
+
+                if len(good_dets) >= 2:
+                    ball3d = localizer.triangulate(good_dets)
+
+                    # 更新分片跟踪状态
+                    for sn, det in good_dets.items():
+                        tile_mgr.update_tracking(
+                            sn, det.x, det.y, exposure_pc)
 
                     obs = BallObservation(
                         x=ball3d.x, y=ball3d.y,
@@ -482,6 +644,7 @@ def main() -> int:
                         "t": exposure_pc,
                         "reproj_err": ball3d.reprojection_error,
                         "confidence": ball3d.confidence,
+                        "cameras_used": ball3d.cameras_used,
                     })
 
                     if tracker_result.prediction is not None:
@@ -507,43 +670,67 @@ def main() -> int:
                     })
                     prev_state = tracker_result.state
 
+                # ── 小车 AprilTag 定位 ──
+                car_loc: CarLoc | None = None
+                car_loc = car_localizer.locate(images, t=exposure_pc)
+
+                # ── UDP 发送小车位置给 ROS2 桥接 ──
+                if car_loc is not None:
+                    try:
+                        _udp_sock.sendto(json.dumps({
+                            "x": round(car_loc.x / 1000, 4),
+                            "y": round(car_loc.y / 1000, 4),
+                            "z": round(car_loc.z / 1000, 4),
+                            "yaw": round(car_loc.yaw, 4),
+                            "t": round(car_loc.t, 6),
+                            "tag_id": car_loc.tag_id,
+                        }).encode(), _udp_addr)
+                    except OSError:
+                        pass
+
                 # ── 投递给后台写入线程（非阻塞）──
                 if writer_thread is not None:
                     writer_thread.submit(WriteJob(
-                        img_left=img_left,
-                        img_right=img_right,
-                        det_left=det_left,
-                        det_right=det_right,
+                        images=images,
+                        detections=all_detections,
+                        serials=cam_serials,
                         exposure_wall=exposure_wall,
                         ball3d=ball3d,
                         tracker_result=tracker_result,
                         frame_idx=frame_idx,
                         latency_ms=latency_ms,
+                        tiles=frame_tiles,
+                        car_loc=car_loc,
                     ))
 
+                # ── 日志 ──
                 frame_entry = {
                     "idx": frame_idx,
                     "exposure_pc": exposure_pc,
                     "exposure_time": datetime.datetime.fromtimestamp(
                         exposure_wall).strftime('%H:%M:%S.%f')[:-3],
-                    "det_left": len(det_left),
-                    "det_right": len(det_right),
                     "has_3d": ball3d is not None,
                     "state": tracker_result.state.value,
                     "latency_ms": round(latency_ms, 1),
                 }
-                if det_left:
-                    frame_entry["det_left_detail"] = [
-                        {"x": round(d.x), "y": round(d.y),
-                         "conf": round(d.confidence, 3)}
-                        for d in det_left
-                    ]
-                if det_right:
-                    frame_entry["det_right_detail"] = [
-                        {"x": round(d.x), "y": round(d.y),
-                         "conf": round(d.confidence, 3)}
-                        for d in det_right
-                    ]
+                for sn in cam_serials:
+                    dets = all_detections.get(sn, [])
+                    frame_entry[f"det_{sn[-3:]}"] = len(dets)
+                    if dets:
+                        frame_entry[f"det_{sn[-3:]}_detail"] = [
+                            {"x": round(d.x), "y": round(d.y),
+                             "conf": round(d.confidence, 3)}
+                            for d in dets
+                        ]
+                if car_loc is not None:
+                    frame_entry["car_loc"] = {
+                        "x": round(car_loc.x),
+                        "y": round(car_loc.y),
+                        "z": round(car_loc.z),
+                        "yaw": round(car_loc.yaw, 4),
+                        "tag_id": car_loc.tag_id,
+                        "cameras_used": car_loc.cameras_used,
+                    }
                 log_frames.append(frame_entry)
 
                 frame_idx += 1
@@ -571,6 +758,16 @@ def main() -> int:
             print("  等待视频写入完成...")
             drop_count = writer_thread.stop()
 
+    # ── 关闭 ROS2 桥接子进程 ──
+    _udp_sock.close()
+    if _ros2_proc is not None and _ros2_proc.poll() is None:
+        _ros2_proc.terminate()
+        try:
+            _ros2_proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            _ros2_proc.kill()
+        print("  ROS2 桥接已关闭")
+
     # ── 保存 JSON 结果 ──────────────────────────────────────────────────
     elapsed = time.monotonic() - t_start
 
@@ -583,8 +780,7 @@ def main() -> int:
         "config": {
             "start_time": datetime.datetime.fromtimestamp(
                 _wall_epoch).strftime("%y-%m-%d %H:%M"),
-            "serial_left": serial_left,
-            "serial_right": serial_right,
+            "serials": cam_serials,
             "duration_s": elapsed,
             "ideal_hit_z": tracker.ideal_hit_z,
             "cor": tracker.cor,

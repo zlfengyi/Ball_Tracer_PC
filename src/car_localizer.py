@@ -1,20 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-车辆 3D 定位模块 — AprilTag 双目视觉三角测量。
+车辆 3D 定位模块 — AprilTag 多目视觉三角测量。
 
 流程：
-  1. 接收两台相机的同步 BGR 图像
+  1. 接收多台相机的同步 BGR 图像
   2. cv2.aruco 检测 AprilTag (tag36h11) 的 4 个角点
   3. 取角点中心作为 tag 像素坐标
   4. cv2.undistortPoints 去镜头畸变
-  5. cv2.triangulatePoints 三角测量求 3D 世界坐标
+  5. 多视图 DLT 三角测量求 3D 世界坐标
   6. 计算重投影误差评估定位精度
 
-标定参数从 src/config/stereo_calib.json 加载。
+标定参数从 src/config/multi_calib.json 加载。
 
 用法：
   localizer = CarLocalizer()
-  result = localizer.locate(img_left, img_right, t=time.perf_counter())
+  result = localizer.locate({"DA8199285": img1, "DA8199402": img2, "DA8199243": img3})
   if result is not None:
       print(f"车辆 3D: ({result.x:.0f}, {result.y:.0f}, {result.z:.0f}) mm")
 """
@@ -22,15 +22,17 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 
 _SRC_DIR = Path(__file__).resolve().parent
-_DEFAULT_STEREO_CONFIG = _SRC_DIR / "config" / "stereo_calib.json"
+_DEFAULT_CALIB_CONFIG = _SRC_DIR / "config" / "multi_calib.json"
 
 
 @dataclass
@@ -50,89 +52,87 @@ class CarLoc:
     z: float                       # 世界坐标 Z (mm)
     t: float                       # 时间戳 (perf_counter)
     tag_id: int                    # 检测到的 tag ID
-    pixel_1: tuple[float, float]   # 左相机像素坐标 (u, v)
-    pixel_2: tuple[float, float]   # 右相机像素坐标 (u, v)
-    reprojection_error: float      # 重投影误差 (px)
+    cameras_used: list[str]        # 参与三角测量的相机序列号
+    pixels: dict[str, tuple[float, float]]  # {序列号: (u, v)}
+    reprojection_error: float      # 平均重投影误差 (px)
+    yaw: float = 0.0              # 绕 z 轴旋转角 (rad)
 
 
 class CarLocalizer:
     """
-    双目车辆 3D 定位器（基于 AprilTag）。
+    多目车辆 3D 定位器（基于 AprilTag）。
 
-    在两张同步图像中检测 AprilTag，通过 tag_id 匹配左右图的同一 tag，
-    对 tag 中心进行三角测量得到 3D 世界坐标。
+    在多张同步图像中检测 AprilTag，通过 tag_id 匹配，
+    对 tag 中心进行多视图三角测量得到 3D 世界坐标。
     """
 
     def __init__(
         self,
-        stereo_config_path: Optional[str] = None,
+        calib_config_path: Optional[str] = None,
     ):
-        config_path = stereo_config_path or str(_DEFAULT_STEREO_CONFIG)
-        self._load_stereo_params(config_path)
+        config_path = calib_config_path or str(_DEFAULT_CALIB_CONFIG)
+        self._load_calib(config_path)
         self._init_aruco_detector()
+        self._pool = ThreadPoolExecutor(max_workers=3)
 
     # ── 初始化 ──────────────────────────────────────────────────────────
 
-    def _load_stereo_params(self, path: str) -> None:
-        """加载双目标定参数（与 BallLocalizer 相同逻辑）。"""
+    def _load_calib(self, path: str) -> None:
+        """加载多目标定参数。"""
         with open(path, encoding="utf-8") as f:
             cfg = json.load(f)
 
-        self._K1 = np.array(cfg["K1"], dtype=np.float64).reshape(3, 3)
-        self._K2 = np.array(cfg["K2"], dtype=np.float64).reshape(3, 3)
-        self._D1 = np.array(cfg["D1"], dtype=np.float64).ravel()
-        self._D2 = np.array(cfg["D2"], dtype=np.float64).ravel()
+        self._serials = list(cfg["cameras"].keys())
+        self._K = {}
+        self._D = {}
+        self._P = {}  # 投影矩阵 3x4
 
-        self._R1 = np.array(cfg["R1_world"], dtype=np.float64).reshape(3, 3)
-        self._T1 = np.array(cfg["t1_world"], dtype=np.float64).reshape(3, 1)
-        self._R2 = np.array(cfg["R2_world"], dtype=np.float64).reshape(3, 3)
-        self._T2 = np.array(cfg["t2_world"], dtype=np.float64).reshape(3, 1)
-
-        self._P1 = self._K1 @ np.hstack([self._R1, self._T1])
-        self._P2 = self._K2 @ np.hstack([self._R2, self._T2])
-
-        self._serial_left = cfg.get("serial_left", "")
-        self._serial_right = cfg.get("serial_right", "")
+        for sn, cd in cfg["cameras"].items():
+            K = np.array(cd["K"], dtype=np.float64).reshape(3, 3)
+            D = np.array(cd["D"], dtype=np.float64).ravel()
+            R = np.array(cd["R_world"], dtype=np.float64).reshape(3, 3)
+            t = np.array(cd["t_world"], dtype=np.float64).reshape(3, 1)
+            self._K[sn] = K
+            self._D[sn] = D
+            self._P[sn] = K @ np.hstack([R, t])
 
     def _init_aruco_detector(self) -> None:
-        """创建 AprilTag 36h11 检测器。"""
+        """创建优化后的 AprilTag 36h11 检测器。"""
         aruco_dict = cv2.aruco.getPredefinedDictionary(
             cv2.aruco.DICT_APRILTAG_36h11
         )
         params = cv2.aruco.DetectorParameters()
+        # 速度优化：缩小自适应阈值窗口范围
+        params.adaptiveThreshWinSizeMax = 21
+        # 限制标记周长范围，跳过过大区域
+        params.maxMarkerPerimeterRate = 0.5
+        # 降低轮廓近似精度，加快轮廓筛选
+        params.polygonalApproxAccuracyRate = 0.1
         self._detector = cv2.aruco.ArucoDetector(aruco_dict, params)
 
     # ── 属性 ──────────────────────────────────────────────────────────
 
     @property
-    def serial_left(self) -> str:
-        return self._serial_left
-
-    @property
-    def serial_right(self) -> str:
-        return self._serial_right
+    def serials(self) -> list[str]:
+        return list(self._serials)
 
     # ── 检测 ──────────────────────────────────────────────────────────
 
     def detect(self, image: np.ndarray) -> list[CarDetection]:
-        """
-        检测图像中的所有 AprilTag (tag36h11)。
-
-        Args:
-            image: BGR 图像。
-
-        Returns:
-            检测结果列表（可能为空）。
-        """
+        """检测图像下 2/3 区域中的所有 AprilTag (tag36h11)。"""
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
-        corners_list, ids, _ = self._detector.detectMarkers(gray)
+        h = gray.shape[0]
+        y_offset = h // 3
+        roi = gray[y_offset:]
+        corners_list, ids, _ = self._detector.detectMarkers(roi)
 
         if ids is None:
             return []
 
         results = []
         for i, tag_id in enumerate(ids.ravel()):
-            corners = corners_list[i].reshape(4, 2)  # (4, 2)
+            corners = corners_list[i].reshape(4, 2)
+            corners[:, 1] += y_offset
             cx = float(corners[:, 0].mean())
             cy = float(corners[:, 1].mean())
             results.append(CarDetection(
@@ -143,87 +143,130 @@ class CarLocalizer:
             ))
         return results
 
-    # ── 三角测量 ──────────────────────────────────────────────────────
+    # ── 多视图三角测量 ─────────────────────────────────────────────────
 
     def triangulate(
         self,
-        det1: CarDetection,
-        det2: CarDetection,
+        detections: dict[str, CarDetection],
         t: float = 0.0,
     ) -> CarLoc:
         """
-        对左右图中同一 AprilTag 的中心进行三角测量。
+        对多台相机中同一 AprilTag 的中心进行 DLT 三角测量。
 
         Args:
-            det1: 左相机检测结果。
-            det2: 右相机检测结果。
+            detections: {序列号: CarDetection}，至少 2 台相机。
             t: 时间戳 (perf_counter)。
 
         Returns:
             CarLoc 3D 定位结果。
         """
-        pt1_undist = self._undistort_point(det1.cx, det1.cy, self._K1, self._D1)
-        pt2_undist = self._undistort_point(det2.cx, det2.cy, self._K2, self._D2)
+        serials = list(detections.keys())
+        tag_id = detections[serials[0]].tag_id
 
-        pts_4d = cv2.triangulatePoints(
-            self._P1, self._P2,
-            pt1_undist.reshape(2, 1).astype(np.float64),
-            pt2_undist.reshape(2, 1).astype(np.float64),
-        )
-        pts_3d = (pts_4d[:3] / pts_4d[3]).ravel()
+        # 三角测量 tag 中心
+        center_px = {sn: (det.cx, det.cy) for sn, det in detections.items()}
+        pts_3d = self._triangulate_point(serials, center_px)
 
-        reproj_err = self._reprojection_error(
-            pts_3d, det1.cx, det1.cy, det2.cx, det2.cy
-        )
+        # 三角测量角点 0 和 1（tag 上边缘）计算 yaw
+        c0_px = {sn: (float(det.corners[0, 0]), float(det.corners[0, 1]))
+                 for sn, det in detections.items()}
+        c1_px = {sn: (float(det.corners[1, 0]), float(det.corners[1, 1]))
+                 for sn, det in detections.items()}
+        p0 = self._triangulate_point(serials, c0_px)
+        p1 = self._triangulate_point(serials, c1_px)
+        dx, dy = p1[0] - p0[0], p1[1] - p0[1]
+        yaw = math.atan2(dy, dx)
+
+        # 重投影误差
+        pixels = {}
+        errs = []
+        for sn in serials:
+            det = detections[sn]
+            pixels[sn] = (det.cx, det.cy)
+            pt_h = np.append(pts_3d, 1.0)
+            proj = self._P[sn] @ pt_h
+            proj = proj[:2] / proj[2]
+            err = np.sqrt((proj[0] - det.cx) ** 2 + (proj[1] - det.cy) ** 2)
+            errs.append(err)
 
         return CarLoc(
             x=float(pts_3d[0]),
             y=float(pts_3d[1]),
             z=float(pts_3d[2]),
             t=t,
-            tag_id=det1.tag_id,
-            pixel_1=(det1.cx, det1.cy),
-            pixel_2=(det2.cx, det2.cy),
-            reprojection_error=reproj_err,
+            tag_id=tag_id,
+            cameras_used=serials,
+            pixels=pixels,
+            reprojection_error=float(np.mean(errs)),
+            yaw=yaw,
         )
 
     # ── 一步到位 ──────────────────────────────────────────────────────
 
     def locate(
         self,
-        img1: np.ndarray,
-        img2: np.ndarray,
+        images: dict[str, np.ndarray],
         t: float = 0.0,
     ) -> Optional[CarLoc]:
         """
         检测 + 三角测量一步完成。
 
-        在两张图中各检测 AprilTag，按 tag_id 匹配后三角测量。
-        若匹配到多个相同 ID 的 tag，取第一个。
+        在所有图像中检测 AprilTag，按 tag_id 匹配，
+        用检测到同一 tag 的 2+ 台相机进行三角测量。
 
         Args:
-            img1: 左相机 BGR 图像。
-            img2: 右相机 BGR 图像。
+            images: {序列号: BGR 图像}
             t: 时间戳。
 
         Returns:
-            CarLoc 或 None（未检测到匹配的 tag）。
+            CarLoc 或 None（不足 2 台相机检测到匹配 tag）。
         """
-        dets1 = self.detect(img1)
-        dets2 = self.detect(img2)
+        # 并行检测所有相机（复用线程池）
+        all_dets = {}
+        futures = {self._pool.submit(self.detect, img): sn for sn, img in images.items()}
+        for fut in futures:
+            all_dets[futures[fut]] = fut.result()
 
-        if not dets1 or not dets2:
+        # 统计每个 tag_id 被哪些相机检测到
+        tag_cameras = {}  # {tag_id: {sn: CarDetection}}
+        for sn, dets in all_dets.items():
+            for d in dets:
+                tag_cameras.setdefault(d.tag_id, {})[sn] = d
+
+        # 找到被 >=2 台相机检测到的 tag，取检测相机数最多的
+        best_tag = None
+        best_count = 0
+        for tag_id, cam_dets in tag_cameras.items():
+            if len(cam_dets) >= 2 and len(cam_dets) > best_count:
+                best_tag = tag_id
+                best_count = len(cam_dets)
+
+        if best_tag is None:
             return None
 
-        # 按 tag_id 匹配
-        ids2 = {d.tag_id: d for d in dets2}
-        for d1 in dets1:
-            if d1.tag_id in ids2:
-                return self.triangulate(d1, ids2[d1.tag_id], t)
-
-        return None
+        return self.triangulate(tag_cameras[best_tag], t)
 
     # ── 内部方法 ──────────────────────────────────────────────────────
+
+    def _triangulate_point(
+        self,
+        serials: list[str],
+        pixel_coords: dict[str, tuple[float, float]],
+    ) -> np.ndarray:
+        """对单个像素点进行多视图 DLT 三角测量，返回 3D 坐标 shape=(3,)。"""
+        A = []
+        for sn in serials:
+            u, v = self._undistort_point(
+                pixel_coords[sn][0], pixel_coords[sn][1],
+                self._K[sn], self._D[sn],
+            )
+            P = self._P[sn]
+            A.append(u * P[2] - P[0])
+            A.append(v * P[2] - P[1])
+        A = np.array(A)
+        _, _, Vt = np.linalg.svd(A)
+        X = Vt[-1]
+        return X[:3] / X[3]
 
     @staticmethod
     def _undistort_point(
@@ -233,23 +276,3 @@ class CarLocalizer:
         pts = np.array([[[u, v]]], dtype=np.float64)
         undist = cv2.undistortPoints(pts, K, D, P=K)
         return undist[0, 0]
-
-    def _reprojection_error(
-        self,
-        pt_3d: np.ndarray,
-        u1: float, v1: float,
-        u2: float, v2: float,
-    ) -> float:
-        """计算 3D 点重投影到两个相机的平均像素误差。"""
-        pt_h = np.append(pt_3d, 1.0)
-
-        proj1 = self._P1 @ pt_h
-        proj1 = proj1[:2] / proj1[2]
-
-        proj2 = self._P2 @ pt_h
-        proj2 = proj2[:2] / proj2[2]
-
-        err1 = np.sqrt((proj1[0] - u1) ** 2 + (proj1[1] - v1) ** 2)
-        err2 = np.sqrt((proj2[0] - u2) ** 2 + (proj2[1] - v2) ** 2)
-
-        return float((err1 + err2) / 2.0)
