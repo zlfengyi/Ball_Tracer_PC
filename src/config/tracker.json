@@ -1,0 +1,18 @@
+{
+    "tile_size": 1280,
+    "tile_resize": 640,
+    "track_timeout_s": 0.3,
+    "search_hold_frames": 4,
+    "min_cameras_for_3d": 2,
+    "max_reproj_error_px": 15.0,
+
+    "curve3": {
+        "ideal_hit_z": 800.0,
+        "cor": 0.70,
+        "cor_xy": 0.42,
+        "motion_window_s": 0.2,
+        "motion_min_y": 500,
+        "land_skip_time": 0.05,
+        "reset_timeout": 0.5
+    }
+}

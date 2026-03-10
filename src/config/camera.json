@@ -1,23 +1,9 @@
 {
     "master_serial": "DA8199303",
     "slave_serials": ["DA8199243", "DA8199285", "DA8199402"],
-    "fps": 30.0,
+    "fps": 23.0,
     "exposure_us": 8000.0,
     "gain_db": 25.0,
     "master_min_bandwidth": true,
-    "recalib_every": 10,
-    "slave_params": {
-        "DA8199243": {
-            "roi_offset_y": 400,
-            "roi_width": 2248
-        },
-        "DA8199285": {
-            "roi_offset_y": 700,
-            "roi_width": 2248
-        },
-        "DA8199402": {
-            "roi_offset_y": 700,
-            "roi_width": 2248
-        }
-    }
+    "recalib_every": 10
 }

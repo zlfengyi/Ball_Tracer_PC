@@ -49,6 +49,8 @@ Stage 1（落地后）：
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 from dataclasses import dataclass
 from enum import Enum
@@ -219,13 +221,13 @@ class Curve3Tracker:
         cor: float = 0.78,
         cor_xy: float = 0.42,
         ground_z: float = 0.0,
-        min_points: int = 3,
+        min_points: int = 5,
         min_stage1_points: int = 5,
-        bounce_z_threshold: float = 200.0,
+        fit_rmse_max: float = 400.0,
         reset_timeout: float = 0.5,
         motion_window_s: float = 0.2,
         motion_min_y: float = 500.0,
-        land_skip_time: float = 0.05,
+        land_skip_time: float = 0.03,
     ):
         """
         Args:
@@ -238,9 +240,12 @@ class Curve3Tracker:
                   vy_post / vy_pre = 0.424, 0.469, 0.432，平均 0.442，取 0.42。
                 与法向 cor=0.78 不同，切向恢复系数显著更低。
             ground_z: 地面高度 (mm)。
-            min_points: 拟合所需最少观测点。
+            min_points: S0 拟合所需最少观测点（≥8 保证拟合稳定性）。
             min_stage1_points: stage 1 至少多少点才输出预测。
-            bounce_z_threshold: 反弹检测 z 阈值 (mm)。
+            fit_rmse_max: 拟合质量阈值 (mm)。max(RMSE_x, RMSE_y, RMSE_z)
+                超过此值时认为追踪到错误球，触发重置。用于 S0 和 S1
+                阶段的质量检查。阈值需高于正常三角测量噪声（y 轴
+                可达 ~230mm），但能捕获完全错误的追踪（>1000mm）。
             reset_timeout: 两帧间隔超过此值 (s) 则重置。
             motion_window_s: 运动检测滑动窗口时长 (s)。在此窗口内
                 |Δy| 必须超过 motion_min_y 才认为球在飞行中。
@@ -248,10 +253,10 @@ class Curve3Tracker:
             motion_min_y: 窗口内 |Δy| 最小阈值 (mm)。
                 实测依据：人持球静止 ~1.4mm / 行走 ~74mm / 飞行 ~1340mm，
                 500mm 阈值可安全分离静止+行走 vs 飞行。
-            land_skip_time: 落地排除窗口半宽 (s)。用 S0 曲线预测落地
-                时间 t_land，排除 [t_land - skip, t_land + skip] 内的
-                观测，避免地面接触帧（形变/摩擦）污染 S0 和 S1 拟合。
-                基于时间而非帧数，不受帧率影响。
+            land_skip_time: 落地排除窗口半宽 (s)。S0 曲线每帧预测落地
+                时间 t_land，当观测时间在 t_land ± skip 内时跳过
+                （IN_LANDING），超过 t_land + skip 时进入 S1。
+                参考 curve2: 0.03s。
         """
         self.ideal_hit_z = ideal_hit_z
         self.cor = cor
@@ -259,7 +264,7 @@ class Curve3Tracker:
         self.ground_z = ground_z
         self.min_points = min_points
         self.min_stage1_points = min_stage1_points
-        self.bounce_z_threshold = bounce_z_threshold
+        self.fit_rmse_max = fit_rmse_max
         self.reset_timeout = reset_timeout
         self.motion_window_s = motion_window_s
         self.motion_min_y = motion_min_y
@@ -281,7 +286,8 @@ class Curve3Tracker:
         self._bounce_time: Optional[float] = None
         self._curve0: Optional[FittedCurve] = None
         self._curve1: Optional[FittedCurve] = None
-        self._t_land: Optional[float] = None   # S0 预测的一次落地时间
+        self._predicted_land_time: Optional[float] = None  # S0 预测的落地时间（每帧更新）
+        self._t_land: Optional[float] = None   # 确认的落地时间（进入 S1 时锁定）
         self._t_land2: Optional[float] = None  # S1 预测的二次落地时间
         self._n_post_fit: int = 0  # 参与 S1 拟合的观测数
         self._last_s0_pred: Optional[PredictHitPos] = None
@@ -312,12 +318,11 @@ class Curve3Tracker:
         """
         输入一个新观测，返回 TrackerResult（包含预测和状态）。
 
-        返回的 state 字段反映本帧的追踪状态：
-          - DONE: 检测到超时/跳变/二次落地，本次抛球结束
-          - IDLE: 观测点不足以拟合
-          - TRACKING_S0: 正在 stage 0 追踪
-          - IN_LANDING: 球已反弹但 post-bounce 点数不足
-          - TRACKING_S1: 正在 stage 1 追踪
+        核心流程：
+          S0 每帧拟合抛物线。当 n >= min_points，计算落地时间（每帧更新）。
+          观测时间在落地 ±land_skip_time 内 → 跳过（IN_LANDING）。
+          观测时间超过落地 +land_skip_time → 进入 S1。
+          S0/S1 拟合时 RMSE 过大 → 追踪到错误球 → 重置。
         """
         # ── 检查是否需要重置（超时 / 位置跳变）──
         self._skip_obs = False
@@ -341,15 +346,26 @@ class Curve3Tracker:
                 self._flush_pending_to_obs()
             else:
                 return TrackerResult(prediction=None, state=TrackerState.IDLE)
-
         else:
+            # ── S0 落地时间检查（在添加观测之前）──
+            if self._stage == 0 and self._predicted_land_time is not None:
+                if abs(obs.t - self._predicted_land_time) < self.land_skip_time:
+                    # 接近落地时间 → 跳过，避免地面帧污染
+                    self._state = TrackerState.IN_LANDING
+                    return TrackerResult(prediction=None, state=self._state)
+                if obs.t > self._predicted_land_time:
+                    # 超过落地时间（且不在 skip 窗口内）→ 进入 S1
+                    self._transition_to_s1()
+
             self._obs.append(obs)
 
-        # ── 反弹检测 ──
+        # ── S0 阶段：拟合 + 更新落地时间 ──
         if self._stage == 0:
-            self._detect_bounce()
+            if self._fit_s0():
+                # RMSE 过大 → 追踪错误球 → 重置
+                return TrackerResult(prediction=None, state=TrackerState.DONE)
 
-        # ── 反弹后完成检测（球二次落地 → DONE） ──
+        # ── S1 阶段：反弹后处理 ──
         if self._stage == 1:
             self._update_post_bounce(obs)
             if self._detect_throw_complete():
@@ -357,34 +373,33 @@ class Curve3Tracker:
                 self._reset_throw()
                 return TrackerResult(prediction=None, state=TrackerState.DONE)
 
-        # ── 拟合 ──
-        self._fit()
-
-        # ── 二次落地检测（通过 S1 拟合曲线预测） ──
-        if self._stage == 1 and self._curve1 is not None:
-            self._update_land2_time()
-            if self._t_land2 is not None and obs.t >= self._t_land2:
-                self.reset_times.append(obs.t)
-                self._reset_throw()
+            if self._fit_s1():
+                # S1 RMSE 过大 → 追踪错误球 → 重置
                 return TrackerResult(prediction=None, state=TrackerState.DONE)
+
+            # 二次落地检测
+            if self._curve1 is not None:
+                self._update_land2_time()
+                if self._t_land2 is not None and obs.t >= self._t_land2:
+                    self.reset_times.append(obs.t)
+                    self._reset_throw()
+                    return TrackerResult(prediction=None, state=TrackerState.DONE)
 
         # ── 确定当前状态 ──
         if self._stage == 0:
-            if len(self._obs) >= self.min_points:
+            if len(self._obs) >= self.min_points and self._curve0 is not None:
                 self._state = TrackerState.TRACKING_S0
             else:
                 self._state = TrackerState.IDLE
         else:
-            # stage == 1：反弹后
-            n_post = len(self._obs) - (self._bounce_index or 0)
+            n_post = self._n_post_fit
             if n_post < self.min_stage1_points:
-                # 反弹后采样不足，处于"落地中"阶段，不输出预测
                 self._state = TrackerState.IN_LANDING
             else:
                 self._state = TrackerState.TRACKING_S1
 
         # ── 预测 ──
-        pred = self._predict(obs.t)
+        pred = self._predict(time.perf_counter())
         if pred is not None:
             self.predictions.append(pred)
             if pred.stage == 0:
@@ -486,14 +501,15 @@ class Curve3Tracker:
 
     def _detect_throw_complete(self) -> bool:
         """反弹后球回到地面 → 本次抛球结束。"""
-        if self._bounce_index is None:
+        if self._t_land is None:
             return False
-        n_post = len(self._obs) - self._bounce_index
-        if n_post < 10:
+        post = [o for o in self._obs
+                if o.t > self._t_land + self.land_skip_time]
+        if len(post) < 10:
             return False
-        if self._post_bounce_max_z < self.bounce_z_threshold * 2:
+        if self._post_bounce_max_z < 300:
             return False
-        return self._obs[-1].z < self.bounce_z_threshold
+        return self._obs[-1].z < 100
 
     def _update_land2_time(self) -> None:
         """用 S1 拟合曲线预测二次落地时间。超过此时间后不再给出预测。"""
@@ -505,45 +521,100 @@ class Curve3Tracker:
         if t_land is not None:
             self._t_land2 = t_land
 
-    # ── 反弹检测 ──
+    # ── S0 拟合 + 落地时间预测 ──
 
-    def _detect_bounce(self) -> None:
+    @staticmethod
+    def _compute_fit_rmse(
+        curve: FittedCurve, obs: List[BallObservation],
+    ) -> Tuple[float, float, float]:
+        """计算拟合曲线对观测点的 RMSE (mm)，返回 (rmse_x, rmse_y, rmse_z)。"""
+        err_sq = np.zeros(3)
+        for o in obs:
+            px, py, pz = curve.predict(o.t)
+            err_sq[0] += (px - o.x) ** 2
+            err_sq[1] += (py - o.y) ** 2
+            err_sq[2] += (pz - o.z) ** 2
+        rmse = np.sqrt(err_sq / len(obs))
+        return float(rmse[0]), float(rmse[1]), float(rmse[2])
+
+    def _fit_s0(self) -> bool:
+        """
+        S0 阶段：每帧拟合抛物线，更新落地时间预测。
+
+        当 n >= min_points 时：
+          1. 检查 RMSE → 过大则认为追踪到错误球，触发重置
+          2. 用 solve_t_for_z(ground_z) 计算预测落地时间（每帧更新）
+
+        落地时间用于 update() 中判断 S0→S1 转换：
+          - 观测在落地 ±land_skip_time 内 → 跳过
+          - 观测超过落地 +land_skip_time → 进入 S1
+
+        Returns:
+            True 如果发生重置（RMSE 过大），False 正常。
+        """
         n = len(self._obs)
-        if n < 4:
-            return
-        for i in range(max(2, n - 5), n):
-            p2, p1, cur = self._obs[i-2], self._obs[i-1], self._obs[i]
-            if (p2.z > p1.z and cur.z > p1.z
-                    and p1.z < self.bounce_z_threshold):
-                self._stage = 1
-                self._bounce_index = i - 1
-                self._bounce_time = p1.t
-                # 用 S0 曲线预测落地时间（比观测点更精确）
-                if self._curve0 is not None:
-                    t_pred = self._curve0.solve_t_for_z(
-                        self.ground_z, latest=True)
-                    self._t_land = t_pred if t_pred is not None else p1.t
-                else:
-                    self._t_land = p1.t
-                return
+        if n < 3:
+            return False
 
-    # ── 曲线拟合 ──
+        curve = fit_curve(self._obs)
+        if curve is None:
+            return False
 
-    def _fit(self) -> None:
-        if self._stage == 0:
-            if len(self._obs) >= self.min_points:
-                self._curve0 = fit_curve(self._obs)
-        else:
-            if self._t_land is not None:
-                t_lo = self._t_land - self.land_skip_time
-                t_hi = self._t_land + self.land_skip_time
-                pre = [o for o in self._obs if o.t < t_lo]
-                post = [o for o in self._obs if o.t > t_hi]
-                self._n_post_fit = len(post)
-                if len(pre) >= self.min_points:
-                    self._curve0 = fit_curve(pre)
-                if len(post) >= self.min_points:
-                    self._curve1 = fit_curve(post)
+        self._curve0 = curve
+
+        if n >= self.min_points:
+            # RMSE 质量检查：追踪错误球 → 重置
+            rx, ry, rz = self._compute_fit_rmse(curve, self._obs)
+            if max(rx, ry, rz) > self.fit_rmse_max:
+                self.reset_times.append(self._obs[-1].t)
+                self._reset_throw()
+                return True
+
+            # 更新预测落地时间（latest=True 取下降阶段的解）
+            t_land = curve.solve_t_for_z(
+                self.ground_z, after_time=curve.t_ref, latest=True)
+            if t_land is not None:
+                self._predicted_land_time = t_land
+
+        return False
+
+    def _transition_to_s1(self) -> None:
+        """S0 → S1 转换：锁定落地时间，设置反弹参数。"""
+        self._stage = 1
+        self._bounce_time = self._predicted_land_time
+        self._t_land = self._predicted_land_time
+        # 当前 _obs 中全是 S0 观测，下一个 append 的将是 S1 的第一个
+        self._bounce_index = len(self._obs)
+
+    # ── S1 拟合 ──
+
+    def _fit_s1(self) -> bool:
+        """
+        S1 阶段：拟合反弹后观测，检查 RMSE 质量。
+
+        Returns:
+            True 如果发生重置（RMSE 过大），False 正常。
+        """
+        if self._t_land is None:
+            return False
+        t_hi = self._t_land + self.land_skip_time
+        post = [o for o in self._obs if o.t > t_hi]
+        self._n_post_fit = len(post)
+        if len(post) < 3:
+            return False
+        curve = fit_curve(post)
+        if curve is None:
+            return False
+        self._curve1 = curve
+
+        # RMSE 质量检查
+        if len(post) >= self.min_stage1_points:
+            rx, ry, rz = self._compute_fit_rmse(curve, post)
+            if max(rx, ry, rz) > self.fit_rmse_max:
+                self.reset_times.append(self._obs[-1].t)
+                self._reset_throw()
+                return True
+        return False
 
     # ── 击球预测 ──
 

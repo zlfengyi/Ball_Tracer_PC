@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-UDP → ROS2 桥接节点：接收 run_tracker 通过 UDP 发送的小车位置，
-发布到 ROS2 topic /pc_car_loc。
+UDP → ROS2 桥接节点：接收 run_tracker 通过 UDP 发送的数据，
+按 topic 字段路由到对应的 ROS2 topic。
+
+支持的 topic：
+  - /pc_car_loc       小车位置 + yaw
+  - /predict_hit_pos  预测击球位置
 
 run_tracker.py (Python 3.13) 通过 UDP sendto 127.0.0.1:5858 发送 JSON，
-本节点在后台线程接收，ROS2 定时器 30Hz 发布最新数据。
+JSON 中包含 "topic" 字段指定目标 ROS2 topic。
 
 用法：
     ros2/run_ros2.bat ros2/car_loc_bridge.py
@@ -20,18 +24,26 @@ from rclpy.node import Node
 from std_msgs.msg import String
 
 UDP_PORT = 5858
-TOPIC = "/pc_car_loc"
 PUBLISH_HZ = 30
 
+TOPICS = {
+    "car_loc": "/pc_car_loc",
+    "predict_hit": "/predict_hit_pos",
+}
 
-class CarLocBridge(Node):
+
+class TrackerBridge(Node):
     def __init__(self):
-        super().__init__("car_loc_bridge")
+        super().__init__("tracker_bridge")
 
-        self._pub = self.create_publisher(String, TOPIC, 10)
+        self._pubs = {}
+        for key, topic in TOPICS.items():
+            self._pubs[key] = self.create_publisher(String, topic, 10)
+
         self._timer = self.create_timer(1.0 / PUBLISH_HZ, self._on_timer)
 
-        self._latest: str | None = None
+        # 每个 topic 缓存最新消息
+        self._latest: dict[str, str] = {}
         self._lock = threading.Lock()
         self._count = 0
 
@@ -43,46 +55,48 @@ class CarLocBridge(Node):
             target=self._udp_recv_loop, daemon=True)
         self._udp_thread.start()
 
+        topics_str = ", ".join(TOPICS.values())
         self.get_logger().info(
-            f"CarLocBridge 已启动：UDP:{UDP_PORT} → {TOPIC}")
+            f"TrackerBridge 已启动：UDP:{UDP_PORT} → {topics_str}")
 
     def _udp_recv_loop(self):
         while rclpy.ok():
             try:
                 data, _ = self._sock.recvfrom(4096)
-                with self._lock:
-                    self._latest = data.decode("utf-8")
+                text = data.decode("utf-8")
+                d = json.loads(text)
+                key = d.pop("topic", None)
+                if key and key in self._pubs:
+                    payload = json.dumps(d)
+                    with self._lock:
+                        self._latest[key] = payload
             except socket.timeout:
                 continue
-            except OSError:
-                break
+            except (OSError, json.JSONDecodeError):
+                continue
 
     def _on_timer(self):
         with self._lock:
-            payload = self._latest
-            self._latest = None
+            pending = dict(self._latest)
+            self._latest.clear()
 
-        if payload is None:
-            return
+        for key, payload in pending.items():
+            pub = self._pubs.get(key)
+            if pub is None:
+                continue
+            msg = String()
+            msg.data = payload
+            pub.publish(msg)
 
-        msg = String()
-        msg.data = payload
-        self._pub.publish(msg)
-
-        self._count += 1
-        if self._count % 300 == 1:
-            try:
-                d = json.loads(payload)
+            self._count += 1
+            if self._count % 300 == 1:
                 self.get_logger().info(
-                    f"#{self._count} car=({d.get('x', '?')}, "
-                    f"{d.get('y', '?')}, {d.get('z', '?')}) m")
-            except json.JSONDecodeError:
-                pass
+                    f"#{self._count} {TOPICS[key]}: {payload[:80]}")
 
 
 def main():
     rclpy.init()
-    node = CarLocBridge()
+    node = TrackerBridge()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

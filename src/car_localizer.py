@@ -102,12 +102,10 @@ class CarLocalizer:
             cv2.aruco.DICT_APRILTAG_36h11
         )
         params = cv2.aruco.DetectorParameters()
-        # 速度优化：缩小自适应阈值窗口范围
-        params.adaptiveThreshWinSizeMax = 21
-        # 限制标记周长范围，跳过过大区域
-        params.maxMarkerPerimeterRate = 0.5
-        # 降低轮廓近似精度，加快轮廓筛选
-        params.polygonalApproxAccuracyRate = 0.1
+        # 提高 cell 采样分辨率，改善斜视角下的解码成功率
+        params.perspectiveRemovePixelPerCell = 8
+        # 忽略 cell 边缘 30%，减少边缘串扰
+        params.perspectiveRemoveIgnoredMarginPerCell = 0.3
         self._detector = cv2.aruco.ArucoDetector(aruco_dict, params)
 
     # ── 属性 ──────────────────────────────────────────────────────────

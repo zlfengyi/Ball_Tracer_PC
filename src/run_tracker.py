@@ -32,6 +32,7 @@
 from __future__ import annotations
 
 import argparse
+import signal
 import datetime
 import json
 import math
@@ -347,51 +348,19 @@ class VideoWriterThread:
             self._process(job)
 
     def _process(self, job: WriteJob) -> None:
-        """缩放 → 缩放检测坐标 → 标注 → 写入视频。"""
-        half_images = {}
-        cam_scales = {}  # {sn: (sx, sy)} — 每台相机实际缩放比例
+        """缩放 → 拼接 → 写入原始视频（不标注）。"""
+        panels = []
         for sn in job.serials:
             if sn in job.images:
-                orig_h, orig_w = job.images[sn].shape[:2]
-                half_images[sn] = cv2.resize(
-                    job.images[sn], (self._half_w, self._half_h))
-                cam_scales[sn] = (self._half_w / orig_w,
-                                  self._half_h / orig_h)
-
-        half_dets = {}
-        for sn in job.serials:
-            sx, sy = cam_scales.get(sn, (0.5, 0.5))
-            half_dets[sn] = [
-                BallDetection(
-                    x=d.x * sx, y=d.y * sy, confidence=d.confidence,
-                    x1=d.x1 * sx, y1=d.y1 * sy, x2=d.x2 * sx, y2=d.y2 * sy,
-                )
-                for d in job.detections.get(sn, [])
-            ]
-
-        # 缩放切片区域到半分辨率（使用每台相机的实际缩放比例）
-        half_tiles = {}
-        for sn, t in job.tiles.items():
-            sx, sy = cam_scales.get(sn, (0.5, 0.5))
-            half_tiles[sn] = TileRect(
-                x=int(t.x * sx), y=int(t.y * sy),
-                w=int(t.w * sx), h=int(t.h * sy),
-            )
-
-        annotated = annotate_frame(
-            half_images, half_dets, job.serials,
-            job.exposure_wall, job.ball3d,
-            job.tracker_result, job.frame_idx,
-            latency_ms=job.latency_ms,
-            tiles=half_tiles,
-            car_loc=job.car_loc,
-            cam_scales=cam_scales,
-        )
-
-        self._writer.write(annotated)
+                panels.append(cv2.resize(
+                    job.images[sn], (self._half_w, self._half_h)))
+        if not panels:
+            return
+        stitched = np.hstack(panels)
+        self._writer.write(stitched)
 
         if self._display:
-            cv2.imshow("Tracker", annotated)
+            cv2.imshow("Tracker", stitched)
             cv2.waitKey(1)
 
 
@@ -421,6 +390,20 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
+    # ── 加载追踪配置 ──────────────────────────────────────────────────────
+    _config_dir = Path(__file__).resolve().parent / "config"
+    _tracker_config_path = _config_dir / "tracker.json"
+    with open(_tracker_config_path, encoding="utf-8") as _f:
+        tracker_cfg = json.load(_f)
+
+    tile_size = tracker_cfg.get("tile_size", 1280)
+    track_timeout_s = tracker_cfg.get("track_timeout_s", 0.3)
+    search_hold_frames = tracker_cfg.get("search_hold_frames", 4)
+    min_cameras_for_3d = tracker_cfg.get("min_cameras_for_3d", 2)
+    max_reproj_error_px = tracker_cfg.get("max_reproj_error_px", 15.0)
+    curve3_cfg = tracker_cfg.get("curve3", {})
+
+
     # ── 初始化组件 ──────────────────────────────────────────────────────
     print("=" * 60)
     print("网球定位与实验视频保存")
@@ -442,7 +425,7 @@ def main() -> int:
     print(f"  相机: {cam_serials}")
 
     print("[3/5] 初始化 Curve3Tracker...")
-    tracker = Curve3Tracker()
+    tracker = Curve3Tracker(**curve3_cfg)
     print(f"  ideal_hit_z={tracker.ideal_hit_z}mm, cor={tracker.cor}, "
           f"cor_xy={tracker.cor_xy}")
 
@@ -453,7 +436,10 @@ def main() -> int:
     # ── ROS2 桥接子进程（UDP → /pc_car_loc topic）──
     _udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     _udp_addr = ("127.0.0.1", 5858)
+    _udp_sock2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    _udp_addr2 = ("127.0.0.1", 5859)
     _ros2_proc: subprocess.Popen | None = None
+    _ros2_proc2: subprocess.Popen | None = None
     _ros2_bat = _ROOT / "ros2" / "run_car_loc.bat"
     if _ros2_bat.exists():
         try:
@@ -468,10 +454,23 @@ def main() -> int:
             print(f"  ROS2 桥接启动失败: {e}")
     else:
         print(f"  ROS2 桥接脚本不存在，跳过: {_ros2_bat}")
+    _ros2_bat2 = _ROOT / "ros2" / "run_predict_hit.bat"
+    if _ros2_bat2.exists():
+        try:
+            _ros2_proc2 = subprocess.Popen(
+                [str(_ros2_bat2)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            )
+            print(f"  ROS2 predict_hit 桥接已启动 (PID={_ros2_proc2.pid})")
+        except Exception as e:
+            print(f"  ROS2 predict_hit 桥接启动失败: {e}")
 
     # ── 日志容器 ────────────────────────────────────────────────────────
     log_observations: list[dict] = []
     log_predictions: list[dict] = []
+    log_car_locs: list[dict] = []
     log_frames: list[dict] = []
     log_state_transitions: list[dict] = []
 
@@ -508,7 +507,12 @@ def main() -> int:
               f"视频输出分辨率: {frame_w // 2 * n_cams}x{frame_h // 2}")
 
         # 初始化分片管理器
-        tile_mgr = TileManager(camera_sizes)
+        tile_mgr = TileManager(
+            camera_sizes,
+            tile_size=tile_size,
+            track_timeout=track_timeout_s,
+            search_hold_frames=search_hold_frames,
+        )
         for sn in cam_serials:
             n_tiles = tile_mgr.get_search_tile_count(sn)
             sz = camera_sizes.get(sn, (0, 0))
@@ -517,9 +521,9 @@ def main() -> int:
         # ── YOLO 预热 + 自动检测 batch size ──
         print("  YOLO 预热中...")
         # 用切片大小的图像预热（匹配实际推理输入）
-        ts = tile_mgr._tile_size
-        warmup_img = img_sample[:ts, :ts] if (
-            img_sample.shape[0] >= ts and img_sample.shape[1] >= ts
+        _ts = tile_mgr._tile_size
+        warmup_img = img_sample[:_ts, :_ts] if (
+            img_sample.shape[0] >= _ts and img_sample.shape[1] >= _ts
         ) else img_sample
 
         engine_batch = n_cams
@@ -551,6 +555,49 @@ def main() -> int:
             )
             print(f"  视频输出: {video_path}")
 
+        # ── 并行解码线程池 ──
+        from concurrent.futures import ThreadPoolExecutor
+        _decode_pool = ThreadPoolExecutor(max_workers=len(cam_serials))
+
+        # ── 小车定位后台线程（不阻塞主循环）──
+        _car_lock = threading.Lock()
+        _car_latest: CarLoc | None = None
+        _car_images: dict[str, np.ndarray] | None = None
+        _car_event = threading.Event()
+        _car_stop = threading.Event()
+
+        def _car_worker():
+            nonlocal _car_latest
+            while not _car_stop.is_set():
+                _car_event.wait(timeout=0.5)
+                if _car_stop.is_set():
+                    break
+                _car_event.clear()
+                with _car_lock:
+                    imgs = _car_images
+                if imgs is None:
+                    continue
+                t_car = time.time()
+                result = car_localizer.locate(imgs, t=t_car)
+                with _car_lock:
+                    _car_latest = result
+
+        _car_thread = threading.Thread(target=_car_worker, daemon=True)
+        _car_thread.start()
+
+        # ── 信号处理（确保被终止时也能保存数据）──
+        _shutdown = threading.Event()
+        _stop_file = output_dir / '.stop_tracker'
+        _stop_file.unlink(missing_ok=True)  # 清除上次残留
+
+        def _signal_handler(sig, frame):
+            _shutdown.set()
+
+        signal.signal(signal.SIGINT, _signal_handler)
+        signal.signal(signal.SIGTERM, _signal_handler)
+        if hasattr(signal, 'SIGBREAK'):
+            signal.signal(signal.SIGBREAK, _signal_handler)
+
         # ── 主循环 ────────────────────────────────────────────────────
         frame_idx = 0
         t_start = time.monotonic()
@@ -566,18 +613,22 @@ def main() -> int:
         print("\a", end="", flush=True)
 
         try:
-            while time.monotonic() - t_start < args.duration:
+            while not _shutdown.is_set() and time.monotonic() - t_start < args.duration:
+                # 检测停止文件
+                if _stop_file.exists():
+                    print("检测到停止文件，优雅退出...")
+                    _stop_file.unlink(missing_ok=True)
+                    break
                 frames = cap.get_frames(timeout_s=1.0)
                 if frames is None:
                     timeout_count += 1
                     continue
 
-                # ── Bayer 解码（全分辨率）──
+                # ── Bayer 解码（全分辨率，并行）──
                 _t0 = time.perf_counter()
-                images = {}
-                for sn in cam_serials:
-                    if sn in frames:
-                        images[sn] = frame_to_numpy(frames[sn])
+                _decode_sns = [sn for sn in cam_serials if sn in frames]
+                _decode_futs = {sn: _decode_pool.submit(frame_to_numpy, frames[sn]) for sn in _decode_sns}
+                images = {sn: fut.result() for sn, fut in _decode_futs.items()}
                 _t1 = time.perf_counter()
                 _t_decode_sum += _t1 - _t0
 
@@ -625,36 +676,50 @@ def main() -> int:
                     if len(dets) == 1
                 }
 
-                if len(good_dets) >= 2:
-                    ball3d = localizer.triangulate(good_dets)
+                # 尝试三角测量并检查重投影误差
+                if len(good_dets) >= min_cameras_for_3d:
+                    candidate = localizer.triangulate(good_dets)
+                    if candidate.reprojection_error <= max_reproj_error_px:
+                        ball3d = candidate
 
-                    # 更新分片跟踪状态
-                    for sn, det in good_dets.items():
-                        tile_mgr.update_tracking(
-                            sn, det.x, det.y, exposure_pc)
+                        # 3D 定位成功 → 跟踪模式
+                        for sn, det in good_dets.items():
+                            tile_mgr.on_3d_located(
+                                sn, det.x, det.y, exposure_pc)
 
-                    obs = BallObservation(
-                        x=ball3d.x, y=ball3d.y,
-                        z=ball3d.z, t=exposure_pc,
-                    )
-                    tracker_result = tracker.update(obs)
+                        obs = BallObservation(
+                            x=ball3d.x, y=ball3d.y,
+                            z=ball3d.z, t=exposure_pc,
+                        )
+                        tracker_result = tracker.update(obs)
 
-                    log_observations.append({
-                        "x": ball3d.x, "y": ball3d.y, "z": ball3d.z,
-                        "t": exposure_pc,
-                        "reproj_err": ball3d.reprojection_error,
-                        "confidence": ball3d.confidence,
-                        "cameras_used": ball3d.cameras_used,
-                    })
-
-                    if tracker_result.prediction is not None:
-                        p = tracker_result.prediction
-                        log_predictions.append({
-                            "x": p.x, "y": p.y, "z": p.z,
-                            "stage": p.stage,
-                            "ct": p.ct, "ht": p.ht,
+                        log_observations.append({
+                            "x": ball3d.x, "y": ball3d.y, "z": ball3d.z,
+                            "t": exposure_pc,
+                            "reproj_err": ball3d.reprojection_error,
+                            "confidence": ball3d.confidence,
+                            "cameras_used": ball3d.cameras_used,
                         })
+
+                        if tracker_result.prediction is not None:
+                            p = tracker_result.prediction
+                            log_predictions.append({
+                                "x": p.x, "y": p.y, "z": p.z,
+                                "stage": p.stage,
+                                "ct": p.ct, "ht": p.ht,
+                            })
+                    else:
+                        # 重投影误差过大 → 当作 2D 检测
+                        for sn in good_dets:
+                            tile_mgr.on_2d_detected(sn, frame_tiles[sn])
+                        tracker_result = TrackerResult(
+                            prediction=None,
+                            state=tracker.tracker_state,
+                        )
                 else:
+                    # 不足相机数 → 检测到球的相机进入持续模式
+                    for sn in good_dets:
+                        tile_mgr.on_2d_detected(sn, frame_tiles[sn])
                     tracker_result = TrackerResult(
                         prediction=None,
                         state=tracker.tracker_state,
@@ -670,14 +735,29 @@ def main() -> int:
                     })
                     prev_state = tracker_result.state
 
-                # ── 小车 AprilTag 定位 ──
-                car_loc: CarLoc | None = None
-                car_loc = car_localizer.locate(images, t=exposure_pc)
+                # ── 小车 AprilTag 定位（后台线程异步执行）──
+                with _car_lock:
+                    _car_images = images
+                    car_loc = _car_latest
+                _car_event.set()
 
-                # ── UDP 发送小车位置给 ROS2 桥接 ──
+                if car_loc is not None:
+                    log_car_locs.append({
+                        "x": round(car_loc.x, 1),
+                        "y": round(car_loc.y, 1),
+                        "z": round(car_loc.z, 1),
+                        "yaw": round(car_loc.yaw, 4),
+                        "t": car_loc.t,
+                        "tag_id": car_loc.tag_id,
+                        "reprojection_error": round(
+                            car_loc.reprojection_error, 2),
+                    })
+
+                # ── UDP 发送给 ROS2 桥接 ──
                 if car_loc is not None:
                     try:
                         _udp_sock.sendto(json.dumps({
+                            "topic": "car_loc",
                             "x": round(car_loc.x / 1000, 4),
                             "y": round(car_loc.y / 1000, 4),
                             "z": round(car_loc.z / 1000, 4),
@@ -685,6 +765,20 @@ def main() -> int:
                             "t": round(car_loc.t, 6),
                             "tag_id": car_loc.tag_id,
                         }).encode(), _udp_addr)
+                    except OSError:
+                        pass
+                if tracker_result.prediction is not None:
+                    p = tracker_result.prediction
+                    try:
+                        _udp_sock2.sendto(json.dumps({
+                            "x": round(p.x / 1000, 4),
+                            "y": round(p.y / 1000, 4),
+                            "z": round(p.z / 1000, 4),
+                            "stage": p.stage,
+                            "ct": round(p.ct, 6),
+                            "ht": round(p.ht, 6),
+                            "duration": round(p.ht - p.ct, 4),
+                        }).encode(), _udp_addr2)
                     except OSError:
                         pass
 
@@ -703,7 +797,7 @@ def main() -> int:
                         car_loc=car_loc,
                     ))
 
-                # ── 日志 ──
+                # ── 日志（含完整标注数据）──
                 frame_entry = {
                     "idx": frame_idx,
                     "exposure_pc": exposure_pc,
@@ -713,15 +807,47 @@ def main() -> int:
                     "state": tracker_result.state.value,
                     "latency_ms": round(latency_ms, 1),
                 }
+                # 检测框（含 bbox）
+                frame_dets = {}
                 for sn in cam_serials:
                     dets = all_detections.get(sn, [])
-                    frame_entry[f"det_{sn[-3:]}"] = len(dets)
                     if dets:
-                        frame_entry[f"det_{sn[-3:]}_detail"] = [
+                        frame_dets[sn] = [
                             {"x": round(d.x), "y": round(d.y),
+                             "x1": round(d.x1), "y1": round(d.y1),
+                             "x2": round(d.x2), "y2": round(d.y2),
                              "conf": round(d.confidence, 3)}
                             for d in dets
                         ]
+                if frame_dets:
+                    frame_entry["detections"] = frame_dets
+                # 切片区域
+                if frame_tiles:
+                    frame_entry["tiles"] = {
+                        sn: {"x": t.x, "y": t.y, "w": t.w, "h": t.h}
+                        for sn, t in frame_tiles.items()
+                    }
+                # 3D 球位置
+                if ball3d is not None:
+                    frame_entry["ball3d"] = {
+                        "x": round(ball3d.x, 1),
+                        "y": round(ball3d.y, 1),
+                        "z": round(ball3d.z, 1),
+                        "reproj": round(ball3d.reprojection_error, 1),
+                        "conf": round(ball3d.confidence, 3),
+                        "cameras": ball3d.cameras_used,
+                    }
+                # 预测
+                pred = tracker_result.prediction
+                if pred is not None:
+                    frame_entry["prediction"] = {
+                        "x": round(pred.x, 1),
+                        "y": round(pred.y, 1),
+                        "z": round(pred.z, 1),
+                        "stage": pred.stage,
+                        "lead_ms": round((pred.ht - pred.ct) * 1000),
+                    }
+                # 小车位置
                 if car_loc is not None:
                     frame_entry["car_loc"] = {
                         "x": round(car_loc.x),
@@ -730,6 +856,8 @@ def main() -> int:
                         "yaw": round(car_loc.yaw, 4),
                         "tag_id": car_loc.tag_id,
                         "cameras_used": car_loc.cameras_used,
+                        "pixels": {sn: [round(u), round(v)]
+                                   for sn, (u, v) in car_loc.pixels.items()},
                     }
                 log_frames.append(frame_entry)
 
@@ -758,15 +886,27 @@ def main() -> int:
             print("  等待视频写入完成...")
             drop_count = writer_thread.stop()
 
+    # ── 关闭小车定位线程 ──
+    _car_stop.set()
+    _car_event.set()
+    _car_thread.join(timeout=2.0)
+
     # ── 关闭 ROS2 桥接子进程 ──
     _udp_sock.close()
+    _udp_sock2.close()
     if _ros2_proc is not None and _ros2_proc.poll() is None:
         _ros2_proc.terminate()
         try:
             _ros2_proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
             _ros2_proc.kill()
-        print("  ROS2 桥接已关闭")
+    if _ros2_proc2 is not None and _ros2_proc2.poll() is None:
+        _ros2_proc2.terminate()
+        try:
+            _ros2_proc2.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            _ros2_proc2.kill()
+    print("  ROS2 桥接已关闭")
 
     # ── 保存 JSON 结果 ──────────────────────────────────────────────────
     elapsed = time.monotonic() - t_start
@@ -793,6 +933,7 @@ def main() -> int:
             "timeouts": timeout_count,
             "observations_3d": len(log_observations),
             "predictions": len(log_predictions),
+            "car_locs": len(log_car_locs),
             "state_transitions": len(log_state_transitions),
             "reset_times": tracker.reset_times,
             "video_frames_dropped": drop_count,
@@ -802,6 +943,7 @@ def main() -> int:
         },
         "observations": log_observations,
         "predictions": log_predictions,
+        "car_locs": log_car_locs,
         "frames": log_frames,
         "state_transitions": log_state_transitions,
     }
@@ -817,6 +959,7 @@ def main() -> int:
     print(f"  实际帧率:   {frame_idx / elapsed if elapsed > 0 else 0:.1f} fps")
     print(f"  3D 观测:    {len(log_observations)}")
     print(f"  预测数:     {len(log_predictions)}")
+    print(f"  小车定位:   {len(log_car_locs)}")
     print(f"  状态转换:   {len(log_state_transitions)}")
     print(f"  超时次数:   {timeout_count}")
     print(f"  延迟(ms):   avg={lat_avg:.0f}  min={lat_min:.0f}  max={lat_max:.0f}")

@@ -110,11 +110,19 @@ T点宽2m中间在1m处，长2.54m
 
 
 	11.3）run_tracker 实时发布小车位置
-		在运行run_tracker时，我们已经可以获得小车的位置， 通过ros2 topic /pc_car_loc 发送给rk订阅小车位置
+		在运行run_tracker时，我们已经可以获得小车的位置， 通过ros2 topic /pc_car_loc  win->rk， 消息格式为(car_x, car_y, t), 用m和s做单位，其中t表示windows上的时间， rk获取后需要处理时间校准的offset后变成 rk上的时间
 
 
 
-	  		/predict_hit_pos  Win->RK   预测击球位置,  格式为(tx, ty, duration), 表示在duration秒后，到达目标点(tx, ty)
+	11.4） ✅ 已完成 — run_tracker 发布预测击球信息 /predict_hit_pos  Win->RK
+		- 通过 UDP→ROS2 桥接发布到 /predict_hit_pos topic（String JSON）
+		- 格式：{"x": m, "y": m, "z": m, "stage": 0|1, "ct": s, "ht": s, "duration": s}
+		  其中 duration = ht - ct，表示 duration 秒后到达目标点 (x, y, z)
+		- 性能指标（2026-03-09，全画幅 2448x2048，23fps）：
+		  - 帧率：稳定 22.9-23.0 fps（小车定位异步化后从 12fps 提升）
+		  - 延迟：avg=74ms
+		  - 小车定位成功率：99.9%+
+		  - COR 参数：cor_z=0.70, cor_xy=0.42（S0/S1 预测 z 差异 <100mm）
 
 
 
@@ -127,16 +135,34 @@ T点宽2m中间在1m处，长2.54m
 		- 保存视频的时候，同时把每个相机当前切片区域给框出来
 
 
+13） 球拍检测
+	13.1）tracker运行中如果要保存视频，改为保存原始3个视频（分辨率/2） + json
+	13.2) 专门拼接+label的代码
+	13.3）实现单视频里的球拍检测
+
+
 --------------------------------------Windows部分结束-------------------------------------------
 
-21）RK runner上，收到来自windows的(car_loc, t)信息， 使用car-loc和IMU信息，实现卡尔曼滤波，得到一个融合后的速度和位置。 请注意IMU更新频率较快，但是car-loc更新频率是慢的 且有时候不会给，最终要的是car-loc是滞后的。基于这个信息能否完成融合？？重点项目！需要calude给出详细的做法，确认后再进行实施
+21）✅ RK runner上，收到来自windows的(car_loc, t)信息， 使用car-loc和IMU信息，实现卡尔曼滤波，得到一个融合后的速度和位置。 请注意IMU更新频率较快，但是car-loc更新频率是慢的 且有时候不会给，最终要的是car-loc是滞后的。基于这个信息能否完成融合？？重点项目！需要calude给出详细的做法，确认后再进行实施
       
 
-22) RK runner上 收到(tx, ty, target_t)信息， 开始启动移动！
-
+22) ✅ RK runner上 收到(tx, ty, target_t)信息， 开始启动移动！
+     - 跑了第一组，试着超目标位置运行了4次，看起来总体是ok的， 移动误差是在5cm水平。
 
 	 
-23） 控制机械调整到stage1z-in-stage0-car-loc 高度！ 和 
+23） 控制机械调整到stage1z-in-stage0-car-loc 高度和位置
+	- Newarm 测试第一版本，可行，但是非常的卡。 Next： 希望换成低速但更丝滑一点的版本
+	- 
+
+24）检测球拍的3d位置，以此全局检测小车、球、拍！ 和启动全面分析：已经有模型了
 
 
-24）
+25）室内搭建固定相机棚子，全局追踪击球效果！ 有必要的话楼上场地也搞！
+
+
+26）基于固定相机的击球误差分析，本周目标实现稳定可击打！
+
+
+
+ claude --resume 05bd1bd6-a964-4c0b-a8ec-9a6a499f5290
+ 
