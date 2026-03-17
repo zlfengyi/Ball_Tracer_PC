@@ -29,6 +29,7 @@ import cv2
 import numpy as np
 
 from .ball_detector import BallDetector, BallDetection
+from .cv_linalg import matvec, projection_matrix, smallest_right_singular_vector
 
 _SRC_DIR = Path(__file__).resolve().parent
 _DEFAULT_CALIB_CONFIG = _SRC_DIR / "config" / "multi_calib.json"
@@ -89,7 +90,7 @@ class BallLocalizer:
             t = np.array(cd["t_world"], dtype=np.float64).reshape(3, 1)
             self._K[sn] = K
             self._D[sn] = D
-            self._P[sn] = K @ np.hstack([R, t])
+            self._P[sn] = projection_matrix(K, R, t)
 
     @property
     def serials(self) -> list[str]:
@@ -124,8 +125,9 @@ class BallLocalizer:
         # 收集恰好检测到 1 个网球的相机
         detections = {}
         for sn, dets in zip(sns, det_results):
-            if len(dets) == 1:
-                detections[sn] = dets[0]
+            ball_dets = [det for det in dets if det.is_tennis_ball]
+            if len(ball_dets) == 1:
+                detections[sn] = ball_dets[0]
 
         if len(detections) < 2:
             return None
@@ -165,8 +167,7 @@ class BallLocalizer:
         A = np.array(A)
 
         # SVD 求解
-        _, _, Vt = np.linalg.svd(A)
-        X = Vt[-1]
+        X = smallest_right_singular_vector(A)
         pts_3d = (X[:3] / X[3])
 
         # 重投影误差
@@ -176,7 +177,7 @@ class BallLocalizer:
             det = detections[sn]
             pixels[sn] = (det.x, det.y)
             pt_h = np.append(pts_3d, 1.0)
-            proj = self._P[sn] @ pt_h
+            proj = matvec(self._P[sn], pt_h)
             proj = proj[:2] / proj[2]
             err = np.sqrt((proj[0] - det.x) ** 2 + (proj[1] - det.y) ** 2)
             errs.append(err)

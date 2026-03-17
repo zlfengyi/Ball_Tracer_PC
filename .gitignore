@@ -12,6 +12,8 @@ dist/
 build/
 *.whl
 .venv/
+.venv_clean/
+.venv_ros2/
 venv/
 env/
 
@@ -33,6 +35,7 @@ yolo_model/*.engine
 yolo_model/*.engine.bak
 yolo_model/*.onnx
 yolo_model/*.pt
+yolo_model/*.cache
 
 # ── 标定图片（40GB+） ──
 calibration/images/
@@ -54,3 +57,4 @@ yolo_test_imgs/
 
 # ── Claude Code 临时文件 ──
 .claude/
+NUL

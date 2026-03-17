@@ -500,7 +500,7 @@ class ImageGrabber(threading.Thread):
         self._timeout_ms = int(timeout_ms)
         self._queue: deque[Frame] = deque(maxlen=self.MAX_QUEUE)
         self._lock = threading.Lock()
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self._recalib_every = recalib_every
         self._time_offset: float = 0.0       # PC epoch - dev_time（秒）
         self._calib_thread: Optional[threading.Thread] = None
@@ -518,7 +518,7 @@ class ImageGrabber(threading.Thread):
             self._calib_thread.start()
 
         st_frame = MV_FRAME_OUT()
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             memset(byref(st_frame), 0, sizeof(st_frame))
             ret = self._cam.MV_CC_GetImageBuffer(st_frame, self._timeout_ms)
             if ret != 0:
@@ -562,9 +562,9 @@ class ImageGrabber(threading.Thread):
         # recalib_every 帧 × 帧周期 ≈ 校准间隔秒数
         # 但我们不知道确切帧率，用固定时间间隔：recalib_every * 43ms ≈ 0.43s
         interval = max(self._recalib_every * 0.043, 0.5)  # 至少 0.5 秒
-        while not self._stop.is_set():
-            self._stop.wait(interval)
-            if self._stop.is_set():
+        while not self._stop_event.is_set():
+            self._stop_event.wait(interval)
+            if self._stop_event.is_set():
                 break
             new_offset = calibrate_time_offset(self._cam)
             # 平滑更新：如果新旧 offset 差异过大（>5ms），可能是测量异常，跳过
@@ -590,7 +590,7 @@ class ImageGrabber(threading.Thread):
             return len(self._queue)
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
 
     def _drain_keep_latest(self) -> Optional[Frame]:
         """清空队列，仅返回最新帧。"""

@@ -5,6 +5,31 @@
     "search_hold_frames": 4,
     "min_cameras_for_3d": 2,
     "max_reproj_error_px": 15.0,
+    "detection_postprocess": {
+        "duplicate_iou_threshold": 0.95,
+        "max_box_aspect_ratio": 1.2
+    },
+    "stationary_filter": {
+        "enabled": true,
+        "window_s": 15.0,
+        "radius_px": 2.0,
+        "min_occurrences": 6
+    },
+    "car_localizer": {
+        "enabled": true,
+        "active_interval_s": 0.1,
+        "idle_interval_s": 0.5,
+        "idle_after_misses": 3
+    },
+    "video_output": {
+        "codec": "XVID"
+    },
+    "post_run": {
+        "enabled": true,
+        "generate_html": true,
+        "generate_annotated_video": true,
+        "annotated_video_no_racket": true
+    },
 
     "curve3": {
         "ideal_hit_z": 800.0,

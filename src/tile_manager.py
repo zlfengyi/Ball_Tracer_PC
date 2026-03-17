@@ -208,6 +208,7 @@ class TileManager:
             y1=det.y1 * sy + tile.y,
             x2=det.x2 * sx + tile.x,
             y2=det.y2 * sy + tile.y,
+            label=det.label,
         )
 
     def get_search_tile_count(self, sn: str) -> int:

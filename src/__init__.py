@@ -23,6 +23,7 @@ from .ball_grabber import (
 from .ball_detector import BallDetection, BallDetector
 from .ball_localizer import Ball3D, BallLocalizer
 from .car_localizer import CarDetection, CarLoc, CarLocalizer
+from .stationary_filter import StationaryObjectFilter
 from .tile_manager import TileManager, TileRect
 from .curve3 import (
     BallObservation, PredictHitPos, Curve3Tracker, FittedCurve, fit_curve,
@@ -44,6 +45,7 @@ __all__ = [
     "CarDetection",
     "CarLoc",
     "CarLocalizer",
+    "StationaryObjectFilter",
     "BallObservation",
     "PredictHitPos",
     "Curve3Tracker",

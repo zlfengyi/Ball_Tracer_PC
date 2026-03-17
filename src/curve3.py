@@ -49,12 +49,15 @@ Stage 1（落地后）：
 
 from __future__ import annotations
 
+import math
 import time
 
 import numpy as np
 from dataclasses import dataclass
 from enum import Enum
 from typing import List, Optional, Tuple
+
+from .cv_linalg import solve_least_squares
 
 GRAVITY = 9800.0  # mm/s²
 
@@ -165,7 +168,7 @@ class FittedCurve:
         disc = b * b - 4.0 * a * c
         if disc < 0:
             return None
-        sq = np.sqrt(disc)
+        sq = math.sqrt(disc)
         t1 = (-b - sq) / (2.0 * a) + self.t_ref
         t2 = (-b + sq) / (2.0 * a) + self.t_ref
         min_t = after_time if after_time is not None else self.t_ref
@@ -196,10 +199,10 @@ def fit_curve(observations: List[BallObservation]) -> Optional[FittedCurve]:
     ys = np.array([obs.y for obs in observations])
     zs = np.array([obs.z for obs in observations])
     A_lin = np.column_stack([np.ones_like(ts), ts])
-    ax, bx = np.linalg.lstsq(A_lin, xs, rcond=None)[0]
-    ay, by = np.linalg.lstsq(A_lin, ys, rcond=None)[0]
+    ax, bx = solve_least_squares(A_lin, xs)
+    ay, by = solve_least_squares(A_lin, ys)
     A_quad = np.column_stack([np.ones_like(ts), ts, ts ** 2])
-    az, bz, cz = np.linalg.lstsq(A_quad, zs, rcond=None)[0]
+    az, bz, cz = solve_least_squares(A_quad, zs)
     return FittedCurve(ax=ax, bx=bx, ay=ay, by=by,
                        az=az, bz=bz, cz=cz, t_ref=t_ref)
 
@@ -228,6 +231,7 @@ class Curve3Tracker:
         motion_window_s: float = 0.2,
         motion_min_y: float = 500.0,
         land_skip_time: float = 0.03,
+        prediction_time_mode: str = "wall",
     ):
         """
         Args:
@@ -269,6 +273,11 @@ class Curve3Tracker:
         self.motion_window_s = motion_window_s
         self.motion_min_y = motion_min_y
         self.land_skip_time = land_skip_time
+        if prediction_time_mode not in ("wall", "observation"):
+            raise ValueError(
+                "prediction_time_mode must be 'wall' or 'observation'"
+            )
+        self.prediction_time_mode = prediction_time_mode
 
         # ── 全局累积（不随重置清除） ──
         self.predictions: List[PredictHitPos] = []
@@ -399,13 +408,19 @@ class Curve3Tracker:
                 self._state = TrackerState.TRACKING_S1
 
         # ── 预测 ──
-        pred = self._predict(time.perf_counter())
+        pred = self._predict(self._current_prediction_time(obs))
         if pred is not None:
             self.predictions.append(pred)
             if pred.stage == 0:
                 self._last_s0_pred = pred
 
         return TrackerResult(prediction=pred, state=self._state)
+
+    def _current_prediction_time(self, obs: BallObservation) -> float:
+        """Return ct on the same time axis as obs.t."""
+        if self.prediction_time_mode == "observation":
+            return obs.t
+        return time.time()
 
     # ── 运动过滤 ──
 
@@ -424,11 +439,15 @@ class Curve3Tracker:
         if len(self._pending_obs) < 2:
             return False
         latest = self._pending_obs[-1]
-        # 从新到旧扫描，找第一个 dt >= window 的观测（最紧窗口）
+        # 从新到旧扫描，只检查最近 window 秒内、朝机器方向的位移
         for earlier in reversed(self._pending_obs[:-1]):
             dt = latest.t - earlier.t
-            if dt >= self.motion_window_s:
-                return abs(latest.y - earlier.y) >= self.motion_min_y
+            if dt <= 0:
+                continue
+            if dt > self.motion_window_s:
+                break
+            if latest.y - earlier.y <= -self.motion_min_y:
+                return True
         return False
 
     def _flush_pending_to_obs(self) -> None:
@@ -443,11 +462,16 @@ class Curve3Tracker:
         motion_start = 0  # fallback: include all
         for k in range(1, len(self._pending_obs)):
             cur = self._pending_obs[k]
-            # 从 k-1 向前找最近的 dt >= window 的观测
+            # 从 k-1 向前找最近的、仍在 window 秒内的参考点
             for j in range(k - 1, -1, -1):
-                if cur.t - self._pending_obs[j].t >= self.motion_window_s:
-                    if abs(cur.y - self._pending_obs[j].y) >= self.motion_min_y:
-                        motion_start = k
+                dt = cur.t - self._pending_obs[j].t
+                if dt <= 0:
+                    continue
+                if dt > self.motion_window_s:
+                    break
+                if cur.y - self._pending_obs[j].y <= -self.motion_min_y:
+                    # 参考点 j 可能仍处在持球或刚脱手边缘，故从 j+1 开始回补。
+                    motion_start = j + 1
                     break
             if motion_start > 0:
                 break
@@ -562,6 +586,14 @@ class Curve3Tracker:
 
         self._curve0 = curve
 
+        # 只要能拟合出 S0 抛物线，就立即刷新预测落地时间。
+        # 这样即使球在 min_points 之前就完成第一次落地，也能及时切到 S1，
+        # 避免把反弹后的观测误并入 S0。
+        t_land = curve.solve_t_for_z(
+            self.ground_z, after_time=curve.t_ref, latest=True)
+        if t_land is not None:
+            self._predicted_land_time = t_land
+
         if n >= self.min_points:
             # RMSE 质量检查：追踪错误球 → 重置
             rx, ry, rz = self._compute_fit_rmse(curve, self._obs)
@@ -569,12 +601,6 @@ class Curve3Tracker:
                 self.reset_times.append(self._obs[-1].t)
                 self._reset_throw()
                 return True
-
-            # 更新预测落地时间（latest=True 取下降阶段的解）
-            t_land = curve.solve_t_for_z(
-                self.ground_z, after_time=curve.t_ref, latest=True)
-            if t_land is not None:
-                self._predicted_land_time = t_land
 
         return False
 

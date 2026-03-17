@@ -31,6 +31,8 @@ import cv2
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 
+from .cv_linalg import matvec, projection_matrix, smallest_right_singular_vector
+
 _SRC_DIR = Path(__file__).resolve().parent
 _DEFAULT_CALIB_CONFIG = _SRC_DIR / "config" / "multi_calib.json"
 
@@ -94,7 +96,7 @@ class CarLocalizer:
             t = np.array(cd["t_world"], dtype=np.float64).reshape(3, 1)
             self._K[sn] = K
             self._D[sn] = D
-            self._P[sn] = K @ np.hstack([R, t])
+            self._P[sn] = projection_matrix(K, R, t)
 
     def _init_aruco_detector(self) -> None:
         """创建优化后的 AprilTag 36h11 检测器。"""
@@ -182,7 +184,7 @@ class CarLocalizer:
             det = detections[sn]
             pixels[sn] = (det.cx, det.cy)
             pt_h = np.append(pts_3d, 1.0)
-            proj = self._P[sn] @ pt_h
+            proj = matvec(self._P[sn], pt_h)
             proj = proj[:2] / proj[2]
             err = np.sqrt((proj[0] - det.cx) ** 2 + (proj[1] - det.cy) ** 2)
             errs.append(err)
@@ -262,8 +264,7 @@ class CarLocalizer:
             A.append(u * P[2] - P[0])
             A.append(v * P[2] - P[1])
         A = np.array(A)
-        _, _, Vt = np.linalg.svd(A)
-        X = Vt[-1]
+        X = smallest_right_singular_vector(A)
         return X[:3] / X[3]
 
     @staticmethod

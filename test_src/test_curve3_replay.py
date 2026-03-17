@@ -34,7 +34,7 @@ def replay(input_path: str, **overrides) -> dict:
     raw_obs = data["observations"]
     orig_config = data.get("config", {})
 
-    tracker = Curve3Tracker(**overrides)
+    tracker = Curve3Tracker(prediction_time_mode="observation", **overrides)
 
     log_observations = []
     log_predictions = []
@@ -89,6 +89,7 @@ def replay(input_path: str, **overrides) -> dict:
             "replay_source": os.path.basename(input_path),
             "motion_window_s": tracker.motion_window_s,
             "motion_min_y": tracker.motion_min_y,
+            "prediction_time_mode": tracker.prediction_time_mode,
         },
         "summary": {
             "total_observations": len(raw_obs),
