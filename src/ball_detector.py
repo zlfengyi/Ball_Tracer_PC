@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 from pathlib import Path
+import re
 from typing import Optional
 
 import cv2
@@ -82,6 +83,16 @@ def _find_model(model_dir: Path) -> Path:
     raise FileNotFoundError(f"在 {model_dir} 中未找到模型文件 (.engine/.onnx/.pt)")
 
 
+def _infer_fixed_engine_batch(model_path: Path) -> int | None:
+    if model_path.suffix != ".engine":
+        return None
+    match = re.search(r"_b(\d+)(?:_|\.engine$)", model_path.name)
+    if not match:
+        return None
+    batch = int(match.group(1))
+    return batch if batch > 0 else None
+
+
 class BallDetector:
     """
     通用检测器。
@@ -97,6 +108,7 @@ class BallDetector:
         half: bool = False,
         duplicate_iou_threshold: Optional[float] = 0.95,
         max_box_aspect_ratio: Optional[float] = 1.2,
+        onnx_providers: Optional[list[str]] = None,
     ):
         if model_path is None:
             model_path = _find_model(_DEFAULT_MODEL_DIR)
@@ -110,10 +122,12 @@ class BallDetector:
         self._device = device
         self._duplicate_iou_threshold = duplicate_iou_threshold
         self._max_box_aspect_ratio = max_box_aspect_ratio
+        self._onnx_providers = list(onnx_providers) if onnx_providers is not None else None
         self._model = None
         self._onnx_session = None
         self._onnx_input_name: str | None = None
         self._onnx_input_hw: tuple[int, int] | None = None
+        self._fixed_engine_batch = _infer_fixed_engine_batch(self._model_path)
 
         if self._model_path.suffix == ".onnx":
             self._init_onnx_runtime()
@@ -129,15 +143,18 @@ class BallDetector:
             self._init_ultralytics()
             return
 
-        providers = ["CPUExecutionProvider"]
-        try:
-            if torch.cuda.is_available():
-                torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
-                if hasattr(os, "add_dll_directory") and os.path.isdir(torch_lib):
-                    os.add_dll_directory(torch_lib)
-                providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        except Exception:
+        if self._onnx_providers is not None:
+            providers = list(self._onnx_providers)
+        else:
             providers = ["CPUExecutionProvider"]
+            try:
+                if torch.cuda.is_available():
+                    torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
+                    if hasattr(os, "add_dll_directory") and os.path.isdir(torch_lib):
+                        os.add_dll_directory(torch_lib)
+                    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            except Exception:
+                providers = ["CPUExecutionProvider"]
 
         self._onnx_session = ort.InferenceSession(
             str(self._model_path),
@@ -165,6 +182,24 @@ class BallDetector:
         if self._half:
             kwargs["half"] = True
         return self._model.predict(source, **kwargs)
+
+    def _predict_fixed_batch(self, images: list[np.ndarray], conf: float) -> list:
+        if not images:
+            return []
+
+        fixed_batch = self._fixed_engine_batch
+        if fixed_batch is None or self._onnx_session is not None:
+            return self._predict(images, conf)
+
+        results = []
+        for start in range(0, len(images), fixed_batch):
+            chunk = list(images[start:start + fixed_batch])
+            actual_n = len(chunk)
+            while len(chunk) < fixed_batch:
+                chunk.append(chunk[-1])
+            chunk_results = self._predict(chunk, conf)
+            results.extend(chunk_results[:actual_n])
+        return results
 
     def _predict_onnx(self, image: np.ndarray) -> np.ndarray:
         assert self._onnx_session is not None
@@ -347,9 +382,9 @@ class BallDetector:
                 max_box_aspect_ratio=self._max_box_aspect_ratio,
             )
 
-        results = self._predict(image, target_conf)
+        results = self._predict_fixed_batch([image], target_conf)
         out: list[BallDetection] = []
-        for result in results:
+        for result in results[:1]:
             out.extend(self._parse_boxes(result))
         return self.postprocess_detections(
             out,
@@ -366,7 +401,10 @@ class BallDetector:
         if self._onnx_session is not None:
             return [self.detect(image, conf=conf) for image in images]
 
-        results = self._predict(images, conf if conf is not None else self._conf)
+        results = self._predict_fixed_batch(
+            images,
+            conf if conf is not None else self._conf,
+        )
         return [
             self.postprocess_detections(
                 self._parse_boxes(result),
