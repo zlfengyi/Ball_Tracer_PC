@@ -58,3 +58,12 @@ yolo_test_imgs/
 # ── Claude Code 临时文件 ──
 .claude/
 NUL
+benchmark_reports/
+four_camera_data/
+ArmCalibration/data/
+data/four_camera_ground_registration/
+data/calibration_pairwise_bridge_test/
+data/tmp/
+tmp_codec_bench/
+tmp_report_server_*.txt
+*.log

@@ -130,7 +130,7 @@ def main():
     detected_count = {sn: 0 for sn in serials}
     total_count = {sn: 0 for sn in serials}
     processed = 0
-    t0 = time.monotonic()
+    t0 = time.perf_counter()
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {}
@@ -155,7 +155,7 @@ def main():
 
             # 进度
             if processed % 50 == 0 or processed == len(tasks):
-                elapsed = time.monotonic() - t0
+                elapsed = time.perf_counter() - t0
                 speed = processed / elapsed if elapsed > 0 else 0
                 eta = (len(tasks) - processed) / speed if speed > 0 else 0
                 total_det = sum(detected_count.values())
@@ -165,7 +165,7 @@ def main():
                       f"已检测到 {total_det} 个角点帧")
 
     # 汇总
-    elapsed = time.monotonic() - t0
+    elapsed = time.perf_counter() - t0
     print(f"\n=== 检测完成 ({elapsed:.1f}s) ===")
     for sn in serials:
         n = detected_count[sn]

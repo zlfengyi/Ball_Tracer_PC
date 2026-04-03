@@ -55,11 +55,11 @@ class QuadCapture:
             组满则返回 N 张 FramePacket；超时返回 None。
         """
 
-        end_t = None if timeout_s <= 0 else (time.monotonic() + float(timeout_s))
+        end_t = None if timeout_s <= 0 else (time.perf_counter() + float(timeout_s))
         while not self.stop_event.is_set():
             remaining = 0.1
             if end_t is not None:
-                remaining = max(0.0, end_t - time.monotonic())
+                remaining = max(0.0, end_t - time.perf_counter())
                 if remaining <= 0:
                     return None
 

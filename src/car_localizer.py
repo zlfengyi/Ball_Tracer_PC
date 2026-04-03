@@ -10,11 +10,16 @@
   5. 多视图 DLT 三角测量求 3D 世界坐标
   6. 计算重投影误差评估定位精度
 
-标定参数从 src/config/multi_calib.json 加载。
+默认标定参数从 src/config/four_camera_calib.json 加载。
 
 用法：
   localizer = CarLocalizer()
-  result = localizer.locate({"DA8199285": img1, "DA8199402": img2, "DA8199243": img3})
+  result = localizer.locate({
+      "DA7403103": img1,
+      "DA8571029": img2,
+      "DA7403087": img3,
+      "DA8474746": img4,
+  })
   if result is not None:
       print(f"车辆 3D: ({result.x:.0f}, {result.y:.0f}, {result.z:.0f}) mm")
 """
@@ -34,7 +39,9 @@ from concurrent.futures import ThreadPoolExecutor
 from .cv_linalg import matvec, projection_matrix, smallest_right_singular_vector
 
 _SRC_DIR = Path(__file__).resolve().parent
-_DEFAULT_CALIB_CONFIG = _SRC_DIR / "config" / "multi_calib.json"
+_DEFAULT_CALIB_CONFIG = _SRC_DIR / "config" / "four_camera_calib.json"
+_DEFAULT_ARM_POE_CONFIG = _SRC_DIR / "config" / "arm_poe_racket_center.json"
+_WORLD_SCALE_M_PER_MM = 1.0 / 1000.0
 
 
 @dataclass
@@ -74,8 +81,9 @@ class CarLocalizer:
     ):
         config_path = calib_config_path or str(_DEFAULT_CALIB_CONFIG)
         self._load_calib(config_path)
+        self._load_vehicle_reference()
         self._init_aruco_detector()
-        self._pool = ThreadPoolExecutor(max_workers=3)
+        self._pool = ThreadPoolExecutor(max_workers=max(1, len(self._serials)))
 
     # ── 初始化 ──────────────────────────────────────────────────────────
 
@@ -98,6 +106,29 @@ class CarLocalizer:
             self._D[sn] = D
             self._P[sn] = projection_matrix(K, R, t)
 
+    def _load_vehicle_reference(self) -> None:
+        offset_m = np.zeros(3, dtype=np.float64)
+        try:
+            with open(_DEFAULT_ARM_POE_CONFIG, encoding="utf-8") as f:
+                cfg = json.load(f)
+            vehicle_cfg = cfg.get("vehicle_reference", {})
+            if "apriltag_center_to_car_base_offset_m" in vehicle_cfg:
+                offset_m = np.array(
+                    vehicle_cfg["apriltag_center_to_car_base_offset_m"],
+                    dtype=np.float64,
+                ).reshape(3)
+            elif "apriltag_center_to_car_base_offset_mm" in vehicle_cfg:
+                offset_m = (
+                    np.array(
+                        vehicle_cfg["apriltag_center_to_car_base_offset_mm"],
+                        dtype=np.float64,
+                    ).reshape(3)
+                    * _WORLD_SCALE_M_PER_MM
+                )
+        except FileNotFoundError:
+            pass
+        self._apriltag_to_car_base_offset_m = offset_m
+
     def _init_aruco_detector(self) -> None:
         """创建优化后的 AprilTag 36h11 检测器。"""
         aruco_dict = cv2.aruco.getPredefinedDictionary(
@@ -116,13 +147,18 @@ class CarLocalizer:
     def serials(self) -> list[str]:
         return list(self._serials)
 
+    @property
+    def apriltag_to_car_base_offset_m(self) -> np.ndarray:
+        return self._apriltag_to_car_base_offset_m.copy()
+
     # ── 检测 ──────────────────────────────────────────────────────────
 
     def detect(self, image: np.ndarray) -> list[CarDetection]:
-        """检测图像下 2/3 区域中的所有 AprilTag (tag36h11)。"""
+        """检测图像上 60% 区域中的所有 AprilTag (tag36h11)。"""
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
         h = gray.shape[0]
-        y_offset = h // 3
+        # Crop only: keep native pixels and detect on the lower 60% ROI.
+        y_offset = int(h * 0.4)
         roi = gray[y_offset:]
         corners_list, ids, _ = self._detector.detectMarkers(roi)
 
@@ -189,10 +225,15 @@ class CarLocalizer:
             err = np.sqrt((proj[0] - det.cx) ** 2 + (proj[1] - det.cy) ** 2)
             errs.append(err)
 
+        car_pos_m = (
+            pts_3d * _WORLD_SCALE_M_PER_MM
+            + self._apriltag_to_car_base_offset_m
+        )
+
         return CarLoc(
-            x=float(pts_3d[0]),
-            y=float(pts_3d[1]),
-            z=float(pts_3d[2]),
+            x=float(car_pos_m[0]),
+            y=float(car_pos_m[1]),
+            z=float(car_pos_m[2]),
             t=t,
             tag_id=tag_id,
             cameras_used=serials,

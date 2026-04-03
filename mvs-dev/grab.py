@@ -31,7 +31,7 @@ class FramePacket:
     pixel_type: int
     frame_len: int
     lost_packet: int
-    arrival_monotonic: float
+    arrival_perf_counter: float
     data: bytes
 
 
@@ -88,7 +88,7 @@ class Grabber(threading.Thread):
 
             pkt: Optional[FramePacket] = None
             try:
-                arrival = time.monotonic()
+                arrival = time.perf_counter()
                 info = st_frame.stFrameInfo
 
                 width = int(info.nExtendWidth) if int(info.nExtendWidth) else int(info.nWidth)
@@ -112,7 +112,7 @@ class Grabber(threading.Thread):
                     pixel_type=int(info.enPixelType),
                     frame_len=frame_len,
                     lost_packet=int(info.nLostPacket),
-                    arrival_monotonic=arrival,
+                    arrival_perf_counter=arrival,
                     data=data,
                 )
             finally:

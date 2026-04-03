@@ -1,149 +1,238 @@
 # -*- coding: utf-8 -*-
-"""
-棋盘格角点检测 v2 — 更精准 + 质量评分 + 坏帧筛选。
-
-改进：
-  1. findChessboardCornersSB（更鲁棒）+ 回退到经典方法
-  2. cornerSubPix 更精细参数
-  3. 网格规整度评分：行列间距一致性
-  4. 自动标记并导出坏帧
-
-用法：
-  python -m calibration.detect_corners_v2 --images images/005_checker_030321
-
-输出：
-  corner_detections.json  — 含角点 + 每帧质量评分
-  {serial}/det_v2/        — 可视化（含评分）
-  bad_corners/            — 评分低于阈值的帧
-"""
+"""Checkerboard corner detection with color overlays and quality scoring."""
 
 from __future__ import annotations
-import argparse, json, sys, time
-from pathlib import Path
+
+import argparse
+import json
+import shutil
+import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 import cv2
 import numpy as np
 
+_CANONICAL_PARITY_SIGN = 1.0
 
-# ================================================================
-#  角点检测（多策略）
-# ================================================================
 
-def detect_corners(gray: np.ndarray, pattern: tuple[int, int]
-                   ) -> np.ndarray | None:
+def _is_valid_corners(corners: np.ndarray | None, pattern: tuple[int, int]) -> bool:
+    return corners is not None and len(corners) == pattern[0] * pattern[1]
+
+
+def _sample_patch(gray: np.ndarray, pt: np.ndarray, radius: int = 1) -> float:
+    x = int(round(float(pt[0])))
+    y = int(round(float(pt[1])))
+    x = max(radius, min(gray.shape[1] - radius - 1, x))
+    y = max(radius, min(gray.shape[0] - radius - 1, y))
+    patch = gray[y - radius:y + radius + 1, x - radius:x + radius + 1]
+    return float(patch.mean())
+
+
+def checker_parity_sign(gray: np.ndarray, corners: np.ndarray,
+                        cols: int, rows: int) -> float:
     """
-    检测棋盘格角点，返回 (N,1,2) float32 或 None。
-    使用经典方法 + 精细 cornerSubPix（保证角点排列顺序一致）。
-    """
-    flags = (cv2.CALIB_CB_ADAPTIVE_THRESH
-             | cv2.CALIB_CB_NORMALIZE_IMAGE
-             | cv2.CALIB_CB_FAST_CHECK)
-    ret, corners = cv2.findChessboardCorners(gray, pattern, None, flags)
-    if not ret or corners is None or len(corners) != pattern[0] * pattern[1]:
-        # 去掉 FAST_CHECK 重试（更慢但更鲁棒）
-        flags2 = (cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE)
-        ret, corners = cv2.findChessboardCorners(gray, pattern, None, flags2)
-        if not ret or corners is None or len(corners) != pattern[0] * pattern[1]:
-            return None
+    Return a signed checkerboard parity score for the current corner ordering.
 
-    # 精细亚像素（迭代次数更多、收敛阈值更小、窗口更合适）
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
-                100, 0.0001)
+    We sample the four quadrants around the first corner in the returned grid.
+    Because the board has odd/even square parity, the physically correct board
+    origin yields a stable diagonal intensity sign across cameras, while the
+    180-degree reversed ordering flips the sign.
+    """
+    grid = np.asarray(corners, dtype=np.float32).reshape(rows, cols, 2)
+    origin = grid[0, 0]
+    vx = grid[0, 1] - grid[0, 0]
+    vy = grid[1, 0] - grid[0, 0]
+    scale = 0.25
+
+    upper_left = _sample_patch(gray, origin - scale * vx - scale * vy)
+    upper_right = _sample_patch(gray, origin + scale * vx - scale * vy)
+    lower_left = _sample_patch(gray, origin - scale * vx + scale * vy)
+    lower_right = _sample_patch(gray, origin + scale * vx + scale * vy)
+    return (upper_left + lower_right) - (upper_right + lower_left)
+
+
+def canonicalize_corner_order(gray: np.ndarray, corners: np.ndarray,
+                              cols: int, rows: int) -> tuple[np.ndarray, float, bool]:
+    """
+    Force a consistent physical checkerboard origin across cameras/sessions.
+
+    The raw detector output is already grid-ordered, but some cameras/sessions
+    return the grid with a 180-degree ambiguity. We resolve that ambiguity by
+    enforcing a fixed checkerboard parity sign at the first corner.
+    """
+    parity = checker_parity_sign(gray, corners, cols, rows)
+    reversed_to_canonical = False
+    canonical = corners.astype(np.float32, copy=True)
+    if parity * _CANONICAL_PARITY_SIGN < 0:
+        canonical = canonical[::-1].copy()
+        parity = checker_parity_sign(gray, canonical, cols, rows)
+        reversed_to_canonical = True
+    return canonical, float(parity), reversed_to_canonical
+
+
+def _draw_corner_labels(vis: np.ndarray, corners: np.ndarray,
+                        cols: int, rows: int) -> None:
+    grid = corners.reshape(rows, cols, 2)
+    for row in range(rows):
+        for col in range(cols):
+            x, y = grid[row, col]
+            cv2.putText(
+                vis,
+                f"{row},{col}",
+                (int(round(x)) + 4, int(round(y)) - 4),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.3,
+                (255, 255, 0),
+                1,
+                cv2.LINE_AA,
+            )
+
+
+def detect_corners(gray: np.ndarray, pattern: tuple[int, int]) -> tuple[np.ndarray | None, str]:
+    """
+    Detect checkerboard corners.
+
+    Prefer the SB detector so we avoid the classic adaptive-threshold pipeline
+    that can visually shrink dark squares on difficult images. Fall back to the
+    classic detector without adaptive-threshold/normalize flags if SB fails.
+    """
+    corners = None
+    method = "none"
+
+    if hasattr(cv2, "findChessboardCornersSB"):
+        sb_flag_sets = [
+            0,
+            getattr(cv2, "CALIB_CB_EXHAUSTIVE", 0),
+        ]
+        for flags in sb_flag_sets:
+            try:
+                ret, cand = cv2.findChessboardCornersSB(gray, pattern, flags=flags)
+            except cv2.error:
+                continue
+            if ret and _is_valid_corners(cand, pattern):
+                corners = cand.astype(np.float32)
+                method = "sb"
+                break
+
+    if corners is None:
+        classic_flag_sets = [
+            0,
+            cv2.CALIB_CB_FAST_CHECK,
+        ]
+        for flags in classic_flag_sets:
+            ret, cand = cv2.findChessboardCorners(gray, pattern, None, flags)
+            if ret and _is_valid_corners(cand, pattern):
+                corners = cand
+                method = "classic"
+                break
+
+    if corners is None:
+        return None, method
+
+    criteria = (
+        cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+        100,
+        0.0001,
+    )
     corners = cv2.cornerSubPix(gray, corners, (7, 7), (-1, -1), criteria)
-    return corners
+    return corners, method
 
-
-# ================================================================
-#  网格质量评分
-# ================================================================
 
 def grid_quality_score(corners: np.ndarray, cols: int, rows: int) -> float:
-    """
-    评估检测到的角点是否构成规则网格。
-
-    方法：将角点 reshape 成 (rows, cols, 2) 网格，
-    计算行方向和列方向的相邻间距，
-    评分 = 1 - (间距标准差 / 间距均值)。
-    完美网格 → 1.0，畸形网格 → 接近 0。
-
-    Returns: 0~1 之间的评分
-    """
+    """Estimate how regular the detected corner grid is."""
     pts = corners.reshape(-1, 2)
     if len(pts) != rows * cols:
         return 0.0
 
     grid = pts.reshape(rows, cols, 2)
 
-    dists = []
-    # 行方向间距（同一行相邻角点）
-    for r in range(rows):
-        for c in range(cols - 1):
-            d = np.linalg.norm(grid[r, c + 1] - grid[r, c])
-            dists.append(d)
-    # 列方向间距（同一列相邻角点）
-    for r in range(rows - 1):
-        for c in range(cols):
-            d = np.linalg.norm(grid[r + 1, c] - grid[r, c])
-            dists.append(d)
-
-    dists = np.array(dists)
-    if len(dists) == 0 or dists.mean() < 1e-6:
-        return 0.0
-
-    # 分别计算行间距和列间距的一致性
     row_dists = []
     for r in range(rows):
         for c in range(cols - 1):
             row_dists.append(np.linalg.norm(grid[r, c + 1] - grid[r, c]))
+
     col_dists = []
     for r in range(rows - 1):
         for c in range(cols):
             col_dists.append(np.linalg.norm(grid[r + 1, c] - grid[r, c]))
 
-    row_dists = np.array(row_dists)
-    col_dists = np.array(col_dists)
+    row_dists = np.array(row_dists, dtype=np.float64)
+    col_dists = np.array(col_dists, dtype=np.float64)
+    if row_dists.size == 0 or col_dists.size == 0:
+        return 0.0
+    if row_dists.mean() < 1e-6 or col_dists.mean() < 1e-6:
+        return 0.0
 
-    # 每行内的间距应接近等距
-    row_cv = row_dists.std() / row_dists.mean() if row_dists.mean() > 0 else 1.0
-    col_cv = col_dists.std() / col_dists.mean() if col_dists.mean() > 0 else 1.0
-
-    # 综合评分：cv 越小越好，cv=0 → score=1
+    row_cv = row_dists.std() / row_dists.mean()
+    col_cv = col_dists.std() / col_dists.mean()
     avg_cv = (row_cv + col_cv) / 2.0
-    score = max(0.0, 1.0 - avg_cv * 5.0)  # cv=0.2 → score=0
-    return round(score, 4)
+    return round(max(0.0, 1.0 - avg_cv * 5.0), 4)
 
 
-# ================================================================
-#  处理单张图片
-# ================================================================
-
-def process_image(path: Path, pattern: tuple[int, int],
-                  det_dir: Path | None, cols: int, rows: int
-                  ) -> dict | None:
-    """检测角点 + 评分 + 保存可视化。"""
-    img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
-    if img is None:
+def process_image(
+    path: Path,
+    pattern: tuple[int, int],
+    det_dir: Path | None,
+    cols: int,
+    rows: int,
+    save_failed: bool = True,
+) -> dict | None:
+    """Detect corners, score them, and optionally save a visualization."""
+    color = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if color is None:
         return None
 
-    h, w = img.shape[:2]
-    corners = detect_corners(img, pattern)
+    gray = cv2.cvtColor(color, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape[:2]
+    corners, method = detect_corners(gray, pattern)
+    parity = 0.0
+    reversed_to_canonical = False
+    if corners is not None:
+        corners, parity, reversed_to_canonical = canonicalize_corner_order(
+            gray, corners, cols, rows
+        )
 
-    # 可视化
     if det_dir is not None:
-        vis = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        vis = color.copy()
         if corners is not None:
             score = grid_quality_score(corners, cols, rows)
             cv2.drawChessboardCorners(vis, pattern, corners, True)
-            color = (0, 255, 0) if score > 0.8 else (0, 165, 255) if score > 0.5 else (0, 0, 255)
-            cv2.putText(vis, f"score={score:.3f}", (20, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
-        else:
-            cv2.putText(vis, "NOT DETECTED", (30, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 3)
-        det_dir.mkdir(exist_ok=True)
-        cv2.imwrite(str(det_dir / f"{path.stem}_det.jpg"), vis,
-                    [cv2.IMWRITE_JPEG_QUALITY, 80])
+            _draw_corner_labels(vis, corners, cols, rows)
+            color_code = (0, 255, 0) if score > 0.8 else (0, 165, 255) if score > 0.5 else (0, 0, 255)
+            cv2.putText(
+                vis,
+                f"score={score:.3f}  method={method}",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                color_code,
+                2,
+            )
+            cv2.putText(
+                vis,
+                f"parity={parity:.1f}  reversed={reversed_to_canonical}",
+                (20, 78),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                color_code,
+                2,
+            )
+            det_dir.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(det_dir / f"{path.stem}_det.png"), vis)
+        elif save_failed:
+            cv2.putText(
+                vis,
+                f"NOT DETECTED  method={method}",
+                (30, 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.4,
+                (0, 0, 255),
+                3,
+            )
+            det_dir.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(det_dir / f"{path.stem}_det.png"), vis)
 
     if corners is None:
         return None
@@ -153,25 +242,22 @@ def process_image(path: Path, pattern: tuple[int, int],
         "corners": corners.reshape(-1, 2).tolist(),
         "image_size": [w, h],
         "score": float(score),
+        "detector": method,
+        "parity_sign": float(parity),
+        "reversed_to_canonical": bool(reversed_to_canonical),
     }
 
 
-# ================================================================
-#  主程序
-# ================================================================
-
-def main():
-    parser = argparse.ArgumentParser(description="棋盘格角点检测 v2")
-    parser.add_argument("--images", type=str, required=True,
-                        help="图片目录（相对于 calibration/）")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Detect checkerboard corners with scoring.")
+    parser.add_argument("--images", type=str, required=True, help="Image directory relative to calibration/.")
     parser.add_argument("--serials", type=str, nargs="+", default=None)
     parser.add_argument("--range-start", type=int, default=1)
     parser.add_argument("--range-end", type=int, default=500)
     parser.add_argument("--inner-cols", type=int, default=8)
     parser.add_argument("--inner-rows", type=int, default=11)
     parser.add_argument("--workers", type=int, default=4)
-    parser.add_argument("--score-threshold", type=float, default=0.8,
-                        help="低于此评分视为坏帧 (默认: 0.8)")
+    parser.add_argument("--score-threshold", type=float, default=0.8)
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parent.parent
@@ -182,58 +268,54 @@ def main():
         serials = args.serials
     else:
         camera_json = project_root / "src" / "config" / "camera.json"
-        with open(camera_json, encoding="utf-8") as f:
-            cam_cfg = json.load(f)
+        with open(camera_json, encoding="utf-8") as inp:
+            cam_cfg = json.load(inp)
         serials = cam_cfg.get("slave_serials", [])
 
     pattern = (args.inner_cols, args.inner_rows)
-    cols, rows = args.inner_cols, args.inner_rows
-    start, end = args.range_start, args.range_end
     threshold = args.score_threshold
 
     print("=" * 60)
-    print("       棋盘格角点检测 v2")
+    print("Checkerboard Corner Detection v2")
     print("=" * 60)
-    print(f"  目录: {image_dir}")
-    print(f"  相机: {serials}")
-    print(f"  范围: {start:03d}~{end:03d}")
-    print(f"  棋盘: {cols}x{rows}")
-    print(f"  评分阈值: {threshold}")
+    print(f"  Directory: {image_dir}")
+    print(f"  Cameras: {serials}")
+    print(f"  Range: {args.range_start:03d}~{args.range_end:03d}")
+    print(f"  Board: {args.inner_cols}x{args.inner_rows}")
+    print(f"  Threshold: {threshold}")
 
-    # 收集任务
     tasks = []
     for sn in serials:
         det_dir = image_dir / sn / "det_v2"
-        for idx in range(start, end + 1):
+        for idx in range(args.range_start, args.range_end + 1):
             path = image_dir / sn / f"{idx:03d}.png"
             if path.exists():
                 tasks.append((sn, idx, path, det_dir))
 
-    print(f"  图片: {len(tasks)} 张")
-    print()
+    print(f"  Images: {len(tasks)}")
 
-    # 并行检测
     results = {sn: {} for sn in serials}
-    stats = {sn: {"total": 0, "detected": 0, "good": 0, "bad": 0, "scores": []}
-             for sn in serials}
+    stats = {
+        sn: {"total": 0, "detected": 0, "good": 0, "bad": 0, "scores": []}
+        for sn in serials
+    }
     processed = 0
-    t0 = time.monotonic()
+    t0 = time.perf_counter()
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = {}
-        for sn, idx, path, det_dir in tasks:
-            fut = pool.submit(process_image, path, pattern, det_dir, cols, rows)
-            futures[fut] = (sn, idx, path)
-
+        futures = {
+            pool.submit(process_image, path, pattern, det_dir, args.inner_cols, args.inner_rows): (sn, idx)
+            for sn, idx, path, det_dir in tasks
+        }
         for fut in as_completed(futures):
-            sn, idx, path = futures[fut]
+            sn, idx = futures[fut]
             stats[sn]["total"] += 1
             processed += 1
 
             try:
                 det = fut.result()
-            except Exception as e:
-                print(f"  错误: {sn}/{idx:03d} — {e}")
+            except Exception as exc:
+                print(f"  Error: {sn}/{idx:03d} - {exc}")
                 det = None
 
             if det is not None:
@@ -247,30 +329,27 @@ def main():
                     stats[sn]["bad"] += 1
 
             if processed % 100 == 0 or processed == len(tasks):
-                elapsed = time.monotonic() - t0
-                speed = processed / elapsed if elapsed > 0 else 0
-                print(f"  [{processed}/{len(tasks)}] "
-                      f"{elapsed:.0f}s, {speed:.1f} img/s")
+                elapsed = time.perf_counter() - t0
+                speed = processed / elapsed if elapsed > 0 else 0.0
+                print(f"  [{processed}/{len(tasks)}] {elapsed:.0f}s, {speed:.1f} img/s")
 
-    # ── 统计 ──
-    elapsed = time.monotonic() - t0
-    print(f"\n{'='*60}")
-    print(f"  检测完成 ({elapsed:.1f}s)")
-    print(f"{'='*60}")
+    elapsed = time.perf_counter() - t0
+    print(f"\n{'=' * 60}")
+    print(f"Detection complete ({elapsed:.1f}s)")
+    print(f"{'=' * 60}")
 
     for sn in serials:
         s = stats[sn]
-        scores = np.array(s["scores"]) if s["scores"] else np.array([0])
+        scores = np.array(s["scores"]) if s["scores"] else np.array([0.0])
         print(f"\n  {sn}:")
-        print(f"    检测: {s['detected']}/{s['total']}")
-        print(f"    评分: median={np.median(scores):.3f} "
-              f"mean={np.mean(scores):.3f} "
-              f"min={np.min(scores):.3f}")
-        print(f"    好帧(≥{threshold}): {s['good']}")
-        print(f"    坏帧(<{threshold}): {s['bad']}")
+        print(f"    detected: {s['detected']}/{s['total']}")
+        print(
+            f"    score: median={np.median(scores):.3f} "
+            f"mean={np.mean(scores):.3f} min={np.min(scores):.3f}"
+        )
+        print(f"    good (>= {threshold}): {s['good']}")
+        print(f"    bad  (<  {threshold}): {s['bad']}")
 
-    # ── 导出坏帧 ──
-    import shutil
     bad_dir = image_dir / "bad_corners"
     if bad_dir.exists():
         shutil.rmtree(bad_dir)
@@ -278,33 +357,31 @@ def main():
     bad_count = 0
     for sn in serials:
         for idx_s, det in results[sn].items():
-            if det["score"] < threshold:
-                idx = int(idx_s)
-                sn_dir = bad_dir / sn
-                sn_dir.mkdir(parents=True, exist_ok=True)
-                # 复制原图
-                src = image_dir / sn / f"{idx:03d}.png"
-                if src.exists():
-                    tag = f"score{det['score']:.3f}"
-                    shutil.copy2(src, sn_dir / f"{idx:03d}_{tag}.png")
-                # 复制检测标注图
-                src_det = image_dir / sn / "det_v2" / f"{idx:03d}_det.jpg"
-                if src_det.exists():
-                    shutil.copy2(src_det, sn_dir / f"{idx:03d}_{tag}_det.jpg")
-                bad_count += 1
+            if det["score"] >= threshold:
+                continue
+            idx = int(idx_s)
+            sn_dir = bad_dir / sn
+            sn_dir.mkdir(parents=True, exist_ok=True)
+            src = image_dir / sn / f"{idx:03d}.png"
+            if src.exists():
+                tag = f"score{det['score']:.3f}"
+                shutil.copy2(src, sn_dir / f"{idx:03d}_{tag}.png")
+            src_det = image_dir / sn / "det_v2" / f"{idx:03d}_det.png"
+            if src_det.exists():
+                shutil.copy2(src_det, sn_dir / f"{idx:03d}_{tag}_det.png")
+            bad_count += 1
 
-    print(f"\n  坏帧共 {bad_count} 张，已导出到: {bad_dir}")
+    print(f"\n  Bad frames: {bad_count}, exported to {bad_dir}")
 
-    # ── 保存 JSON ──
     output = {
-        "board": {"inner_cols": cols, "inner_rows": rows},
+        "board": {"inner_cols": args.inner_cols, "inner_rows": args.inner_rows},
         "cameras": results,
     }
     out_path = image_dir / "corner_detections.json"
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(output, f, ensure_ascii=False)
+    with open(out_path, "w", encoding="utf-8") as out:
+        json.dump(output, out, ensure_ascii=False)
     size_mb = out_path.stat().st_size / 1024 / 1024
-    print(f"  已保存: {out_path} ({size_mb:.1f}MB)")
+    print(f"  Saved: {out_path} ({size_mb:.1f}MB)")
 
 
 if __name__ == "__main__":

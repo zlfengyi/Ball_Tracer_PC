@@ -59,7 +59,7 @@ class JointStateCollector(Node):
                 "sec": int(stamp.sec),
                 "nanosec": int(stamp.nanosec),
             },
-            "received_time_pc": float(time.time()),
+            "received_time_pc": float(time.perf_counter()),
             "name": list(msg.name),
             "position": [float(v) for v in msg.position],
             "velocity": [float(v) for v in msg.velocity],
@@ -79,7 +79,7 @@ class JointStateCollector(Node):
         stable_window_s: float,
         stable_tolerance_rad: float,
     ) -> dict | None:
-        now = time.time()
+        now = time.perf_counter()
         with self._lock:
             if not self._history:
                 return None
@@ -161,7 +161,6 @@ def _frame_metadata(frame) -> dict:
         "host_timestamp": int(frame.host_timestamp),
         "exposure_time_us": float(frame.exposure_time),
         "lost_packet": int(frame.lost_packet),
-        "arrival_mono": float(frame.arrival_mono),
         "arrival_perf": float(frame.arrival_perf),
         "exposure_start_pc": float(frame.exposure_start_pc),
     }
@@ -239,13 +238,13 @@ def main() -> int:
 
             accepted = 0
             rejected = 0
-            next_capture_time = time.monotonic()
+            next_capture_time = time.perf_counter()
 
             while accepted < args.count:
                 if args.manual:
                     input(f"\nPose the arm, then press Enter to capture sample {accepted + 1}/{args.count}...")
                 else:
-                    sleep_s = next_capture_time - time.monotonic()
+                    sleep_s = next_capture_time - time.perf_counter()
                     if sleep_s > 0:
                         time.sleep(sleep_s)
                     next_capture_time += args.interval

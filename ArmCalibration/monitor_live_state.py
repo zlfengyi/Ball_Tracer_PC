@@ -67,7 +67,7 @@ class JointStateCollector(Node):
                 "sec": int(stamp.sec),
                 "nanosec": int(stamp.nanosec),
             },
-            "received_time_pc": float(time.time()),
+            "received_time_pc": float(time.perf_counter()),
             "name": list(msg.name),
             "position": [float(v) for v in msg.position],
             "velocity": [float(v) for v in msg.velocity],
@@ -81,7 +81,7 @@ class JointStateCollector(Node):
         return self._first_msg.wait(timeout_s)
 
     def latest_snapshot(self, *, max_age_s: float) -> Optional[dict]:
-        now = time.time()
+        now = time.perf_counter()
         with self._lock:
             if not self._history:
                 return None
@@ -253,11 +253,11 @@ def main() -> int:
             time.sleep(args.warmup)
 
             loop_period_s = 1.0 / args.rate_hz
-            next_tick = time.monotonic()
+            next_tick = time.perf_counter()
             printed = 0
 
             while True:
-                sleep_s = next_tick - time.monotonic()
+                sleep_s = next_tick - time.perf_counter()
                 if sleep_s > 0:
                     time.sleep(sleep_s)
                 next_tick += loop_period_s

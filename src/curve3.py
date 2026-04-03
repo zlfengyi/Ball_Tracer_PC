@@ -50,7 +50,6 @@ Stage 1（落地后）：
 from __future__ import annotations
 
 import math
-import time
 
 import numpy as np
 from dataclasses import dataclass
@@ -59,7 +58,7 @@ from typing import List, Optional, Tuple
 
 from .cv_linalg import solve_least_squares
 
-GRAVITY = 9800.0  # mm/s²
+GRAVITY = 9.8  # m/s²
 
 
 # ── 数据结构 ──────────────────────────────────────────────────────────────
@@ -220,18 +219,17 @@ class Curve3Tracker:
 
     def __init__(
         self,
-        ideal_hit_z: float = 800.0,
+        ideal_hit_z: float = 0.8,
         cor: float = 0.78,
         cor_xy: float = 0.42,
         ground_z: float = 0.0,
         min_points: int = 5,
         min_stage1_points: int = 5,
-        fit_rmse_max: float = 400.0,
+        fit_rmse_max: float = 0.4,
         reset_timeout: float = 0.5,
         motion_window_s: float = 0.2,
-        motion_min_y: float = 500.0,
+        motion_min_y: float = 0.5,
         land_skip_time: float = 0.03,
-        prediction_time_mode: str = "wall",
     ):
         """
         Args:
@@ -273,11 +271,6 @@ class Curve3Tracker:
         self.motion_window_s = motion_window_s
         self.motion_min_y = motion_min_y
         self.land_skip_time = land_skip_time
-        if prediction_time_mode not in ("wall", "observation"):
-            raise ValueError(
-                "prediction_time_mode must be 'wall' or 'observation'"
-            )
-        self.prediction_time_mode = prediction_time_mode
 
         # ── 全局累积（不随重置清除） ──
         self.predictions: List[PredictHitPos] = []
@@ -408,19 +401,13 @@ class Curve3Tracker:
                 self._state = TrackerState.TRACKING_S1
 
         # ── 预测 ──
-        pred = self._predict(self._current_prediction_time(obs))
+        pred = self._predict(obs.t)
         if pred is not None:
             self.predictions.append(pred)
             if pred.stage == 0:
                 self._last_s0_pred = pred
 
         return TrackerResult(prediction=pred, state=self._state)
-
-    def _current_prediction_time(self, obs: BallObservation) -> float:
-        """Return ct on the same time axis as obs.t."""
-        if self.prediction_time_mode == "observation":
-            return obs.t
-        return time.time()
 
     # ── 运动过滤 ──
 
@@ -480,7 +467,7 @@ class Curve3Tracker:
 
     # ── 重置检测 ──
 
-    _VELOCITY_JUMP_THRESHOLD = 50000  # 50 m/s — 超过此速度视为异常跳变
+    _VELOCITY_JUMP_THRESHOLD = 50.0  # 50 m/s — 超过此速度视为异常跳变
     _JUMP_RESET_COUNT = 3  # 连续跳变帧数达此值才真正重置
 
     def _check_reset(self, obs: BallObservation) -> bool:
@@ -531,9 +518,9 @@ class Curve3Tracker:
                 if o.t > self._t_land + self.land_skip_time]
         if len(post) < 10:
             return False
-        if self._post_bounce_max_z < 300:
+        if self._post_bounce_max_z < 0.3:
             return False
-        return self._obs[-1].z < 100
+        return self._obs[-1].z < 0.1
 
     def _update_land2_time(self) -> None:
         """用 S1 拟合曲线预测二次落地时间。超过此时间后不再给出预测。"""
@@ -652,7 +639,7 @@ class Curve3Tracker:
 
     def _predict_stage0(self, ct: float) -> Optional[PredictHitPos]:
         """
-        Stage 0: 拟合空中曲线 → 推算落地 → COR 反弹 →
+        Stage 0: 拟合空中曲线 -> 推算落地 -> COR 反弹 ->
         求下降阶段到达 ideal_hit_z 的时刻和位置。
         小车根据此 (x, y) 移动。
         """
@@ -670,12 +657,12 @@ class Curve3Tracker:
 
         x_b, y_b, _ = curve.predict(t_bounce)
         vx_b, vy_b, vz_b = curve.velocity_at(t_bounce)
-        # 反弹后速度：z 反向 × cor，x/y 衰减 × cor_xy
+        # 反弹后速度：z 反向 * cor，x/y 衰减 * cor_xy
         vz_post = -self.cor * vz_b
         vx_post = self.cor_xy * vx_b
         vy_post = self.cor_xy * vy_b
 
-        # z(dt) = vz_post*dt - 0.5*g*dt² = ideal_hit_z
+        # z(dt) = vz_post*dt - 0.5*g*dt^2 = ideal_hit_z
         a = -0.5 * GRAVITY
         b = vz_post
         c = self.ground_z - self.ideal_hit_z

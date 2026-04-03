@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-1280x1280 分片管理器 — 每台相机独立的 YOLO 检测区域管理。
+1000x1000 分片管理器 — 每台相机独立的 YOLO 检测区域管理。
 
-裁剪 1280x1280 切片后压缩到 640x640 送入 YOLO，检测坐标乘 2 还原到切片坐标
+裁剪 1000x1000 切片后压缩到 640x640 送入 YOLO，检测坐标按缩放比例还原到切片坐标
 再加上切片偏移得到全图坐标。
 
 每台相机独立的三种状态：
@@ -19,18 +19,18 @@
 
 用法::
 
-    tile_mgr = TileManager({"DA8199285": (2448, 2048)})
+    tile_mgr = TileManager({"cam0": (2048, 1536)})
 
     # 每帧
-    crop_640, tile = tile_mgr.get_tile("DA8199285", image, current_time)
+    crop_640, tile = tile_mgr.get_tile("cam0", image, current_time)
     dets = detector.detect(crop_640)
     dets_full = [TileManager.map_detection_to_full(d, tile) for d in dets]
 
     # YOLO 检测到球但 3D 定位失败
-    tile_mgr.on_2d_detected("DA8199285", tile)
+    tile_mgr.on_2d_detected("cam0", tile)
 
     # 3D 定位成功
-    tile_mgr.on_3d_located("DA8199285", det.x, det.y, current_time)
+    tile_mgr.on_3d_located("cam0", det.x, det.y, current_time)
 """
 
 from __future__ import annotations
@@ -75,7 +75,7 @@ class _CameraState:
 
 
 class TileManager:
-    """每台相机独立的 1280x1280 分片管理器（压缩 640x640 送 YOLO）。"""
+    """每台相机独立的 1000x1000 分片管理器（压缩 640x640 送 YOLO）。"""
 
     RESIZE_TO = 640
 
@@ -83,10 +83,12 @@ class TileManager:
         self,
         camera_sizes: dict[str, tuple[int, int]],
         tile_size: int = 1280,
+        resize_to: int = RESIZE_TO,
         track_timeout: float = 0.3,
         search_hold_frames: int = 4,
     ):
         self._tile_size = tile_size
+        self._resize_to = max(int(resize_to), 1)
         self._track_timeout = track_timeout
         self._search_hold_frames = search_hold_frames
         self._states: dict[str, _CameraState] = {}
@@ -191,15 +193,19 @@ class TileManager:
         self, image: np.ndarray, tile: TileRect
     ) -> np.ndarray:
         crop = image[tile.y:tile.y + tile.h, tile.x:tile.x + tile.w]
-        return cv2.resize(crop, (self.RESIZE_TO, self.RESIZE_TO))
+        return cv2.resize(crop, (self._resize_to, self._resize_to))
 
     @staticmethod
     def map_detection_to_full(
-        det: BallDetection, tile: TileRect
+        det: BallDetection,
+        tile: TileRect,
+        *,
+        resize_to: int = RESIZE_TO,
     ) -> BallDetection:
         """将 640x640 上的检测坐标映射回全图坐标。"""
-        sx = tile.w / TileManager.RESIZE_TO
-        sy = tile.h / TileManager.RESIZE_TO
+        resize = max(int(resize_to), 1)
+        sx = tile.w / resize
+        sy = tile.h / resize
         return BallDetection(
             x=det.x * sx + tile.x,
             y=det.y * sy + tile.y,
@@ -214,6 +220,10 @@ class TileManager:
     def get_search_tile_count(self, sn: str) -> int:
         """返回该相机的搜索切片总数。"""
         return len(self._states[sn].search_tiles)
+
+    @property
+    def resize_to(self) -> int:
+        return self._resize_to
 
     @property
     def serials(self) -> list[str]:

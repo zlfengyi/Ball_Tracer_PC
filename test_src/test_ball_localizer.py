@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-三目网球 3D 定位测试 (Step 8.5)。
+四相机网球 3D 定位测试。
 
-拍摄一帧三目图片 → YOLO 检测网球 → 多视图三角测量 → 打印 3D 位置。
+拍摄一帧四相机同步图片 → YOLO 检测网球 → 多视图三角测量 → 打印 3D 位置。
 
 用法：
   python test_src/test_ball_localizer.py
@@ -47,20 +47,20 @@ def _yolo_detect_n(detector, img_list, engine_batch):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="三目网球 3D 定位测试 (Step 8.5)")
+    parser = argparse.ArgumentParser(description="四相机网球 3D 定位测试")
     parser.add_argument("--frames", type=int, default=1,
                         help="拍摄帧数（默认 1）")
     args = parser.parse_args()
 
     print("=" * 60)
-    print("  Step 8.5 — 三目网球 3D 定位测试")
+    print("  四相机网球 3D 定位测试")
     print("=" * 60)
 
     print("\n[1/3] 初始化 BallDetector (YOLO)...")
     detector = BallDetector()
     print(f"  模型: {detector.model_path}")
 
-    print("[2/3] 初始化 BallLocalizer (multi_calib.json)...")
+    print("[2/3] 初始化 BallLocalizer (four_camera_calib.json)...")
     localizer = BallLocalizer(detector=detector)
     cam_serials = localizer.serials
     print(f"  相机: {cam_serials}")
@@ -141,7 +141,7 @@ def main():
                 dt_tri = (time.perf_counter() - t1) * 1000
 
                 cams = "+".join(s[-3:] for s in ball3d.cameras_used)
-                print(f"  -> 3D: ({ball3d.x:.0f}, {ball3d.y:.0f}, {ball3d.z:.0f}) mm")
+                print(f"  -> 3D: ({ball3d.x:.3f}, {ball3d.y:.3f}, {ball3d.z:.3f}) m")
                 print(f"     相机: {cams}")
                 print(f"     重投影误差: {ball3d.reprojection_error:.1f}px")
                 print(f"     置信度: {ball3d.confidence:.3f}")

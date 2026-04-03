@@ -100,11 +100,11 @@ def main():
         segment_idx = 0
 
         print(f"\n开始测试（{args.duration}s）...\n")
-        t_start = time.monotonic()
+        t_start = time.perf_counter()
         next_progress = t_start + PROGRESS_INTERVAL
         segment_start_time = t_start
 
-        while time.monotonic() - t_start < args.duration:
+        while time.perf_counter() - t_start < args.duration:
             frames = cap.get_frames(timeout_s=1.0)
             if frames is None:
                 timeout_count += 1
@@ -118,7 +118,7 @@ def main():
             exposure_starts = []
             for sn in all_serials:
                 f = frames[sn]
-                arrivals.append(f.arrival_mono)
+                arrivals.append(f.arrival_perf)
                 exposure_starts.append(f.exposure_start_pc)
                 lost_packets[sn] += f.lost_packet
 
@@ -138,7 +138,7 @@ def main():
                     frame_drops[sn] += abs(cur_fn - prev_fn - 1)
                 frame_nums[sn] = cur_fn
 
-            # 组内 arrival_mono 差（ms）
+            # 组内 arrival_perf 差（ms）
             arrival_spread = (max(arrivals) - min(arrivals)) * 1000.0
             arrival_spreads_ms.append(arrival_spread)
 
@@ -166,7 +166,7 @@ def main():
                 saved = True
 
             # ── 分时段进度输出 ──
-            now = time.monotonic()
+            now = time.perf_counter()
             if now >= next_progress:
                 elapsed = now - t_start
                 seg_elapsed = now - segment_start_time
@@ -188,7 +188,7 @@ def main():
                 segment_start_time = now
                 next_progress = now + PROGRESS_INTERVAL
 
-        t_elapsed = time.monotonic() - t_start
+        t_elapsed = time.perf_counter() - t_start
 
     # ── 生成报告内容 ──
     lines: list[str] = []
@@ -236,10 +236,10 @@ def main():
         out(f"  P1-P99:  [{exp_stats['p1']:.3f}, {exp_stats['p99']:.3f}]")
         out()
 
-    # 主机到达抖动（arrival_mono spread）
+    # 主机到达抖动（arrival_perf spread）
     if arrival_spreads_ms:
         arr_stats = _stats(arrival_spreads_ms)
-        out("主机到达抖动 (arrival_mono max-min, ms):")
+        out("主机到达抖动 (arrival_perf max-min, ms):")
         out(f"  均值:    {arr_stats['mean']:.3f}")
         out(f"  标准差:  {arr_stats['std']:.3f}")
         out(f"  最大:    {arr_stats['max']:.3f}")

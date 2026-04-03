@@ -318,8 +318,8 @@ def _enable_device_events(
                 out_q.put_nowait(
                     {
                         "type": "camera_event",
-                        "created_at": time.time(),
-                        "host_monotonic": time.monotonic(),
+                        "created_at_perf": time.perf_counter(),
+                        "host_perf_counter": time.perf_counter(),
                         "serial": str(serial),
                         "event_name": event_name,
                         "requested_event_name": _requested,

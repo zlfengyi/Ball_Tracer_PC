@@ -3,7 +3,7 @@
 """软触发循环（TriggerSource=Software 时使用）。
 
 该模块负责“发命令”的侧写：
-- 每个触发周期记录一次 send 事件（host monotonic + wall time），用于离线统计 send-fps。
+- 每个触发周期记录一次 send 事件（host perf_counter），用于离线统计 send-fps。
 """
 
 from __future__ import annotations
@@ -57,8 +57,7 @@ class SoftwareTriggerLoop(threading.Thread):
                 time.sleep(min(0.005, next_t - now))
                 continue
 
-            send_monotonic = time.monotonic()
-            send_wall_time = time.time()
+            send_perf_counter = time.perf_counter()
             targets_serial = []
             for serial, cam in self._targets:
                 try:
@@ -73,8 +72,8 @@ class SoftwareTriggerLoop(threading.Thread):
                         {
                             "type": "soft_trigger_send",
                             "seq": seq,
-                            "created_at": send_wall_time,
-                            "host_monotonic": send_monotonic,
+                            "created_at_perf": send_perf_counter,
+                            "host_perf_counter": send_perf_counter,
                             "targets": targets_serial,
                         }
                     )

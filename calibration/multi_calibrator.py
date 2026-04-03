@@ -34,6 +34,8 @@ log = logging.getLogger(__name__)
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 _MIN_VALID_IMAGES = 5
+_PAIRWISE_TRANSLATION_TOL_MM = 100.0
+_PAIRWISE_ROTATION_TOL_DEG = 2.0
 
 
 # ================================================================
@@ -190,6 +192,10 @@ def _detect_checkerboard(gray: np.ndarray, board: BoardConfig
     # 亚像素精化
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
     corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
+    from calibration.detect_corners_v2 import canonicalize_corner_order
+    corners, _, _ = canonicalize_corner_order(
+        gray, corners, board.inner_cols, board.inner_rows
+    )
     return corners
 
 
@@ -210,9 +216,45 @@ def _mat_to_rvec_tvec(T):
     return rvec.ravel(), T[:3, 3].copy()
 
 
+def _average_transforms(transforms: list[np.ndarray]) -> np.ndarray:
+    """Average SE(3) transforms with quaternion averaging and median translation."""
+    if not transforms:
+        raise ValueError("transforms must not be empty")
+    if len(transforms) == 1:
+        return transforms[0].copy()
+
+    quats = np.array([Rotation.from_matrix(T[:3, :3]).as_quat() for T in transforms])
+    for i in range(1, len(quats)):
+        if np.dot(quats[i], quats[0]) < 0:
+            quats[i] = -quats[i]
+    avg_quat = np.mean(quats, axis=0)
+    avg_quat /= np.linalg.norm(avg_quat)
+
+    avg_t = np.median(np.array([T[:3, 3] for T in transforms]), axis=0)
+    T = np.eye(4)
+    T[:3, :3] = Rotation.from_quat(avg_quat).as_matrix()
+    T[:3, 3] = avg_t
+    return T
+
+
 def _project(pts_3d, rvec, tvec, K, D):
     proj, _ = cv2.projectPoints(pts_3d, rvec, tvec, K, D)
     return proj.reshape(-1, 2)
+
+
+def _rotation_angle_deg(R: np.ndarray) -> float:
+    """Return the rotation angle (degrees) represented by a 3x3 rotation matrix."""
+    val = (np.trace(R) - 1.0) * 0.5
+    val = float(np.clip(val, -1.0, 1.0))
+    return float(np.degrees(np.arccos(val)))
+
+
+def _transform_error(T: np.ndarray, T_ref: np.ndarray) -> tuple[float, float]:
+    """Return translation and rotation error between two SE(3) transforms."""
+    trans_err = float(np.linalg.norm(T[:3, 3] - T_ref[:3, 3]))
+    R_delta = T[:3, :3] @ T_ref[:3, :3].T
+    rot_err = _rotation_angle_deg(R_delta)
+    return trans_err, rot_err
 
 
 # ================================================================
@@ -240,6 +282,9 @@ class MultiCalibrator:
         save_annotations: bool = False,
         fix_intrinsics: bool = False,
         max_images: int = 0,
+        min_cameras_per_board: int = 2,
+        detection_score_threshold: float = 0.8,
+        provided_intrinsics: Optional[dict[str, dict[str, np.ndarray | tuple[int, int]]]] = None,
     ):
         self._serials = serials
         self._image_dir = Path(image_dir)
@@ -249,6 +294,11 @@ class MultiCalibrator:
         self._save_annotations = save_annotations
         self._fix_intrinsics = fix_intrinsics
         self._max_images = max_images
+        self._detection_score_threshold = float(detection_score_threshold)
+        self._provided_intrinsics = provided_intrinsics or {}
+        if min_cameras_per_board < 2:
+            raise ValueError("min_cameras_per_board must be >= 2")
+        self._min_cameras_per_board = min_cameras_per_board
 
         if self._ref_serial not in self._serials:
             raise ValueError(f"参考相机 {self._ref_serial} 不在列表 {self._serials} 中")
@@ -275,14 +325,14 @@ class MultiCalibrator:
         # ── 3. 初始化外参 + 板位姿 ──
         print(f"\n[3/4] 初始化外参 (solvePnP)...")
         (init_cam_poses, init_board_poses,
-         valid_images) = self._init_extrinsics(detections, init_K, init_D,
-                                               obj_pts)
+         valid_images) = self._init_extrinsics_pairwise(detections, init_K, init_D,
+                                                        obj_pts)
 
         if len(valid_images) < _MIN_VALID_IMAGES:
             raise RuntimeError(
                 f"有效图像不足: {len(valid_images)} < {_MIN_VALID_IMAGES}")
 
-        print(f"  有效图像: {len(valid_images)} (3台同时检测成功)")
+        print(f"  有效图像: {len(valid_images)} (>= {self._min_cameras_per_board} 台相机)")
         for sn in self._serials:
             if sn != self._ref_serial and sn in init_cam_poses:
                 rv, tv = _mat_to_rvec_tvec(init_cam_poses[sn])
@@ -320,11 +370,16 @@ class MultiCalibrator:
                 cache = json.load(f)
 
             cam_cache = cache.get("cameras", {})
+            filtered_low_score = {sn: 0 for sn in self._serials}
             for sn in self._serials:
                 sn_data = cam_cache.get(sn, {})
                 for idx_str, det_data in sn_data.items():
                     idx = int(idx_str)
                     if idx < start or idx > end:
+                        continue
+                    score = float(det_data.get("score", 1.0))
+                    if score < self._detection_score_threshold:
+                        filtered_low_score[sn] += 1
                         continue
                     corners = np.array(det_data["corners"],
                                        dtype=np.float32).reshape(-1, 1, 2)
@@ -339,6 +394,11 @@ class MultiCalibrator:
             for sn in self._serials:
                 n = sum(1 for d in detections.values() if sn in d)
                 print(f"  {sn}: {n}/{total} 帧检测成功")
+                if filtered_low_score[sn]:
+                    print(
+                        f"    filtered by score<{self._detection_score_threshold:.3f}: "
+                        f"{filtered_low_score[sn]}"
+                    )
 
             return detections, image_sizes
 
@@ -346,13 +406,15 @@ class MultiCalibrator:
         print(f"  未找到缓存，实时检测（建议先运行 detect_corners.py）")
         pattern = (board.inner_cols, board.inner_rows)
         total = end - start + 1
-        t0 = _time.monotonic()
+        t0 = _time.perf_counter()
         processed = 0
 
         for idx in range(start, end + 1):
             cam_dets = {}
             for sn in self._serials:
-                path = self._image_dir / sn / f"{idx:03d}.png"
+                path = self._image_dir / sn / f"{idx:04d}.png"
+                if not path.exists():
+                    path = self._image_dir / sn / f"{idx:03d}.png"
                 if not path.exists():
                     continue
                 img = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
@@ -371,7 +433,7 @@ class MultiCalibrator:
 
             processed += 1
             if processed % 20 == 0 or processed == total:
-                elapsed = _time.monotonic() - t0
+                elapsed = _time.perf_counter() - t0
                 speed = processed / elapsed if elapsed > 0 else 0
                 eta = (total - processed) / speed if speed > 0 else 0
                 n_det = len(cam_dets)
@@ -381,7 +443,7 @@ class MultiCalibrator:
                       f"ETA {eta:.0f}s, "
                       f"本帧检测到 {n_det}/{len(self._serials)} 相机")
 
-        total_elapsed = _time.monotonic() - t0
+        total_elapsed = _time.perf_counter() - t0
         print(f"\n  检测完成，耗时 {total_elapsed:.1f}s")
         for sn in self._serials:
             n = sum(1 for d in detections.values() if sn in d)
@@ -394,6 +456,30 @@ class MultiCalibrator:
     # ────────────────────────────────────────────────────────────
 
     def _init_intrinsics(self, detections, image_sizes, board, obj_pts):
+        if self._provided_intrinsics:
+            print("  使用提供的内参结果，不再重新 calibrateCamera")
+            init_K = {}
+            init_D = {}
+            for sn in self._serials:
+                if sn not in self._provided_intrinsics:
+                    raise RuntimeError(f"提供的内参中缺少相机 {sn}")
+                intr = self._provided_intrinsics[sn]
+                K = np.asarray(intr["K"], dtype=np.float64).reshape(3, 3)
+                D = np.asarray(intr["D"], dtype=np.float64).ravel()[:5]
+                size = tuple(int(v) for v in intr["image_size"])
+                if sn in image_sizes and tuple(image_sizes[sn]) != size:
+                    raise RuntimeError(
+                        f"相机 {sn} 的图像尺寸不匹配: detections={image_sizes[sn]} vs intrinsics={size}"
+                    )
+                image_sizes[sn] = size
+                init_K[sn] = K
+                init_D[sn] = D
+                print(
+                    f"  {sn}: fx={K[0,0]:.1f} fy={K[1,1]:.1f} "
+                    f"(provided, size={size})"
+                )
+            return init_K, init_D
+
         init_K = {}
         init_D = {}
 
@@ -524,10 +610,13 @@ class MultiCalibrator:
         for idx, T in cam_frame_poses[ref].items():
             board_poses[idx] = T
 
-        # 有效图像：所有相机都有检测的帧
+        # 有效图像：满足最小相机数的帧（参考相机必须可见）
         valid_images = sorted(
             idx for idx in board_poses
-            if all(idx in cam_frame_poses[sn] for sn in self._serials))
+            if sum(1 for sn in self._serials if idx in cam_frame_poses[sn])
+               >= self._min_cameras_per_board)
+
+        print(f"  有效图像: {len(valid_images)} 帧 (>= {self._min_cameras_per_board} 台相机)")
 
         # 均匀抽样限制图片数量（加速 BA）
         if self._max_images > 0 and len(valid_images) > self._max_images:
@@ -577,6 +666,180 @@ class MultiCalibrator:
                      sn, len(R_estimates), t_avg[0], t_avg[1], t_avg[2])
 
         return cam_poses, board_poses, valid_images
+
+    def _init_extrinsics_pairwise(self, detections, init_K, init_D, obj_pts):
+        ref = self._ref_serial
+
+        # 每台相机每帧 solvePnP，先得到 board -> camera 的观测位姿。
+        cam_frame_poses = {sn: {} for sn in self._serials}
+        for idx, cam_dets in detections.items():
+            for sn in self._serials:
+                if sn not in cam_dets:
+                    continue
+                corners = cam_dets[sn]
+                ok, rvec, tvec = cv2.solvePnP(
+                    obj_pts, corners,
+                    init_K[sn], init_D[sn],
+                    flags=cv2.SOLVEPNP_ITERATIVE)
+                if ok:
+                    cam_frame_poses[sn][idx] = _rvec_tvec_to_mat(rvec, tvec)
+
+        candidate_images = sorted(
+            idx for idx in detections
+            if sum(1 for sn in self._serials if idx in cam_frame_poses[sn])
+            >= self._min_cameras_per_board
+        )
+        if not candidate_images:
+            raise RuntimeError(
+                f"有效图像不足: 0 < {_MIN_VALID_IMAGES} "
+                f"(至少需要 {self._min_cameras_per_board} 台相机同时看到棋盘)"
+            )
+
+        # 用两两共同看到棋盘的帧建立相机重叠图。
+        pairwise_rel: dict[tuple[str, str], list[np.ndarray]] = {}
+        for idx in candidate_images:
+            viewers = [sn for sn in self._serials if idx in cam_frame_poses[sn]]
+            if len(viewers) < 2:
+                continue
+            for from_sn in viewers:
+                T_from_board = cam_frame_poses[from_sn][idx]
+                for to_sn in viewers:
+                    if to_sn == from_sn:
+                        continue
+                    T_to_board = cam_frame_poses[to_sn][idx]
+                    T_to_from = T_to_board @ np.linalg.inv(T_from_board)
+                    pairwise_rel.setdefault((from_sn, to_sn), []).append(T_to_from)
+
+        if not pairwise_rel:
+            raise RuntimeError("没有足够的两两共同观测，无法初始化相机外参")
+
+        pairwise_avg = {}
+        for edge, transforms in pairwise_rel.items():
+            avg0 = _average_transforms(transforms)
+            filtered = []
+            for T in transforms:
+                trans_err, rot_err = _transform_error(T, avg0)
+                if (trans_err <= _PAIRWISE_TRANSLATION_TOL_MM
+                        and rot_err <= _PAIRWISE_ROTATION_TOL_DEG):
+                    filtered.append(T)
+            if filtered and len(filtered) < len(transforms):
+                log.info(
+                    "pair %s -> %s: filtered %d/%d inconsistent observations",
+                    edge[0], edge[1], len(transforms) - len(filtered), len(transforms),
+                )
+            pairwise_avg[edge] = _average_transforms(filtered or transforms)
+
+        filtered_cam_frame_poses = {sn: {} for sn in self._serials}
+        dropped_observations = 0
+        for idx in candidate_images:
+            viewers = [sn for sn in self._serials if idx in cam_frame_poses[sn]]
+            if len(viewers) < 2:
+                continue
+
+            consistent = set()
+            for from_sn in viewers:
+                T_from_board = cam_frame_poses[from_sn][idx]
+                for to_sn in viewers:
+                    if to_sn == from_sn:
+                        continue
+                    T_ref_edge = pairwise_avg.get((from_sn, to_sn))
+                    if T_ref_edge is None:
+                        continue
+                    T_to_board = cam_frame_poses[to_sn][idx]
+                    T_to_from = T_to_board @ np.linalg.inv(T_from_board)
+                    trans_err, rot_err = _transform_error(T_to_from, T_ref_edge)
+                    if (trans_err <= _PAIRWISE_TRANSLATION_TOL_MM
+                            and rot_err <= _PAIRWISE_ROTATION_TOL_DEG):
+                        consistent.add(from_sn)
+                        consistent.add(to_sn)
+
+            if len(consistent) >= self._min_cameras_per_board:
+                for sn in consistent:
+                    filtered_cam_frame_poses[sn][idx] = cam_frame_poses[sn][idx]
+            dropped_observations += len(viewers) - len(consistent)
+
+        if dropped_observations:
+            log.info(
+                "Dropped %d inconsistent camera observations before BA initialization",
+                dropped_observations,
+            )
+        cam_frame_poses = filtered_cam_frame_poses
+        candidate_images = sorted(
+            idx for idx in detections
+            if sum(1 for sn in self._serials if idx in cam_frame_poses[sn])
+            >= self._min_cameras_per_board
+        )
+        if not candidate_images:
+            raise RuntimeError(
+                "Pairwise consistency filtering removed all valid calibration frames"
+            )
+
+        # 从参考相机沿相机重叠图传播初始化每台相机的外参。
+        cam_poses = {ref: np.eye(4)}
+        queue = [ref]
+        while queue:
+            from_sn = queue.pop(0)
+            for to_sn in self._serials:
+                if to_sn in cam_poses:
+                    continue
+                T_to_from = pairwise_avg.get((from_sn, to_sn))
+                if T_to_from is None:
+                    continue
+                cam_poses[to_sn] = T_to_from @ cam_poses[from_sn]
+                queue.append(to_sn)
+
+        if len(cam_poses) != len(self._serials):
+            missing = [sn for sn in self._serials if sn not in cam_poses]
+            raise RuntimeError(
+                "相机重叠图不连通，无法把所有相机初始化到参考相机；"
+                f"缺少: {missing}"
+            )
+
+        # 只要有 >= min_cameras 台已初始化相机看到棋盘，就可以恢复这一帧的板位姿。
+        board_poses = {}
+        valid_images = []
+        valid_images_without_ref = 0
+        for idx in candidate_images:
+            viewers = [
+                sn for sn in self._serials
+                if idx in cam_frame_poses[sn] and sn in cam_poses
+            ]
+            if len(viewers) < self._min_cameras_per_board:
+                continue
+            if ref in viewers:
+                # When the reference camera sees the board, use its direct solvePnP
+                # pose to keep board indexing consistent across frames.
+                board_poses[idx] = cam_frame_poses[ref][idx].copy()
+            else:
+                estimates = []
+                for sn in viewers:
+                    T_cam_ref = cam_poses[sn]
+                    T_ref_board = np.linalg.inv(T_cam_ref) @ cam_frame_poses[sn][idx]
+                    estimates.append(T_ref_board)
+                board_poses[idx] = _average_transforms(estimates)
+            valid_images.append(idx)
+            if ref not in viewers:
+                valid_images_without_ref += 1
+
+        print(
+            f"  有效图像: {len(valid_images)} 帧 (>= {self._min_cameras_per_board} 台相机, "
+            f"其中 {valid_images_without_ref} 帧不含参考相机)"
+        )
+
+        if self._max_images > 0 and len(valid_images) > self._max_images:
+            n = self._max_images
+            step = len(valid_images) / n
+            valid_images = [valid_images[int(i * step)] for i in range(n)]
+            log.info("抽样 %d/%d 帧用于 BA", n, len(valid_images))
+
+        for sn in self._serials:
+            if sn == ref:
+                continue
+            T = cam_poses[sn]
+            log.info("%s -> ref 初始化: t=[%.1f, %.1f, %.1f]",
+                     sn, T[0, 3], T[1, 3], T[2, 3])
+
+        return cam_poses, board_poses, sorted(valid_images)
 
     # ────────────────────────────────────────────────────────────
     #  Bundle Adjustment

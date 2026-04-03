@@ -1,0 +1,469 @@
+{
+  "config_role": "arm_poe_racket_center_position",
+  "written_at": "2026-03-29T21:26:41",
+  "source_session": "ArmCalibration\\data\\004_15_2_formal_capture_domain2_03192121",
+  "source_result": "ArmCalibration\\data\\004_15_2_formal_capture_domain2_03192121\\poe_reprojection_result_pruned15_strict.json",
+  "camera_calibration": "src\\config\\four_camera_calib.json",
+  "measurement_target": {
+    "name": "racket_center",
+    "definition": "geometric center of racket keypoints 0-3",
+    "joint_5_position_invariant_assumption": true,
+    "joint_5_note": "This config is position-only. joint_5 is treated as an orientation-only axis for the racket center and is not included in the translational POE chain."
+  },
+  "frames": {
+    "world": {
+      "definition": "ground-registered world frame from four_camera_calib.json",
+      "ground_plane_world_z": 0.0
+    },
+    "base": {
+      "definition": "Base origin is the intersection of joint_1 axis with the world ground plane. base z-axis is aligned with joint_1 axis. base y-axis is the projection of joint_2 axis onto the plane orthogonal to base z. base x-axis completes the right-handed frame.",
+      "origin_definition": "intersection of joint_1 axis with world ground plane z=0.000",
+      "physical_meaning": "This base origin is also the car chassis center used as p_car in step 15.6."
+    }
+  },
+  "validation_manual": {
+    "step_15_status": "completed",
+    "checked_at": "2026-03-22",
+    "summary": "On-site manual cross-checks indicate the overall discrepancy between manual measurement, vision, and POE is at the few-centimeter level.",
+    "z_axis_note": "The z-axis accuracy is at the centimeter level.",
+    "source_note": "These notes are the final manual validation notes recorded in DEV.md."
+  },
+  "vehicle_reference": {
+    "car_base_definition": "car chassis center in world coordinates. In this project it is the same physical point as the robotic arm base used by the exported POE model.",
+    "apriltag_center_measurement": "p_apriltag is the multi-camera triangulated world position of the detected AprilTag center.",
+    "p_car_definition": "p_car = p_apriltag + apriltag_center_to_car_base_offset_world",
+    "apriltag_center_to_car_base_offset_m": [
+      0.06,
+      0.1,
+      -0.34
+    ],
+    "apriltag_center_to_car_base_offset_mm": [
+      60.0,
+      100.0,
+      -340.0
+    ],
+    "offset_axis_convention": "The offset is applied directly in the world frame axes, exactly as p_car = (x + 0.06, y + 0.10, z - 0.34) when p_apriltag = (x, y, z) in meters."
+  },
+  "T_base_in_world": {
+    "R": [
+      [
+        -0.9999992895452321,
+        0.0011687124469672743,
+        0.00023456395188598981
+      ],
+      [
+        -0.0011681161174263977,
+        -0.999996126077937,
+        0.002526526044787543
+      ],
+      [
+        0.00023751582563965164,
+        0.002526250251872303,
+        0.9999967808177671
+      ]
+    ],
+    "t_mm": [
+      -310.14671509470554,
+      2165.833907062299,
+      0.0
+    ]
+  },
+  "poe_model_position_only": {
+    "joint_count": 4,
+    "joint_angle_offsets_rad": [
+      -3.1414179487950165,
+      3.14151873499119,
+      -2.4492276312534376,
+      -2.3962852000524806
+    ],
+    "space_axes_base": [
+      {
+        "joint_index": 1,
+        "omega": [
+          -2.710505431213761e-20,
+          -4.336808689942018e-19,
+          0.9999999999999999
+        ],
+        "q_mm": [
+          -2.3814283878209608e-14,
+          -1.2390088954816747e-13,
+          1049.1176253825333
+        ],
+        "v_mm": [
+          -1.234459073047144e-13,
+          2.378584748799379e-14,
+          6.96945898625131e-33
+        ],
+        "screw_axis_base": [
+          -2.710505431213761e-20,
+          -4.336808689942018e-19,
+          0.9999999999999999,
+          -1.234459073047144e-13,
+          2.378584748799379e-14,
+          6.96945898625131e-33
+        ]
+      },
+      {
+        "joint_index": 2,
+        "omega": [
+          2.0371142381465923e-19,
+          0.9999999563473636,
+          0.00029547465355365997
+        ],
+        "q_mm": [
+          7.786759290444906,
+          -748.4312129363639,
+          801.9452281947545
+        ],
+        "v_mm": [
+          -802.1663356410821,
+          -0.0023007900036497884,
+          7.7867589505323345
+        ],
+        "screw_axis_base": [
+          2.0371142381465923e-19,
+          0.9999999563473636,
+          0.00029547465355365997,
+          -802.1663356410821,
+          -0.0023007900036497884,
+          7.7867589505323345
+        ]
+      },
+      {
+        "joint_index": 3,
+        "omega": [
+          0.006094818174216322,
+          -0.9999812425408707,
+          0.0006064304080363482
+        ],
+        "q_mm": [
+          25.987248761086583,
+          -748.3905142496133,
+          411.474574109111
+        ],
+        "v_mm": [
+          411.0130091266775,
+          2.4921032546382027,
+          -21.425457198670426
+        ],
+        "screw_axis_base": [
+          0.006094818174216322,
+          -0.9999812425408707,
+          0.0006064304080363482,
+          411.0130091266775,
+          2.4921032546382027,
+          -21.425457198670426
+        ]
+      },
+      {
+        "joint_index": 4,
+        "omega": [
+          0.6321663478722294,
+          0.0012413893638676997,
+          0.7748317027395913
+        ],
+        "q_mm": [
+          1099.065550633894,
+          1.3407958810605018,
+          1739.8365512002893
+        ],
+        "v_mm": [
+          -1.1209234339799605,
+          248.27528644681513,
+          0.5167622493781672
+        ],
+        "screw_axis_base": [
+          0.6321663478722294,
+          0.0012413893638676997,
+          0.7748317027395913,
+          -1.1209234339799605,
+          248.27528644681513,
+          0.5167622493781672
+        ]
+      }
+    ],
+    "home_point_base_mm": [
+      440.6942630110467,
+      -375.78422270461675,
+      242.78457889878894
+    ]
+  },
+  "diagnostics": {
+    "dataset": {
+      "sample_dir_count": 400,
+      "samples_with_joint_state": 399,
+      "samples_missing_joint_state": 1,
+      "samples_with_1plus_cameras": 398,
+      "samples_with_2plus_cameras": 288,
+      "accepted_image_observations": 1128
+    },
+    "reprojection": {
+      "observation_count": 1128,
+      "mean_px": 4.610921275640277,
+      "median_px": 4.035524468211314,
+      "p95_px": 10.619935303966098,
+      "max_px": 14.769086756824635,
+      "count_over_10px": 77,
+      "count_over_20px": 0,
+      "count_over_50px": 0,
+      "per_camera": {
+        "DA7403103": {
+          "observation_count": 355,
+          "mean_px": 3.9602659556836755,
+          "median_px": 3.2872266473686116,
+          "p95_px": 10.699752909054308,
+          "max_px": 13.620843334222371
+        },
+        "DA8571029": {
+          "observation_count": 263,
+          "mean_px": 5.316640618839126,
+          "median_px": 4.9735658354342975,
+          "p95_px": 10.316109399883938,
+          "max_px": 14.769086756824635
+        },
+        "DA7403087": {
+          "observation_count": 254,
+          "mean_px": 4.943847211204528,
+          "median_px": 4.29979417061165,
+          "p95_px": 11.257557147428525,
+          "max_px": 14.53318301862399
+        },
+        "DA8474746": {
+          "observation_count": 256,
+          "mean_px": 4.457855899429248,
+          "median_px": 3.7696977536946834,
+          "p95_px": 10.490417676718764,
+          "max_px": 14.417613374072989
+        }
+      }
+    },
+    "joint_5_analysis": {
+      "range_rad": [
+        -0.05445869983956353,
+        0.23698861838733887
+      ],
+      "range_width_rad": 0.2914473182269024,
+      "discrete_0p1rad_bin_count": 4,
+      "residual_abs_corr_with_q5": 0.05466297480880412,
+      "residual_by_q5_bin": [
+        {
+          "bin_index": -1,
+          "range_rad": [
+            -0.1,
+            0.0
+          ],
+          "observation_count": 725,
+          "mean_px": 4.536799402202457,
+          "median_px": 3.8247867978871906
+        },
+        {
+          "bin_index": 0,
+          "range_rad": [
+            0.0,
+            0.1
+          ],
+          "observation_count": 259,
+          "mean_px": 4.507865461123281,
+          "median_px": 4.113723707696986
+        },
+        {
+          "bin_index": 1,
+          "range_rad": [
+            0.1,
+            0.2
+          ],
+          "observation_count": 132,
+          "mean_px": 5.222532337221476,
+          "median_px": 4.682752301804551
+        },
+        {
+          "bin_index": 2,
+          "range_rad": [
+            0.2,
+            0.30000000000000004
+          ],
+          "observation_count": 12,
+          "mean_px": 4.585684115107262,
+          "median_px": 4.615477298442284
+        }
+      ],
+      "conclusion": "Current position-only POE fit ignores joint_5. If residual does not track q5 and the fit is already low, joint_5 behaves like an orientation-only axis for the racket center."
+    },
+    "axis_distances_mm": [
+      {
+        "pair": "joint_1_to_joint_2",
+        "shortest_axis_distance_mm": 7.786759290444929
+      },
+      {
+        "pair": "joint_2_to_joint_3",
+        "shortest_axis_distance_mm": 388.92869678351235
+      },
+      {
+        "pair": "joint_3_to_joint_4",
+        "shortest_axis_distance_mm": 5.046608742354348
+      }
+    ],
+    "top_outliers": [
+      {
+        "sample_id": "sample_0186",
+        "camera_serial": "DA8571029",
+        "residual_uv": [
+          -12.849439779909972,
+          7.281333735867349
+        ],
+        "residual_px": 14.769086756824635,
+        "q4": [
+          -0.0413900968947889,
+          0.13981078812848047,
+          0.18863965819790884,
+          -0.008964675364309116
+        ],
+        "q5": -0.05445869983956353
+      },
+      {
+        "sample_id": "sample_0084",
+        "camera_serial": "DA8571029",
+        "residual_uv": [
+          -12.981392545287349,
+          -6.7973703265558925
+        ],
+        "residual_px": 14.653354420445323,
+        "q4": [
+          -1.2186236362249172,
+          0.09708552681773064,
+          0.05779354543373749,
+          0.07000076295109459
+        ],
+        "q5": -0.05445869983956353
+      },
+      {
+        "sample_id": "sample_0188",
+        "camera_serial": "DA7403087",
+        "residual_uv": [
+          -5.28018401218128,
+          13.54005411548735
+        ],
+        "residual_px": 14.53318301862399,
+        "q4": [
+          -0.27218280308232323,
+          -0.34733348592355284,
+          0.18787670710307403,
+          -0.008201724269474298
+        ],
+        "q5": -0.05445869983956353
+      },
+      {
+        "sample_id": "sample_0185",
+        "camera_serial": "DA7403087",
+        "residual_uv": [
+          -5.141574803840626,
+          -13.586181928254518
+        ],
+        "residual_px": 14.526531962279174,
+        "q4": [
+          0.5113679713130406,
+          0.17986572060730843,
+          0.1871137560082392,
+          -0.008583199816891707
+        ],
+        "q5": -0.05445869983956353
+      },
+      {
+        "sample_id": "sample_0135",
+        "camera_serial": "DA8474746",
+        "residual_uv": [
+          12.879103437555841,
+          -6.480452920050084
+        ],
+        "residual_px": 14.417613374072989,
+        "q4": [
+          1.4275738018770765,
+          0.11501487754634887,
+          0.05893797207598972,
+          -0.027275501640344757
+        ],
+        "q5": -0.05445869983956353
+      },
+      {
+        "sample_id": "sample_0015",
+        "camera_serial": "DA8474746",
+        "residual_uv": [
+          12.121104701013564,
+          -7.312536794243215
+        ],
+        "residual_px": 14.156071967184046,
+        "q4": [
+          -0.10852979324025291,
+          0.2523460746166162,
+          0.056267643244067855,
+          -0.06275272755016381
+        ],
+        "q5": -0.05445869983956353
+      },
+      {
+        "sample_id": "sample_0129",
+        "camera_serial": "DA7403087",
+        "residual_uv": [
+          -9.54068826840853,
+          -9.943986485567848
+        ],
+        "residual_px": 13.780696639143617,
+        "q4": [
+          0.9072411551997277,
+          0.12264438849469705,
+          0.05779354543373749,
+          -0.02574959945067512
+        ],
+        "q5": -0.05445869983956353
+      },
+      {
+        "sample_id": "sample_0173",
+        "camera_serial": "DA7403087",
+        "residual_uv": [
+          -8.60490565403984,
+          -10.56748959669585
+        ],
+        "residual_px": 13.627774495169849,
+        "q4": [
+          0.7234683756771201,
+          0.11997405966277519,
+          0.0661860074769205,
+          -0.018501564049744346
+        ],
+        "q5": -0.05445869983956353
+      },
+      {
+        "sample_id": "sample_0036",
+        "camera_serial": "DA7403103",
+        "residual_uv": [
+          1.1044660796160315,
+          13.575990859396143
+        ],
+        "residual_px": 13.620843334222371,
+        "q4": [
+          -0.1657511253528643,
+          -0.7101167315175108,
+          0.07648584725719054,
+          -0.07419699397268609
+        ],
+        "q5": -0.05445869983956353
+      },
+      {
+        "sample_id": "sample_0300",
+        "camera_serial": "DA8474746",
+        "residual_uv": [
+          6.810075583043499,
+          -11.775814469652005
+        ],
+        "residual_px": 13.6031957962249,
+        "q4": [
+          -0.20122835126268512,
+          -0.40531776913099904,
+          -0.23479819943541713,
+          -0.023842221713588074
+        ],
+        "q5": 0.14924924248133298
+      }
+    ]
+  }
+}

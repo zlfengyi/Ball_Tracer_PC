@@ -192,9 +192,9 @@ def simple_ba(detections, ref_serial, slave_serials, K, D,
                 res.append((proj.reshape(-1, 2) - obs).ravel())
         return np.concatenate(res)
 
-    t0 = time.monotonic()
+    t0 = time.perf_counter()
     result = least_squares(residuals, x0, method='lm', max_nfev=500, verbose=1)
-    elapsed = time.monotonic() - t0
+    elapsed = time.perf_counter() - t0
     total_rms = np.sqrt(np.mean(result.fun ** 2))
     print(f"\n  BA 完成: {elapsed:.1f}s, RMS={total_rms:.3f}px, "
           f"nfev={result.nfev}")

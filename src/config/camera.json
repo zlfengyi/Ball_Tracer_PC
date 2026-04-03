@@ -1,9 +1,9 @@
 {
-    "master_serial": "DA8199303",
-    "slave_serials": ["DA8199243", "DA8199285", "DA8199402"],
-    "fps": 23.0,
-    "exposure_us": 8000.0,
-    "gain_db": 25.0,
-    "master_min_bandwidth": true,
-    "recalib_every": 10
+    "master_serial": "DA7403103",
+    "slave_serials": ["DA8571029", "DA7403087", "DA8474746"],
+    "fps": 35.0,
+    "exposure_us": 1800.0,
+    "gain_db": 23.5,
+    "master_min_bandwidth": false,
+    "recalib_every": 2100
 }

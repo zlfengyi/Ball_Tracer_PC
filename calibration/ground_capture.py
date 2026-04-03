@@ -84,11 +84,11 @@ def main():
         captured = 0
         print(f"\n开始拍摄（{args.duration}s 内拍 {args.count} 组）...")
         print("请将标定板平放在地面上，保持不动。\n")
-        t_start = time.monotonic()
+        t_start = time.perf_counter()
         next_capture = t_start
 
         while captured < args.count:
-            now = time.monotonic()
+            now = time.perf_counter()
             elapsed = now - t_start
 
             # 超时保护

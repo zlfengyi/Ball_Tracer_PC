@@ -27,14 +27,20 @@ from src.curve3 import BallObservation, Curve3Tracker, TrackerState
 MIN_THROW_OBS = 10
 
 
+def _input_distance_scale_to_m(data: dict) -> float:
+    cfg = data.get("config", {})
+    return 1.0 if cfg.get("distance_unit") == "m" else 1.0 / 1000.0
+
+
 def replay(input_path: str, **overrides) -> dict:
     with open(input_path, encoding="utf-8") as f:
         data = json.load(f)
 
     raw_obs = data["observations"]
     orig_config = data.get("config", {})
+    dist_scale = _input_distance_scale_to_m(data)
 
-    tracker = Curve3Tracker(prediction_time_mode="observation", **overrides)
+    tracker = Curve3Tracker(**overrides)
 
     log_observations = []
     log_predictions = []
@@ -42,7 +48,12 @@ def replay(input_path: str, **overrides) -> dict:
     prev_state = TrackerState.IDLE
 
     for i, o in enumerate(raw_obs):
-        obs = BallObservation(x=o["x"], y=o["y"], z=o["z"], t=o["t"])
+        obs = BallObservation(
+            x=o["x"] * dist_scale,
+            y=o["y"] * dist_scale,
+            z=o["z"] * dist_scale,
+            t=o["t"],
+        )
         result = tracker.update(obs)
 
         log_observations.append({
@@ -79,17 +90,16 @@ def replay(input_path: str, **overrides) -> dict:
 
     result_json = {
         "config": {
-            "start_time": orig_config.get("start_time", ""),
             "serial_left": orig_config.get("serial_left", ""),
             "serial_right": orig_config.get("serial_right", ""),
             "duration_s": (obs_times[-1] - obs_times[0]) if obs_times else 0,
+            "distance_unit": "m",
             "ideal_hit_z": tracker.ideal_hit_z,
             "cor": tracker.cor,
             "cor_xy": tracker.cor_xy,
             "replay_source": os.path.basename(input_path),
             "motion_window_s": tracker.motion_window_s,
             "motion_min_y": tracker.motion_min_y,
-            "prediction_time_mode": tracker.prediction_time_mode,
         },
         "summary": {
             "total_observations": len(raw_obs),
@@ -131,7 +141,7 @@ def print_summary(result: dict) -> None:
     print(f"Replay Summary  (source: {config['replay_source']})")
     print(f"{'=' * 60}")
     print(f"  Motion filter:  window={config.get('motion_window_s', '?')}s, "
-          f"min_y={config.get('motion_min_y', '?')}mm")
+          f"min_y={config.get('motion_min_y', '?')}m")
     print(f"  COR: z={config['cor']}, xy={config.get('cor_xy', '?')}")
     print(f"  Total observations:    {summary['total_observations']}")
     print(f"  Predictions:           {summary['predictions']} "
@@ -151,16 +161,16 @@ def print_summary(result: dict) -> None:
             ys = [p["y"] for p in g_s0]
             xs = [p["x"] for p in g_s0]
             print(f"    S0: {len(g_s0)} preds, "
-                  f"y=[{min(ys):.0f}, {max(ys):.0f}], "
-                  f"x=[{min(xs):.0f}, {max(xs):.0f}]")
+                  f"y=[{min(ys):.3f}, {max(ys):.3f}]m, "
+                  f"x=[{min(xs):.3f}, {max(xs):.3f}]m")
         else:
             print(f"    S0: no predictions")
         if g_s1:
             zs = [p["z"] for p in g_s1]
             ys = [p["y"] for p in g_s1]
             print(f"    S1: {len(g_s1)} preds, "
-                  f"z=[{min(zs):.0f}, {max(zs):.0f}], "
-                  f"y=[{min(ys):.0f}, {max(ys):.0f}]")
+                  f"z=[{min(zs):.3f}, {max(zs):.3f}]m, "
+                  f"y=[{min(ys):.3f}, {max(ys):.3f}]m")
         else:
             print(f"    S1: no predictions")
 

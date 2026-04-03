@@ -6,14 +6,13 @@
 
 硬件：
   - 相机型号：海康 MV-CS050-10GC (GigE Vision, 500万像素, BayerRG8)
-  - 主相机 DA8199303：free-run 30fps，Line1 输出 ExposureStartActive 信号
-  - 从相机 DA8199243 / DA8199285 / DA8199402：Line0 FallingEdge 硬触发（物理接线接收主相机信号）
-  - 主相机仅做触发源（ROI 压缩到 16px 高度，最小化带宽占用），不参与图像输出
+  - 主相机 DA7403103：free-run 35fps，Line1 输出 ExposureStartActive 信号
+  - 从相机 DA8571029 / DA7403087 / DA8474746：Line0 FallingEdge 硬触发（物理接线接收主相机信号）
+  - 当前默认配置下主相机也参与图像输出，共返回 4 路同步图像
 
 相机参数 (config/camera.json)：
-  - 曝光：2340 μs | 增益：25 dB | 帧率：30 fps | GigE 丢包重传已开启
-  - DA8199243：全画幅 2448×2048（无裁剪）
-  - DA8199285 / DA8199402：OffsetY=700, Width=2248（上裁 700px，右裁 200px）
+  - 曝光：3000 μs | 增益：23.5 dB | 帧率：35 fps | GigE 丢包重传已开启
+  - 4 台相机默认均为全画幅 2048×1536
 
 时间同步：
   - 每台相机的 ImageGrabber 启动时校准 PC↔设备时钟偏移 (GevTimestampControlLatch)
@@ -23,7 +22,7 @@
 同步取图流程 (SyncCapture.get_frames)：
   1. 各 ImageGrabber 后台线程持续取帧入队（bounded deque, max=10）
   2. get_frames() 排空所有 grabber 队列，仅保留各相机最新帧
-  3. 检查 arrival_mono spread ≤ 200ms（粗同步）
+  3. 检查 arrival_perf spread ≤ 200ms（粗同步）
   4. 硬触发模式额外检查 exposure_start_pc spread ≤ 10ms（确保同一触发周期）
   5. 返回 {serial: Frame} 字典，或超时返回 None
 
@@ -31,14 +30,10 @@
   - 海康 Bayer 命名与 OpenCV 相反：BayerRG8 → cv2.COLOR_BayerBG2BGR
   - frame_to_numpy() 自动处理 Mono8 / BayerXX8 / RGB8 / BGR8
 
-端到端延迟 (曝光 → TensorRT YOLO 检测结果)：
-  - GigE 接收：~32ms | Bayer 解码：~5ms | YOLO ×2 (TensorRT FP16 batch=2)：~8ms
-  - 总计：~45ms
-
 模块结构：
   - open_camera()    打开单台相机并 StartGrabbing
   - close_camera()   停止取流、关闭设备、销毁句柄
-  - frame_to_numpy() Frame 原始数据 → numpy BGR/Mono
+  - frame_to_numpy() Frame 原始数据 → numpy BGR/Mono（默认 180° 旋转）
   - ImageGrabber     后台取帧线程（带时间偏移校准）
   - SyncCapture      多相机同步采集上下文管理器
   - SyncCapture.from_config()  从 config/camera.json 创建
@@ -47,6 +42,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import threading
 import time
 from collections import deque
@@ -78,6 +74,29 @@ from ctypes import cast, POINTER, byref, sizeof, memset
 
 
 # ───────────────── 工具函数 ─────────────────
+
+
+def _env_optional_bool(name: str) -> Optional[bool]:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    value = raw.strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{name}={raw!r} 不是合法布尔值")
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = _env_optional_bool(name)
+    return default if raw is None else raw
+
+
+_ENV_CAMERA_REVERSE_180 = _env_bool("BALL_TRACER_CAMERA_REVERSE_180", True)
+_ENV_CAMERA_REVERSE_X = _env_optional_bool("BALL_TRACER_CAMERA_REVERSE_X")
+_ENV_CAMERA_REVERSE_Y = _env_optional_bool("BALL_TRACER_CAMERA_REVERSE_Y")
+_ENV_SOFTWARE_ROTATE_180 = _env_bool("BALL_TRACER_SOFTWARE_ROTATE_180", False)
 
 
 def _decode(buf) -> str:
@@ -127,9 +146,8 @@ class Frame:
     host_timestamp: int = 0      # SDK 主机时间戳（nHostTimeStamp, ms）
     exposure_time: float = 0.0   # 曝光时间 μs（fExposureTime）
     lost_packet: int = 0         # 本帧丢包数（nLostPacket）
-    arrival_mono: float = 0.0    # time.monotonic() 到达时刻
-    arrival_perf: float = 0.0    # time.time() 到达时刻（与 exposure_start_pc 同轴）
-    exposure_start_pc: float = 0.0  # 曝光开始时刻（PC epoch 时间轴，秒）
+    arrival_perf: float = 0.0    # time.perf_counter() 到达时刻
+    exposure_start_pc: float = 0.0  # 曝光开始时刻（PC perf_counter 时间轴，秒）
 
 
 # ───────────────── 时间校准 ─────────────────
@@ -141,11 +159,11 @@ _TICK_FREQ = 100_000_000
 
 def calibrate_time_offset(cam: Any) -> float:
     """
-    校准 PC epoch 时间与相机设备时间的偏移量。
+    校准 PC perf_counter 时间与相机设备时间的偏移量。
 
     通过 GevTimestampControlLatch 锁存设备时间戳并与 PC 时间比对。
     返回 offset（秒），使得:
-        曝光时刻_epoch = dev_timestamp / TICK_FREQ + offset
+        曝光时刻_perf = dev_timestamp / TICK_FREQ + offset
 
     为减少网络延迟误差，取 3 次中往返最短的一次。
     """
@@ -155,9 +173,9 @@ def calibrate_time_offset(cam: Any) -> float:
     best_rtt = float("inf")
 
     for _ in range(3):
-        t_before = time.time()
+        t_before = time.perf_counter()
         cam.MV_CC_SetCommandValue("GevTimestampControlLatch")
-        t_after = time.time()
+        t_after = time.perf_counter()
 
         val = MVCC_INTVALUE_EX()
         ret = cam.MV_CC_GetIntValueEx("GevTimestampValue", val)
@@ -179,37 +197,53 @@ def calibrate_time_offset(cam: Any) -> float:
 # ───────────────── 像素转换 ─────────────────
 
 
-def frame_to_numpy(frame: Frame):
-    """将 Frame 转为 numpy BGR / 灰度图像。支持 Mono8、BayerXX8、RGB8、BGR8。"""
+def frame_to_numpy(frame: Frame, *, rotate_180: Optional[bool] = None):
+    """将 Frame 转为 numpy BGR / 灰度图像。默认做 180° 旋转，支持 Mono8、BayerXX8、RGB8、BGR8。"""
     import cv2
     import numpy as np
+
+    if rotate_180 is None:
+        rotate_180 = _ENV_SOFTWARE_ROTATE_180
 
     pt = frame.pixel_type
     w, h = frame.width, frame.height
 
     # Mono8
     if pt == PixelType_Gvsp_Mono8:
-        return np.frombuffer(frame.data, dtype=np.uint8, count=w * h).reshape(h, w)
+        img = np.frombuffer(frame.data, dtype=np.uint8, count=w * h).reshape(h, w)
+        return cv2.rotate(img, cv2.ROTATE_180) if rotate_180 else img
 
     # BGR8 — 直接 reshape
     if pt == PixelType_Gvsp_BGR8_Packed:
-        return np.frombuffer(frame.data, dtype=np.uint8, count=w * h * 3).reshape(h, w, 3)
+        img = np.frombuffer(frame.data, dtype=np.uint8, count=w * h * 3).reshape(h, w, 3)
+        return cv2.rotate(img, cv2.ROTATE_180) if rotate_180 else img
 
     # RGB8 → BGR
     if pt == PixelType_Gvsp_RGB8_Packed:
         rgb = np.frombuffer(frame.data, dtype=np.uint8, count=w * h * 3).reshape(h, w, 3)
-        return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        img = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        return cv2.rotate(img, cv2.ROTATE_180) if rotate_180 else img
 
     # Bayer 8-bit → BGR
-    # 海康 GigE Vision 的 Bayer 命名与 OpenCV 相反（RG↔BG, GR↔GB）
+    # 海康 GigE Vision 的 Bayer 命名与 OpenCV 相反（RG↔BG, GR↔GB）。
+    # 若最终需要 180° 旋转，先旋转 raw Bayer 再解码，可避免对 3 通道 BGR 再做一次大内存旋转。
     bayer_codes = {
         PixelType_Gvsp_BayerRG8: cv2.COLOR_BayerBG2BGR,
         PixelType_Gvsp_BayerBG8: cv2.COLOR_BayerRG2BGR,
         PixelType_Gvsp_BayerGR8: cv2.COLOR_BayerGB2BGR,
         PixelType_Gvsp_BayerGB8: cv2.COLOR_BayerGR2BGR,
     }
+    rotated_bayer_codes = {
+        PixelType_Gvsp_BayerRG8: cv2.COLOR_BayerRG2BGR,
+        PixelType_Gvsp_BayerBG8: cv2.COLOR_BayerBG2BGR,
+        PixelType_Gvsp_BayerGR8: cv2.COLOR_BayerGR2BGR,
+        PixelType_Gvsp_BayerGB8: cv2.COLOR_BayerGB2BGR,
+    }
     if pt in bayer_codes:
         raw = np.frombuffer(frame.data, dtype=np.uint8, count=w * h).reshape(h, w)
+        if rotate_180:
+            raw = cv2.rotate(raw, cv2.ROTATE_180)
+            return cv2.cvtColor(raw, rotated_bayer_codes[pt])
         return cv2.cvtColor(raw, bayer_codes[pt])
 
     raise RuntimeError(f"不支持的像素格式 0x{pt:08X}，请在 MVS Client 中切换为 Mono8 或 BayerXX8")
@@ -256,10 +290,13 @@ def open_camera(
     full_frame: bool = False,
     exposure_us: float = 0.0,
     gain_db: float = -1.0,
+    pixel_format: str = "",
     roi_offset_y: int = 0,
     roi_height: int = 0,
     roi_width: int = 0,
     binning: int = 1,
+    reverse_x: Optional[bool] = None,
+    reverse_y: Optional[bool] = None,
     _st_dev_list=None,
 ) -> Any:
     """
@@ -279,6 +316,15 @@ def open_camera(
         MvCamera 实例（已 StartGrabbing）。
     """
     serial = str(serial).strip()
+
+    if reverse_x is None:
+        reverse_x = _ENV_CAMERA_REVERSE_X
+        if reverse_x is None:
+            reverse_x = _ENV_CAMERA_REVERSE_180
+    if reverse_y is None:
+        reverse_y = _ENV_CAMERA_REVERSE_Y
+        if reverse_y is None:
+            reverse_y = _ENV_CAMERA_REVERSE_180
 
     if _st_dev_list is None:
         st_list = MV_CC_DEVICE_INFO_LIST()
@@ -406,11 +452,27 @@ def open_camera(
                 ret2 = cam.MV_CC_SetEnumValueByString("LineMode", "Output")
                 if int(ret2) != 0:
                     cam.MV_CC_SetEnumValueByString("LineMode", "Strobe")
+                # 显式清零残留 strobe 参数，避免机内持久化状态引入不确定输出。
+                try:
+                    cam.MV_CC_SetBoolValue("LineInverter", False)
+                except Exception:
+                    pass
                 cam.MV_CC_SetEnumValueByString("LineSource", line_source)
+                for node_name in ("StrobeLineDuration", "StrobeLineDelay", "StrobeLinePreDelay"):
+                    try:
+                        cam.MV_CC_SetIntValueEx(node_name, 0)
+                    except Exception:
+                        pass
                 # 开启输出使能（StrobeEnable）
                 cam.MV_CC_SetBoolValue("StrobeEnable", True)
             except Exception:
                 pass
+
+        if pixel_format:
+            _check(
+                cam.MV_CC_SetEnumValueByString("PixelFormat", pixel_format),
+                f"PixelFormat={pixel_format}",
+            )
 
         # ── 曝光 / 增益 ──
         if exposure_us > 0:
@@ -457,6 +519,12 @@ def open_camera(
             except Exception:
                 pass
 
+        # 相机侧 180° 反转必须在 StartGrabbing 之前设置。
+        if reverse_x is not None:
+            _check(cam.MV_CC_SetBoolValue("ReverseX", bool(reverse_x)), f"ReverseX={reverse_x}")
+        if reverse_y is not None:
+            _check(cam.MV_CC_SetBoolValue("ReverseY", bool(reverse_y)), f"ReverseY={reverse_y}")
+
         _check(cam.MV_CC_StartGrabbing(), f"StartGrabbing({serial})")
         return cam
 
@@ -486,14 +554,21 @@ class ImageGrabber(threading.Thread):
     """
     单相机抓取器：后台取流入队（最大 10 张），提供 get_frame() 取图出队。
 
-    自动校准 PC 与设备时钟偏移，每帧计算 exposure_start_pc（PC epoch 时间轴）。
+    自动校准 PC 与设备时钟偏移，每帧计算 exposure_start_pc（PC perf_counter 时间轴）。
     周期性校准在独立后台线程执行，不阻塞取帧热循环。
     """
 
     MAX_QUEUE = 10
 
-    def __init__(self, cam: Any, serial: str = "", *, timeout_ms: int = 1000,
-                 recalib_every: int = 10):
+    def __init__(
+        self,
+        cam: Any,
+        serial: str = "",
+        *,
+        timeout_ms: int = 1000,
+        recalib_every: int = 10,
+        fps: float = 0.0,
+    ):
         super().__init__(daemon=True, name=f"Grabber-{serial}")
         self._cam = cam
         self.serial = serial
@@ -502,7 +577,8 @@ class ImageGrabber(threading.Thread):
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._recalib_every = recalib_every
-        self._time_offset: float = 0.0       # PC epoch - dev_time（秒）
+        self._fps = float(fps)
+        self._time_offset: float = 0.0       # PC perf_counter - dev_time（秒）
         self._calib_thread: Optional[threading.Thread] = None
 
     def run(self) -> None:
@@ -525,8 +601,7 @@ class ImageGrabber(threading.Thread):
                 continue
 
             try:
-                arrival = time.monotonic()
-                arrival_pc = time.time()
+                arrival_perf = time.perf_counter()
                 info = st_frame.stFrameInfo
                 w = int(info.nExtendWidth) if info.nExtendWidth else int(info.nWidth)
                 h = int(info.nExtendHeight) if info.nExtendHeight else int(info.nHeight)
@@ -545,8 +620,7 @@ class ImageGrabber(threading.Thread):
                     host_timestamp=int(info.nHostTimeStamp),
                     exposure_time=float(info.fExposureTime),
                     lost_packet=int(info.nLostPacket),
-                    arrival_mono=arrival,
-                    arrival_perf=arrival_pc,
+                    arrival_perf=arrival_perf,
                     exposure_start_pc=exposure_start_pc,
                 )
                 with self._lock:
@@ -559,9 +633,11 @@ class ImageGrabber(threading.Thread):
 
     def _recalib_loop(self) -> None:
         """后台线程：按帧间隔周期性重新校准 PC-设备时钟偏移。"""
-        # recalib_every 帧 × 帧周期 ≈ 校准间隔秒数
-        # 但我们不知道确切帧率，用固定时间间隔：recalib_every * 43ms ≈ 0.43s
-        interval = max(self._recalib_every * 0.043, 0.5)  # 至少 0.5 秒
+        # 按真实帧率把“每多少帧重校准一次”换算成秒，避免魔法常数带来的抖动。
+        if self._fps > 0:
+            interval = max(self._recalib_every / self._fps, 0.5)
+        else:
+            interval = max(self._recalib_every * 0.043, 0.5)
         while not self._stop_event.is_set():
             self._stop_event.wait(interval)
             if self._stop_event.is_set():
@@ -577,8 +653,8 @@ class ImageGrabber(threading.Thread):
             with self._lock:
                 return self._queue.popleft() if self._queue else None
 
-        end = time.monotonic() + timeout_s
-        while time.monotonic() < end:
+        end = time.perf_counter() + timeout_s
+        while time.perf_counter() < end:
             with self._lock:
                 if self._queue:
                     return self._queue.popleft()
@@ -634,6 +710,7 @@ class SyncCapture:
         recalib_every: int = 10,
         exposure_us: float = 0.0,
         gain_db: float = -1.0,
+        pixel_format: str = "",
         master_min_bandwidth: bool = False,
         slave_params: Optional[dict[str, dict]] = None,
     ):
@@ -671,6 +748,7 @@ class SyncCapture:
                 line_source=master_line_source,
                 exposure_us=exposure_us,
                 gain_db=gain_db,
+                pixel_format=pixel_format,
                 roi_height=16 if master_min_bandwidth else 0,
                 _st_dev_list=st_dev_list,
             )
@@ -684,6 +762,7 @@ class SyncCapture:
                     full_frame=True,
                     exposure_us=exposure_us,
                     gain_db=gain_db,
+                    pixel_format=pixel_format,
                     roi_offset_y=params.get("roi_offset_y", 0),
                     roi_height=params.get("roi_height", 0),
                     roi_width=params.get("roi_width", 0),
@@ -694,7 +773,8 @@ class SyncCapture:
             # 启动 grabber
             for sn, cam in self._cameras.items():
                 g = ImageGrabber(cam, sn, timeout_ms=1000,
-                                 recalib_every=self._recalib_every)
+                                 recalib_every=self._recalib_every,
+                                 fps=self._fps)
                 self._grabbers[sn] = g
                 g.start()
         except Exception:
@@ -710,10 +790,10 @@ class SyncCapture:
 
         返回 {serial: Frame} 字典，或超时返回 None。
         """
-        deadline = time.monotonic() + timeout_s
+        deadline = time.perf_counter() + timeout_s
         latest: dict[str, Frame] = {}
 
-        while time.monotonic() < deadline:
+        while time.perf_counter() < deadline:
             for sn, g in self._grabbers.items():
                 f = g._drain_keep_latest()
                 # 仅收集 sync_serials 的帧；其他 grabber 照常排空
@@ -721,8 +801,8 @@ class SyncCapture:
                     latest[sn] = f
 
             if len(latest) == len(self._sync_serials):
-                # 粗同步检查：arrival_mono spread
-                arrivals = [f.arrival_mono for f in latest.values()]
+                # 粗同步检查：arrival_perf spread
+                arrivals = [f.arrival_perf for f in latest.values()]
                 spread = max(arrivals) - min(arrivals)
                 if spread <= self._sync_threshold_s:
                     # 精同步检查：exposure_start_pc 是否属于同一触发周期
@@ -735,7 +815,7 @@ class SyncCapture:
                         continue
                     return latest
                 # 帧不同步，丢弃最老的重新收集
-                oldest_sn = min(latest, key=lambda sn: latest[sn].arrival_mono)
+                oldest_sn = min(latest, key=lambda sn: latest[sn].arrival_perf)
                 del latest[oldest_sn]
 
             time.sleep(0.001)
@@ -764,6 +844,10 @@ class SyncCapture:
     def sync_serials(self) -> list[str]:
         """参与同步输出的相机序列号列表（get_frames 返回的相机）。"""
         return list(self._sync_serials)
+
+    @property
+    def fps(self) -> float:
+        return float(self._fps)
 
     def close(self) -> None:
         """停止所有 grabber 并关闭所有相机。"""

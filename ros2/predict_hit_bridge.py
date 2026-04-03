@@ -5,7 +5,17 @@ UDP → ROS2 桥接：接收 predict_hit UDP 数据，发布到 /predict_hit_pos
 """
 import json
 import socket
+import sys
 import threading
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from src.ros2_support import ensure_ros2_environment, make_topic_qos
+
+ensure_ros2_environment()
 
 import rclpy
 from rclpy.node import Node
@@ -17,7 +27,9 @@ UDP_PORT = 5859
 class PredictHitBridge(Node):
     def __init__(self):
         super().__init__("predict_hit_bridge")
-        self._pub = self.create_publisher(String, "/predict_hit_pos", 10)
+        self._pub = self.create_publisher(
+            String, "/predict_hit_pos", make_topic_qos("/predict_hit_pos")
+        )
         self._timer = self.create_timer(1.0 / 30, self._on_timer)
 
         self._latest = None

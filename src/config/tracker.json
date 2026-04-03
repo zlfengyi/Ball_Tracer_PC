@@ -1,9 +1,10 @@
 {
     "tile_size": 1280,
-    "tile_resize": 640,
+    "tile_resize": 512,
     "track_timeout_s": 0.3,
     "search_hold_frames": 4,
     "min_cameras_for_3d": 2,
+    "ball_detection_disabled_serials": ["029"],
     "max_reproj_error_px": 15.0,
     "detection_postprocess": {
         "duplicate_iou_threshold": 0.95,
@@ -22,21 +23,32 @@
         "idle_after_misses": 3
     },
     "video_output": {
-        "codec": "XVID"
+        "codec": "avc1",
+        "backend": "auto",
+        "hw_accel": true
     },
     "post_run": {
         "enabled": true,
         "generate_html": true,
-        "generate_annotated_video": true,
+        "generate_annotated_video": false,
         "annotated_video_no_racket": true
+    },
+    "pc_logger": {
+        "enabled": true,
+        "idle_record_period_sec": 1.0,
+        "high_rate_tail_sec": 1.0,
+        "min_save_interval_sec": 20.0,
+        "post_hit_save_delay_sec": 2.0,
+        "tick_period_sec": 0.5,
+        "startup_wait_sec": 5.0
     },
 
     "curve3": {
-        "ideal_hit_z": 800.0,
+        "ideal_hit_z": 0.8,
         "cor": 0.70,
         "cor_xy": 0.42,
         "motion_window_s": 0.2,
-        "motion_min_y": 500,
+        "motion_min_y": 0.5,
         "land_skip_time": 0.05,
         "reset_timeout": 0.5
     }

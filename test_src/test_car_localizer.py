@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-车辆 AprilTag 3D 实时定位测试（三目）。
+车辆 AprilTag 3D 实时定位测试（四相机）。
 
-从三目相机持续采集同步图片，检测 AprilTag，三角测量得到 3D 位置，
+从四相机持续采集同步图片，检测 AprilTag，三角测量得到 3D 位置，
 实时打印结果。Ctrl+C 停止。
 
 用法：
@@ -27,7 +27,7 @@ from src.car_localizer import CarLocalizer, CarLoc
 
 
 def main():
-    parser = argparse.ArgumentParser(description="车辆 AprilTag 3D 实时定位（三目）")
+    parser = argparse.ArgumentParser(description="车辆 AprilTag 3D 实时定位（四相机）")
     parser.add_argument("--exposure", type=float, default=0,
                         help="曝光时间 μs (默认 0=使用 camera.json)")
     parser.add_argument("--gain", type=float, default=-1,
@@ -35,10 +35,10 @@ def main():
     args = parser.parse_args()
 
     print("=" * 60)
-    print("  DEV 10 — 三目车辆 AprilTag 实时定位")
+    print("  四相机车辆 AprilTag 实时定位")
     print("=" * 60)
 
-    print("\n[1/2] 初始化 CarLocalizer (multi_calib.json)...")
+    print("\n[1/2] 初始化 CarLocalizer (four_camera_calib.json)...")
     localizer = CarLocalizer()
     print(f"  相机: {localizer.serials}")
 
@@ -56,7 +56,7 @@ def main():
         time.sleep(1.0)
 
         print(f"\n开始实时定位，Ctrl+C 停止...\n")
-        print(f"{'帧':>4s}  {'相机':>12s}  {'X':>8s}  {'Y':>8s}  {'Z':>8s}  "
+        print(f"{'帧':>4s}  {'相机':>12s}  {'X(m)':>8s}  {'Y(m)':>8s}  {'Z(m)':>8s}  "
               f"{'误差':>6s}  {'延迟':>6s}")
         print("-" * 65)
 
@@ -90,7 +90,7 @@ def main():
                     cams = "+".join(s[-3:] for s in car_loc.cameras_used)
                     print(
                         f"{frame_count:4d}  {cams:>12s}  "
-                        f"{car_loc.x:8.0f}  {car_loc.y:8.0f}  {car_loc.z:8.0f}  "
+                        f"{car_loc.x:8.3f}  {car_loc.y:8.3f}  {car_loc.z:8.3f}  "
                         f"{car_loc.reprojection_error:5.1f}px  "
                         f"{dt_ms:5.1f}ms"
                     )
@@ -112,10 +112,10 @@ def main():
         zs = np.array([r.z for r in results])
         errs = np.array([r.reprojection_error for r in results])
 
-        print(f"\n  3D 坐标统计 (mm):")
-        print(f"    X: mean={xs.mean():.1f}  std={xs.std():.1f}")
-        print(f"    Y: mean={ys.mean():.1f}  std={ys.std():.1f}")
-        print(f"    Z: mean={zs.mean():.1f}  std={zs.std():.1f}")
+        print(f"\n  3D 坐标统计 (m):")
+        print(f"    X: mean={xs.mean():.4f}  std={xs.std():.4f}")
+        print(f"    Y: mean={ys.mean():.4f}  std={ys.std():.4f}")
+        print(f"    Z: mean={zs.mean():.4f}  std={zs.std():.4f}")
         print(f"    重投影误差: mean={errs.mean():.2f}px  max={errs.max():.2f}px")
 
         # 统计每种相机组合出现频次

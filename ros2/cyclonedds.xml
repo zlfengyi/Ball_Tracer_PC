@@ -1,27 +1,21 @@
 <?xml version="1.0" encoding="UTF-8" ?>
-<!--
-  CycloneDDS 配置 — 用于 Windows ↔ RK3588 unicast 通信。
-  当 multicast 不可用时使用此配置。
-
-  使用方法：
-    Windows (CMD):  set CYCLONEDDS_URI=file:///C:/Users/zlfen/Desktop/ball_tracer_pc/ros2/cyclonedds.xml
-    Windows (Bash): export CYCLONEDDS_URI=file:///c/Users/zlfen/Desktop/ball_tracer_pc/ros2/cyclonedds.xml
-    RK3588:         export CYCLONEDDS_URI=file://$HOME/cyclonedds.xml
-                    (RK 端需要复制并修改 Peer address 为 Windows 的 IP)
--->
 <CycloneDDS>
-  <Domain>
+  <Domain id="any">
     <General>
       <Interfaces>
-        <NetworkInterface autodetermine="true"/>
+        <NetworkInterface address="192.168.50.18" multicast="false" />
       </Interfaces>
+      <AllowMulticast>false</AllowMulticast>
+      <MulticastRecvNetworkInterfaceAddresses>none</MulticastRecvNetworkInterfaceAddresses>
     </General>
     <Discovery>
-      <Peers>
-        <!-- 填写对方的 IP 地址 -->
-        <Peer address="192.168.1.xxx"/>
-      </Peers>
       <ParticipantIndex>auto</ParticipantIndex>
+      <MaxAutoParticipantIndex>8</MaxAutoParticipantIndex>
+      <Peers>
+        <Peer Address="192.168.50.18" />
+        <Peer Address="192.168.50.17" />
+        <Peer Address="192.168.50.68" />
+      </Peers>
     </Discovery>
   </Domain>
 </CycloneDDS>

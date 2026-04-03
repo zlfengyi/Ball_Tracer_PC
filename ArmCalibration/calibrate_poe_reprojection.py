@@ -137,6 +137,15 @@ def parse_args() -> argparse.Namespace:
         default=str(DEFAULT_EXPORT_CONFIG_PATH),
         help="Path to the exported POE config JSON for downstream use.",
     )
+    parser.add_argument(
+        "--prune-observations-over-px",
+        type=float,
+        default=0.0,
+        help=(
+            "If > 0, run an initial fit, remove all image observations whose reprojection residual is above "
+            "this threshold, then refit from the pruned observation set."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -226,6 +235,25 @@ def collect_dataset(session_dir: Path) -> tuple[list[SampleRecord], dict[str, in
         )
 
     return samples, stats
+
+
+def summarize_dataset_from_samples(samples: list[SampleRecord], sample_dir_count: int, samples_missing_joint_state: int) -> dict[str, int]:
+    stats = {
+        "sample_dir_count": int(sample_dir_count),
+        "samples_with_joint_state": int(sample_dir_count - samples_missing_joint_state),
+        "samples_missing_joint_state": int(samples_missing_joint_state),
+        "samples_with_1plus_cameras": 0,
+        "samples_with_2plus_cameras": 0,
+        "accepted_image_observations": 0,
+    }
+    for sample in samples:
+        obs_count = len(sample.observations)
+        if obs_count >= 1:
+            stats["samples_with_1plus_cameras"] += 1
+        if obs_count >= 2:
+            stats["samples_with_2plus_cameras"] += 1
+        stats["accepted_image_observations"] += obs_count
+    return stats
 
 
 def undistort_pixel(camera: CameraModel, uv: np.ndarray) -> np.ndarray:
@@ -779,6 +807,187 @@ def summarize_reprojection(
     }
 
 
+def summarize_triangulation_consistency(
+    params: np.ndarray,
+    samples: list[SampleRecord],
+    cameras: dict[str, CameraModel],
+) -> dict:
+    eligible = [sample for sample in samples if len(sample.observations) >= 2]
+    if not eligible:
+        return {
+            "sample_count": 0,
+            "mean_l2_mm": 0.0,
+            "median_l2_mm": 0.0,
+            "p95_l2_mm": 0.0,
+            "mean_abs_z_mm": 0.0,
+            "median_abs_z_mm": 0.0,
+            "p95_abs_z_mm": 0.0,
+            "top_abs_z_samples": [],
+        }
+
+    per_sample: list[dict] = []
+    for sample in eligible:
+        tri = triangulate_sample(sample, cameras)
+        pred = forward_generic_point(params, sample.q4)
+        delta = pred - tri.point_world
+        per_sample.append(
+            {
+                "sample_id": sample.sample_id,
+                "camera_count": len(sample.observations),
+                "delta_xyz_mm": delta.tolist(),
+                "l2_mm": float(np.linalg.norm(delta)),
+                "abs_z_mm": float(abs(delta[2])),
+                "triangulated_point_world_mm": tri.point_world.tolist(),
+                "predicted_point_world_mm": pred.tolist(),
+                "triangulated_mean_reproj_px": float(tri.mean_reproj_px),
+            }
+        )
+
+    l2 = np.array([item["l2_mm"] for item in per_sample], dtype=np.float64)
+    abs_z = np.array([item["abs_z_mm"] for item in per_sample], dtype=np.float64)
+    top_abs_z = sorted(per_sample, key=lambda item: item["abs_z_mm"], reverse=True)[:20]
+    return {
+        "sample_count": len(per_sample),
+        "mean_l2_mm": float(l2.mean()),
+        "median_l2_mm": float(np.median(l2)),
+        "p95_l2_mm": float(np.percentile(l2, 95)),
+        "mean_abs_z_mm": float(abs_z.mean()),
+        "median_abs_z_mm": float(np.median(abs_z)),
+        "p95_abs_z_mm": float(np.percentile(abs_z, 95)),
+        "top_abs_z_samples": top_abs_z,
+    }
+
+
+def prune_observations_by_reprojection(
+    params: np.ndarray,
+    samples: list[SampleRecord],
+    cameras: dict[str, CameraModel],
+    threshold_px: float,
+) -> tuple[list[SampleRecord], dict]:
+    filtered_samples: list[SampleRecord] = []
+    removed: list[dict] = []
+    kept_count = 0
+    removed_count = 0
+    per_camera_removed: dict[str, int] = {}
+
+    for sample in samples:
+        point_world = forward_generic_point(params, sample.q4)
+        kept_obs: list[CameraObservation] = []
+        for obs in sample.observations:
+            uv_pred = project_point(cameras[obs.serial], point_world)
+            residual = uv_pred - obs.uv
+            residual_px = float(np.linalg.norm(residual))
+            if residual_px > threshold_px:
+                removed_count += 1
+                per_camera_removed[obs.serial] = per_camera_removed.get(obs.serial, 0) + 1
+                removed.append(
+                    {
+                        "sample_id": sample.sample_id,
+                        "camera_serial": obs.serial,
+                        "residual_uv": residual.tolist(),
+                        "residual_px": residual_px,
+                        "q4": sample.q4.tolist(),
+                        "q5": sample.q5,
+                    }
+                )
+                continue
+            kept_count += 1
+            kept_obs.append(obs)
+
+        if kept_obs:
+            filtered_samples.append(
+                SampleRecord(
+                    sample_id=sample.sample_id,
+                    q4=sample.q4.copy(),
+                    q5=float(sample.q5),
+                    observations=tuple(kept_obs),
+                )
+            )
+
+    removed = sorted(removed, key=lambda item: item["residual_px"], reverse=True)
+    original_sample_count = len(samples)
+    kept_sample_count = len(filtered_samples)
+    return filtered_samples, {
+        "enabled": True,
+        "threshold_px": float(threshold_px),
+        "original_observation_count": int(kept_count + removed_count),
+        "removed_observation_count": int(removed_count),
+        "kept_observation_count": int(kept_count),
+        "original_sample_count": int(original_sample_count),
+        "kept_sample_count": int(kept_sample_count),
+        "dropped_empty_sample_count": int(original_sample_count - kept_sample_count),
+        "per_camera_removed": per_camera_removed,
+        "removed_observations": removed,
+    }
+
+
+def run_fit_pipeline(
+    samples: list[SampleRecord],
+    dataset_stats: dict[str, int],
+    cameras: dict[str, CameraModel],
+    args: argparse.Namespace,
+) -> dict:
+    if not samples:
+        raise RuntimeError("No valid samples with accepted cameras and complete joint_state metadata.")
+
+    triangulation_source_samples = [sample for sample in samples if len(sample.observations) >= 2]
+    if not triangulation_source_samples:
+        raise RuntimeError("No valid samples with 2+ accepted cameras for initialization.")
+
+    triangulated = [triangulate_sample(sample, cameras) for sample in triangulation_source_samples]
+    triangulated_inliers = [
+        item for item in triangulated if item.mean_reproj_px <= args.init_reproj_threshold
+    ]
+    if len(triangulated_inliers) < 20:
+        raise RuntimeError(
+            f"Too few triangulated initialization samples below {args.init_reproj_threshold:.1f}px: "
+            f"{len(triangulated_inliers)}"
+        )
+
+    structured_init = fit_structured_init(triangulated_inliers, args.max_nfev_structured)
+    generic_init = structured_to_generic_world(structured_init)
+    generic_3d_init = fit_generic_3d_init(generic_init, triangulated_inliers, args.max_nfev_generic_3d)
+    final_params = fit_direct_reprojection(
+        generic_3d_init,
+        samples,
+        cameras,
+        args.loss_scale_px,
+        args.max_nfev_2d,
+    )
+
+    reprojection_summary = summarize_reprojection(
+        final_params,
+        samples,
+        cameras,
+        args.outlier_threshold_px,
+    )
+    triangulation_consistency = summarize_triangulation_consistency(final_params, samples, cameras)
+    base_frame = derive_base_frame(final_params, args.base_origin_mode, args.ground_plane_z)
+    model = build_model_dict(final_params)
+
+    return {
+        "dataset": dataset_stats,
+        "initialization": {
+            "triangulated_sample_count": len(triangulated),
+            "triangulated_inlier_count": len(triangulated_inliers),
+            "triangulated_inlier_threshold_px": args.init_reproj_threshold,
+            "triangulated_inlier_mean_reproj_px": float(
+                np.mean([item.mean_reproj_px for item in triangulated_inliers])
+            ),
+            "triangulated_inlier_p95_reproj_px": float(
+                np.percentile([item.mean_reproj_px for item in triangulated_inliers], 95)
+            ),
+            "structured_init_params": structured_init.tolist(),
+            "generic_3d_init_params": generic_3d_init.tolist(),
+        },
+        "reprojection_fit": reprojection_summary,
+        "triangulation_consistency": triangulation_consistency,
+        "model": model,
+        "derived_base_in_world": base_frame,
+        "_final_params": final_params,
+    }
+
+
 def build_export_config(
     result: dict,
     export_path: Path,
@@ -807,7 +1016,7 @@ def build_export_config(
         "config_role": "arm_poe_racket_center_position",
         "written_at": datetime.now().isoformat(timespec="seconds"),
         "source_session": result["session_dir"],
-        "source_result": rel_or_abs(export_path.parent / "poe_reprojection_result.json"),
+        "source_result": rel_or_abs(export_path),
         "camera_calibration": rel_or_abs(camera_calib_path),
         "measurement_target": {
             "name": "racket_center",
@@ -898,75 +1107,115 @@ def main() -> None:
     camera_calib_path = Path(args.camera_calib).resolve()
     cameras = load_camera_models(camera_calib_path)
     samples, dataset_stats = collect_dataset(session_dir)
-    if not samples:
-        raise RuntimeError("No valid samples with accepted cameras and complete joint_state metadata.")
-    triangulation_source_samples = [sample for sample in samples if len(sample.observations) >= 2]
-    if not triangulation_source_samples:
-        raise RuntimeError("No valid samples with 2+ accepted cameras for initialization.")
 
     print("=== ArmCalibration 15.4 POE Reprojection Calibration ===")
     print(f"Session: {session_dir}")
     print(f"Camera calib: {camera_calib_path}")
     print(f"Samples used for 2D fit: {len(samples)}")
     print(f"Accepted image observations: {dataset_stats['accepted_image_observations']}")
-    print(f"Samples with 2+ cameras for init: {len(triangulation_source_samples)}")
+    print(f"Samples with 2+ cameras for init: {dataset_stats['samples_with_2plus_cameras']}")
 
-    triangulated = [triangulate_sample(sample, cameras) for sample in triangulation_source_samples]
-    triangulated_inliers = [
-        item for item in triangulated if item.mean_reproj_px <= args.init_reproj_threshold
-    ]
-    if len(triangulated_inliers) < 20:
-        raise RuntimeError(
-            f"Too few triangulated initialization samples below {args.init_reproj_threshold:.1f}px: "
-            f"{len(triangulated_inliers)}"
-        )
-
-    print(
-        f"Init triangulation inliers: {len(triangulated_inliers)} / {len(triangulated)} "
-        f"(threshold {args.init_reproj_threshold:.1f}px)"
-    )
-
-    structured_init = fit_structured_init(triangulated_inliers, args.max_nfev_structured)
-    generic_init = structured_to_generic_world(structured_init)
-    generic_3d_init = fit_generic_3d_init(generic_init, triangulated_inliers, args.max_nfev_generic_3d)
-    final_params = fit_direct_reprojection(
-        generic_3d_init,
-        samples,
-        cameras,
-        args.loss_scale_px,
-        args.max_nfev_2d,
-    )
-
-    reprojection_summary = summarize_reprojection(
-        final_params,
-        samples,
-        cameras,
-        args.outlier_threshold_px,
-    )
-    base_frame = derive_base_frame(final_params, args.base_origin_mode, args.ground_plane_z)
-    model = build_model_dict(final_params)
-
-    result = {
+    initial_fit = run_fit_pipeline(samples, dataset_stats, cameras, args)
+    result_fit = initial_fit
+    result: dict = {
         "session_dir": rel_or_abs(session_dir),
         "camera_calibration": rel_or_abs(camera_calib_path),
-        "dataset": dataset_stats,
-        "initialization": {
-            "triangulated_sample_count": len(triangulated),
-            "triangulated_inlier_count": len(triangulated_inliers),
-            "triangulated_inlier_threshold_px": args.init_reproj_threshold,
-            "triangulated_inlier_mean_reproj_px": float(
-                np.mean([item.mean_reproj_px for item in triangulated_inliers])
-            ),
-            "triangulated_inlier_p95_reproj_px": float(
-                np.percentile([item.mean_reproj_px for item in triangulated_inliers], 95)
-            ),
-            "structured_init_params": structured_init.tolist(),
-            "generic_3d_init_params": generic_3d_init.tolist(),
-        },
-        "reprojection_fit": reprojection_summary,
-        "model": model,
-        "derived_base_in_world": base_frame,
+        "dataset": initial_fit["dataset"],
+        "initialization": initial_fit["initialization"],
+        "reprojection_fit": initial_fit["reprojection_fit"],
+        "triangulation_consistency": initial_fit["triangulation_consistency"],
+        "model": initial_fit["model"],
+        "derived_base_in_world": initial_fit["derived_base_in_world"],
     }
+
+    if args.prune_observations_over_px > 0.0:
+        print(
+            f"Pruning observations above {args.prune_observations_over_px:.1f}px and refitting..."
+        )
+        threshold_px = float(args.prune_observations_over_px)
+        current_samples = samples
+        current_dataset_stats = dataset_stats
+        current_fit = initial_fit
+        pruning_iterations: list[dict] = []
+        removed_observations_all: list[dict] = []
+
+        while current_fit["reprojection_fit"]["max_px"] > threshold_px:
+            pruned_samples, pruning_summary = prune_observations_by_reprojection(
+                current_fit["_final_params"],
+                current_samples,
+                cameras,
+                threshold_px,
+            )
+            if pruning_summary["removed_observation_count"] == 0:
+                break
+
+            pruned_dataset_stats = summarize_dataset_from_samples(
+                pruned_samples,
+                sample_dir_count=dataset_stats["sample_dir_count"],
+                samples_missing_joint_state=dataset_stats["samples_missing_joint_state"],
+            )
+            iteration_index = len(pruning_iterations) + 1
+            print(
+                f"Pruning iteration {iteration_index}: "
+                f"removed={pruning_summary['removed_observation_count']} / "
+                f"{pruning_summary['original_observation_count']} observations, "
+                f"kept={pruning_summary['kept_observation_count']}"
+            )
+            print(
+                "Pruned dataset: "
+                f"samples_with_1plus={pruned_dataset_stats['samples_with_1plus_cameras']}, "
+                f"samples_with_2plus={pruned_dataset_stats['samples_with_2plus_cameras']}"
+            )
+
+            pruning_iterations.append(
+                {
+                    **pruning_summary,
+                    "iteration_index": iteration_index,
+                    "input_fit_max_px": float(current_fit["reprojection_fit"]["max_px"]),
+                    "input_fit_mean_px": float(current_fit["reprojection_fit"]["mean_px"]),
+                }
+            )
+            removed_observations_all.extend(pruning_summary["removed_observations"])
+            current_samples = pruned_samples
+            current_dataset_stats = pruned_dataset_stats
+            current_fit = run_fit_pipeline(current_samples, current_dataset_stats, cameras, args)
+
+        removed_observations_all = sorted(
+            removed_observations_all,
+            key=lambda item: item["residual_px"],
+            reverse=True,
+        )
+        total_removed = sum(
+            item["removed_observation_count"] for item in pruning_iterations
+        )
+        result_fit = current_fit
+        result = {
+            "session_dir": rel_or_abs(session_dir),
+            "camera_calibration": rel_or_abs(camera_calib_path),
+            "dataset": result_fit["dataset"],
+            "initialization": result_fit["initialization"],
+            "reprojection_fit": result_fit["reprojection_fit"],
+            "triangulation_consistency": result_fit["triangulation_consistency"],
+            "model": result_fit["model"],
+            "derived_base_in_world": result_fit["derived_base_in_world"],
+            "pruning": {
+                "enabled": True,
+                "threshold_px": threshold_px,
+                "iteration_count": len(pruning_iterations),
+                "total_removed_observation_count": int(total_removed),
+                "final_observation_count": int(result_fit["dataset"]["accepted_image_observations"]),
+                "final_max_px": float(result_fit["reprojection_fit"]["max_px"]),
+                "iterations": pruning_iterations,
+                "removed_observations": removed_observations_all,
+            },
+            "initial_fit_before_pruning": {
+                "dataset": initial_fit["dataset"],
+                "initialization": initial_fit["initialization"],
+                "reprojection_fit": initial_fit["reprojection_fit"],
+                "triangulation_consistency": initial_fit["triangulation_consistency"],
+                "derived_base_in_world": initial_fit["derived_base_in_world"],
+            },
+        }
 
     result_path = session_dir / args.result_name
     save_json(result_path, result)
@@ -974,15 +1223,23 @@ def main() -> None:
     export_config = build_export_config(result, result_path, camera_calib_path)
     save_json(export_config_path, export_config)
 
+    final_reprojection = result_fit["reprojection_fit"]
+    final_triangulation = result_fit["triangulation_consistency"]
     print("\nCalibration finished.")
     print(f"Result JSON: {result_path}")
     print(f"Export config: {export_config_path}")
     print(
         "Reprojection summary: "
-        f"mean={reprojection_summary['mean_px']:.3f}px, "
-        f"median={reprojection_summary['median_px']:.3f}px, "
-        f"p95={reprojection_summary['p95_px']:.3f}px, "
-        f"max={reprojection_summary['max_px']:.3f}px"
+        f"mean={final_reprojection['mean_px']:.3f}px, "
+        f"median={final_reprojection['median_px']:.3f}px, "
+        f"p95={final_reprojection['p95_px']:.3f}px, "
+        f"max={final_reprojection['max_px']:.3f}px"
+    )
+    print(
+        "Triangulation-vs-model consistency: "
+        f"mean_abs_z={final_triangulation['mean_abs_z_mm']:.3f}mm, "
+        f"median_abs_z={final_triangulation['median_abs_z_mm']:.3f}mm, "
+        f"p95_abs_z={final_triangulation['p95_abs_z_mm']:.3f}mm"
     )
 
 

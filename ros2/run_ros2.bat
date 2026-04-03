@@ -1,14 +1,25 @@
 @echo off
-:: ROS2 环境启动脚本
-:: 用法：run_ros2.bat <python_script>
-:: 示例：run_ros2.bat test_publisher.py
+setlocal
 
-cd /d C:\dev\ros2_jazzy
-call C:\dev\ros2_jazzy\local_setup.bat
-set PYTHONPATH=C:\dev\ros2_jazzy\Lib\site-packages;%PYTHONPATH%
-set ROS_DISTRO=jazzy
-set RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-set PATH=C:\dev\ros2_jazzy\.pixi\envs\default;C:\dev\ros2_jazzy\.pixi\envs\default\Library\bin;%PATH%
+set "ROS2_ROOT=C:\dev\ros2_jazzy"
+set "CYCLONEDDS_XML=%~dp0cyclonedds.xml"
+
+cd /d %ROS2_ROOT%
+call "%ROS2_ROOT%\local_setup.bat"
+set "PYTHONPATH=%ROS2_ROOT%\Lib\site-packages;%PYTHONPATH%"
+set "ROS_DISTRO=jazzy"
+if not defined BALL_TRACER_ROS_DOMAIN_ID (
+    if not defined ROS_DOMAIN_ID (
+        set "ROS_DOMAIN_ID=2"
+    )
+) else (
+    set "ROS_DOMAIN_ID=%BALL_TRACER_ROS_DOMAIN_ID%"
+)
+set "RMW_IMPLEMENTATION=rmw_cyclonedds_cpp"
+set "CYCLONEDDS_URI=file://%CYCLONEDDS_XML:\=/%"
+set FASTRTPS_DEFAULT_PROFILES_FILE=
+set FASTDDS_DEFAULT_PROFILES_FILE=
+set "PATH=%ROS2_ROOT%\.pixi\envs\default;%ROS2_ROOT%\.pixi\envs\default\Library\bin;%PATH%"
 
 cd /d %~dp0
-C:\dev\ros2_jazzy\.pixi\envs\default\python.exe %*
+"%ROS2_ROOT%\.pixi\envs\default\python.exe" %*

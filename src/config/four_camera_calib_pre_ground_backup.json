@@ -1,0 +1,312 @@
+{
+  "config_role": "four_camera_full_calibration_pending_ground_registration",
+  "config_written_at": "2026-03-19T12:18:59",
+  "reference_serial": "DA7403103",
+  "cameras": {
+    "DA7403103": {
+      "K": [
+        [
+          2350.058013024033,
+          0.0,
+          1033.5762556747222
+        ],
+        [
+          0.0,
+          2351.3734312609245,
+          732.715786440456
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "D": [
+        -0.11547935746978659,
+        0.14861048436476648,
+        -0.0006701498053508905,
+        0.0018704533881678045,
+        -0.0777946287859176
+      ],
+      "image_size": [
+        2048,
+        1536
+      ],
+      "R_to_ref": [
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "t_to_ref": [
+        [
+          0.0
+        ],
+        [
+          0.0
+        ],
+        [
+          0.0
+        ]
+      ],
+      "diagnostics": {
+        "relative_extrinsics_rms_px": 0.16415800154209137,
+        "intrinsics_rms_px": 0.07306369361418884,
+        "intrinsics_frames_used": 120,
+        "intrinsics_frames_detected": 158
+      },
+      "sources": {
+        "intrinsics_config": "src/config/four_camera_intrinsics.json",
+        "intrinsics_session": "data/four_camera_calibration/retake_mono8_g10_e5000_retry_03181523",
+        "ground_image": "data/four_camera_ground_registration/ground_reg_20260319_121635/DA7403103/ground_001.png"
+      }
+    },
+    "DA8571029": {
+      "K": [
+        [
+          2325.9850420481157,
+          0.0,
+          1017.9355498844174
+        ],
+        [
+          0.0,
+          2326.012664199984,
+          721.6700341734936
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "D": [
+        -0.10337788614593328,
+        0.09725696354358956,
+        -0.0020398475807376333,
+        -0.00032762454573333764,
+        0.022416515378245898
+      ],
+      "image_size": [
+        2048,
+        1536
+      ],
+      "R_to_ref": [
+        [
+          -0.9894545811782064,
+          0.07119722478220816,
+          -0.12613717520529755
+        ],
+        [
+          -0.04167722459602083,
+          0.6940763349537826,
+          0.7186939892660142
+        ],
+        [
+          0.13871784577131036,
+          0.7163721075254372,
+          -0.6837897065795377
+        ]
+      ],
+      "t_to_ref": [
+        [
+          248.38887828921634
+        ],
+        [
+          -3381.6331194030295
+        ],
+        [
+          6484.31058080861
+        ]
+      ],
+      "diagnostics": {
+        "relative_extrinsics_rms_px": 0.10488665103912354,
+        "intrinsics_rms_px": 0.06616593500027024,
+        "intrinsics_frames_used": 84,
+        "intrinsics_frames_detected": 84
+      },
+      "sources": {
+        "intrinsics_config": "src/config/four_camera_intrinsics.json",
+        "intrinsics_session": "data/four_camera_calibration/retake_mono8_g10_e5000_retry_03181523",
+        "ground_image": "data/four_camera_ground_registration/ground_reg_20260319_121635/DA8571029/ground_001.png"
+      }
+    },
+    "DA7403087": {
+      "K": [
+        [
+          2336.593746234942,
+          0.0,
+          1053.4070521777064
+        ],
+        [
+          0.0,
+          2334.765038047966,
+          742.4043996654592
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "D": [
+        -0.11708747538054855,
+        0.21009341802345796,
+        -0.000805397848721204,
+        0.0017573560655000785,
+        -0.2892097376080056
+      ],
+      "image_size": [
+        2048,
+        1536
+      ],
+      "R_to_ref": [
+        [
+          0.9459772284855704,
+          -0.12075607755600318,
+          0.300907050299669
+        ],
+        [
+          0.11562041593988323,
+          0.9926805994182982,
+          0.03488763328769266
+        ],
+        [
+          -0.30291748481170144,
+          0.0017880916689786558,
+          0.9530151101234103
+        ]
+      ],
+      "t_to_ref": [
+        [
+          -2434.5890617358205
+        ],
+        [
+          -410.56604094701606
+        ],
+        [
+          1524.7935363777542
+        ]
+      ],
+      "diagnostics": {
+        "relative_extrinsics_rms_px": 0.15859177708625793,
+        "intrinsics_rms_px": 0.09430860737522985,
+        "intrinsics_frames_used": 120,
+        "intrinsics_frames_detected": 185
+      },
+      "sources": {
+        "intrinsics_config": "src/config/four_camera_intrinsics.json",
+        "intrinsics_session": "data/four_camera_calibration/retake_mono8_g10_e5000_retry_03181523",
+        "ground_image": "data/four_camera_ground_registration/ground_reg_20260319_121635/DA7403087/ground_001.png"
+      }
+    },
+    "DA8474746": {
+      "K": [
+        [
+          2352.7041554735224,
+          0.0,
+          1030.9601117947952
+        ],
+        [
+          0.0,
+          2350.49861561156,
+          731.7939599000376
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "D": [
+        -0.11283511080393412,
+        0.09266192092944718,
+        -0.0004926969542486408,
+        0.0002803392113538839,
+        0.07321306793155717
+      ],
+      "image_size": [
+        2048,
+        1536
+      ],
+      "R_to_ref": [
+        [
+          0.82895717538001,
+          0.1716426129315998,
+          -0.5323239754247485
+        ],
+        [
+          -0.1476639895830351,
+          0.9851415859133325,
+          0.08770063788015144
+        ],
+        [
+          0.5394676520111438,
+          0.005905008905764439,
+          0.8419856194160362
+        ]
+      ],
+      "t_to_ref": [
+        [
+          2807.483969083368
+        ],
+        [
+          -358.82956867791967
+        ],
+        [
+          916.8661133209898
+        ]
+      ],
+      "diagnostics": {
+        "relative_extrinsics_rms_px": 0.1710696965456009,
+        "intrinsics_rms_px": 0.06627313354193172,
+        "intrinsics_frames_used": 120,
+        "intrinsics_frames_detected": 126
+      },
+      "sources": {
+        "intrinsics_config": "src/config/four_camera_intrinsics.json",
+        "intrinsics_session": "data/four_camera_calibration/retake_mono8_g10_e5000_retry_03181523",
+        "ground_image": "data/four_camera_ground_registration/ground_reg_20260319_121635/DA8474746/ground_001.png"
+      }
+    }
+  },
+  "diagnostics": {
+    "total_rms": 0.11538621783256531,
+    "per_camera_rms": {
+      "DA7403103": 0.16415800154209137,
+      "DA8571029": 0.10488665103912354,
+      "DA7403087": 0.15859177708625793,
+      "DA8474746": 0.1710696965456009
+    },
+    "num_images": 140,
+    "num_observations": 28160
+  },
+  "board": {
+    "inner_cols": 8,
+    "inner_rows": 11,
+    "square_size": 45.0
+  },
+  "sources": {
+    "fixed_intrinsics_config": "src/config/four_camera_intrinsics.json",
+    "fixed_intrinsics_dataset": "data/four_camera_calibration/retake_mono8_g10_e5000_retry_03181523",
+    "relative_extrinsics_result": "data/four_camera_calibration/merge_old_plus_bridge_all_reordered_20260319/extrinsics_4cams_score08_reordered.json",
+    "relative_extrinsics_dataset": "data/four_camera_calibration/merge_old_plus_bridge_all_reordered_20260319",
+    "ground_registration": {
+      "status": "pending",
+      "images_dir": "data/four_camera_ground_registration/ground_reg_20260319_121635",
+      "ground_index": 1,
+      "annotator": "calibration/ground_annotator.py",
+      "point_definition_source": "calibration/ground_annotator.py:GROUND_POINTS"
+    }
+  }
+}

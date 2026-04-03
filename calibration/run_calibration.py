@@ -1,11 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-多目相机标定脚本 — 全局 BA 标定并保存结果。
-
-用法:
-    python -m calibration.run_calibration
-    python -m calibration.run_calibration --serials DA8199285 DA8199402 DA8199243
-"""
+"""Run multi-camera extrinsics calibration with global bundle adjustment."""
 
 from __future__ import annotations
 
@@ -17,6 +11,13 @@ from pathlib import Path
 
 import numpy as np
 
+from calibration.four_camera_calib_common import (
+    CAMERA_CONFIG_PATH,
+    DEFAULT_INTRINSICS_CONFIG_PATH,
+    load_camera_config,
+    load_sync_serials,
+    rel_or_abs,
+)
 from calibration.multi_calibrator import (
     BoardConfig,
     MultiCalibrator,
@@ -24,70 +25,107 @@ from calibration.multi_calibrator import (
 )
 
 
-def _print_results(r: MultiCalibResult) -> None:
+def _print_results(result: MultiCalibResult) -> None:
     print()
     print("=" * 60)
-    print("              标定结果")
+    print("              Calibration Result")
     print("=" * 60)
 
-    print(f"\n  参考相机: {r.reference_serial}")
-    print(f"  相机数量: {len(r.cameras)}")
+    print(f"\n  Reference camera: {result.reference_serial}")
+    print(f"  Camera count: {len(result.cameras)}")
 
-    print(f"\n  重投影误差 (RMS, pixels):")
-    print(f"    全局:  {r.total_rms:.4f}")
-    for sn, rms in r.per_camera_rms.items():
+    print("\n  Reprojection RMS (pixels):")
+    print(f"    total: {result.total_rms:.4f}")
+    for sn, rms in result.per_camera_rms.items():
         print(f"    {sn}: {rms:.4f}")
 
-    print(f"\n  有效图像: {r.num_images}")
-    print(f"  观测角点: {r.num_observations}")
+    print(f"\n  Valid images: {result.num_images}")
+    print(f"  Corner observations: {result.num_observations}")
 
-    print(f"\n  焦距 (pixels):")
-    for sn, cam in r.cameras.items():
-        print(f"    {sn}: fx={cam.K[0,0]:.1f}  fy={cam.K[1,1]:.1f}")
-
-    print(f"\n  主点 (pixels):")
-    for sn, cam in r.cameras.items():
-        print(f"    {sn}: cx={cam.K[0,2]:.1f}  cy={cam.K[1,2]:.1f}")
-
-    print(f"\n  相机间外参 (到参考相机 {r.reference_serial}):")
-    for sn, cam in r.cameras.items():
+    print("\n  Extrinsics to reference:")
+    for sn, cam in result.cameras.items():
         t = cam.t_to_ref.ravel()
         dist = np.linalg.norm(t)
-        print(f"    {sn}: t=[{t[0]:.1f}, {t[1]:.1f}, {t[2]:.1f}]  "
-              f"dist={dist:.1f}mm")
-
-    print()
+        print(f"    {sn}: t=[{t[0]:.1f}, {t[1]:.1f}, {t[2]:.1f}] mm  dist={dist:.1f} mm")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="多目相机标定 (全局 BA)")
-    parser.add_argument("--images", type=str, default="images",
-                        help="标定图片根目录 (默认: images，相对于 calibration/)")
-    parser.add_argument("--serials", type=str, nargs="+", default=None,
-                        help="相机序列号列表 (默认: 从 camera.json 读取)")
-    parser.add_argument("--reference", type=str, default=None,
-                        help="参考相机序列号 (默认: slave_serials 中第二个)")
-    parser.add_argument("--output", type=str, default="src/config/multi_calib.json",
-                        help="输出文件路径 (默认: src/config/multi_calib.json)")
-    parser.add_argument("--range-start", type=int, default=1,
-                        help="标定图片起始编号 (默认: 1)")
-    parser.add_argument("--range-end", type=int, default=500,
-                        help="标定图片结束编号 (默认: 500)")
-    parser.add_argument("--inner-cols", type=int, default=8,
-                        help="棋盘格内角点列数 (默认: 8, 即 9 列方格)")
-    parser.add_argument("--inner-rows", type=int, default=11,
-                        help="棋盘格内角点行数 (默认: 11, 即 12 行方格)")
-    parser.add_argument("--square-size", type=float, default=45.0,
-                        help="方格边长 mm (默认: 45.0)")
-    parser.add_argument("--annotate", action="store_true",
-                        help="保存角点检测标注图")
-    parser.add_argument("--fix-intrinsics", action="store_true", default=True,
-                        help="固定内参，BA 仅优化外参+板位姿 (默认: True)")
-    parser.add_argument("--no-fix-intrinsics", dest="fix_intrinsics",
-                        action="store_false",
-                        help="BA 同时优化内参+外参+板位姿")
-    parser.add_argument("--max-images", type=int, default=50,
-                        help="BA 最大使用图片数（0=不限制，默认: 50）")
+def _load_intrinsics(path: Path) -> dict[str, dict[str, np.ndarray | tuple[int, int]]]:
+    with open(path, encoding="utf-8") as inp:
+        data = json.load(inp)
+
+    cameras = data.get("cameras", {})
+    if not cameras:
+        raise RuntimeError(f"No cameras found in intrinsics file: {path}")
+
+    intrinsics = {}
+    for sn, cam in cameras.items():
+        intrinsics[sn] = {
+            "K": np.array(cam["K"], dtype=np.float64),
+            "D": np.array(cam["D"], dtype=np.float64),
+            "image_size": tuple(int(v) for v in cam["image_size"]),
+        }
+    return intrinsics
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Multi-camera calibration (global BA)")
+    parser.add_argument(
+        "--images",
+        type=str,
+        default="images",
+        help="Calibration image root directory.",
+    )
+    parser.add_argument(
+        "--serials",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Camera serials. Defaults to current four-camera config.",
+    )
+    parser.add_argument(
+        "--reference",
+        type=str,
+        default=None,
+        help="Reference camera serial. Defaults to current master serial.",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="src/config/multi_calib.json",
+        help="Output JSON path.",
+    )
+    parser.add_argument(
+        "--intrinsics",
+        type=str,
+        default="",
+        help="Optional fixed intrinsics JSON path. Defaults to src/config/four_camera_intrinsics.json when present.",
+    )
+    parser.add_argument("--range-start", type=int, default=1)
+    parser.add_argument("--range-end", type=int, default=500)
+    parser.add_argument("--inner-cols", type=int, default=8)
+    parser.add_argument("--inner-rows", type=int, default=11)
+    parser.add_argument("--square-size", type=float, default=45.0)
+    parser.add_argument("--annotate", action="store_true", help="Save checkerboard annotations.")
+    parser.add_argument(
+        "--fix-intrinsics",
+        action="store_true",
+        default=True,
+        help="Keep intrinsics fixed during BA.",
+    )
+    parser.add_argument(
+        "--no-fix-intrinsics",
+        dest="fix_intrinsics",
+        action="store_false",
+        help="Optimize intrinsics and extrinsics together.",
+    )
+    parser.add_argument("--max-images", type=int, default=50)
+    parser.add_argument("--min-cameras", type=int, default=2)
+    parser.add_argument(
+        "--score-threshold",
+        type=float,
+        default=0.8,
+        help="Ignore cached corner detections whose score is below this threshold.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -98,46 +136,63 @@ def main():
 
     project_root = Path(__file__).resolve().parent.parent
     calib_root = Path(__file__).resolve().parent
-    image_dir = calib_root / args.images
-    output_path = project_root / args.output
 
-    # 确定相机列表
+    raw_image_dir = Path(args.images)
+    if raw_image_dir.is_absolute():
+        image_dir = raw_image_dir
+    else:
+        project_candidate = project_root / raw_image_dir
+        image_dir = project_candidate if project_candidate.exists() else calib_root / raw_image_dir
+
+    raw_output = Path(args.output)
+    output_path = raw_output if raw_output.is_absolute() else project_root / raw_output
+
+    intrinsics_path = None
+    provided_intrinsics = None
+    if args.intrinsics:
+        raw_intr_path = Path(args.intrinsics)
+        intrinsics_path = raw_intr_path if raw_intr_path.is_absolute() else project_root / raw_intr_path
+        provided_intrinsics = _load_intrinsics(intrinsics_path)
+    elif DEFAULT_INTRINSICS_CONFIG_PATH.exists():
+        intrinsics_path = DEFAULT_INTRINSICS_CONFIG_PATH
+        provided_intrinsics = _load_intrinsics(intrinsics_path)
+
     if args.serials:
         serials = args.serials
+        cam_cfg = {}
     else:
-        # 从 camera.json 读取
-        camera_json = project_root / "src" / "config" / "camera.json"
-        with open(camera_json, encoding="utf-8") as f:
-            cam_cfg = json.load(f)
-        serials = cam_cfg.get("slave_serials", [])
+        cam_cfg = load_camera_config(CAMERA_CONFIG_PATH)
+        serials = load_sync_serials(CAMERA_CONFIG_PATH)
         if not serials:
-            print("错误: camera.json 中无 slave_serials")
+            print("Error: no cameras found in camera.json")
             sys.exit(1)
 
-    # 参考相机：默认 DA8199285（中间相机）
     reference = args.reference
     if reference is None:
-        reference = "DA8199285" if "DA8199285" in serials else serials[0]
+        default_ref = cam_cfg.get("master_serial")
+        reference = default_ref if default_ref in serials else serials[0]
 
-    # 检查目录
     for sn in serials:
         d = image_dir / sn
         if not d.exists():
-            print(f"错误: 图片目录不存在 — {d}")
+            print(f"Error: missing image directory {d}")
             sys.exit(1)
 
     print("=" * 60)
-    print("         多目相机标定 (全局 BA)")
+    print("         Multi-Camera Calibration (Global BA)")
     print("=" * 60)
-    print(f"  相机: {serials}")
-    print(f"  参考: {reference}")
-    print(f"  图片目录: {image_dir}")
-    print(f"  标定范围: {args.range_start:03d} ~ {args.range_end:03d}")
-    print(f"  棋盘格: {args.inner_cols}x{args.inner_rows} 内角点, "
-          f"方格 {args.square_size}mm")
-    print(f"  固定内参: {args.fix_intrinsics}")
-    print(f"  最大图片: {args.max_images if args.max_images > 0 else '不限制'}")
-    print(f"  输出: {output_path}")
+    print(f"  Cameras: {serials}")
+    print(f"  Reference: {reference}")
+    print(f"  Image dir: {rel_or_abs(image_dir)}")
+    print(f"  Range: {args.range_start:03d} ~ {args.range_end:03d}")
+    print(f"  Board: {args.inner_cols}x{args.inner_rows} inner corners, {args.square_size} mm")
+    print(f"  Fix intrinsics: {args.fix_intrinsics}")
+    if intrinsics_path is not None:
+        print(f"  Intrinsics input: {intrinsics_path}")
+    print(f"  Max images: {args.max_images if args.max_images > 0 else 'unlimited'}")
+    print(f"  Min cameras: {args.min_cameras}")
+    print(f"  Score threshold: {args.score_threshold:.3f}")
+    print(f"  Output: {output_path}")
 
     board = BoardConfig(
         inner_cols=args.inner_cols,
@@ -154,6 +209,9 @@ def main():
         save_annotations=args.annotate,
         fix_intrinsics=args.fix_intrinsics,
         max_images=args.max_images,
+        min_cameras_per_board=args.min_cameras,
+        detection_score_threshold=args.score_threshold,
+        provided_intrinsics=provided_intrinsics,
     )
 
     result = calibrator.run()
@@ -161,7 +219,7 @@ def main():
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     result.save(output_path)
-    print(f"标定结果已保存: {output_path}")
+    print(f"Saved calibration result to {output_path}")
 
 
 if __name__ == "__main__":

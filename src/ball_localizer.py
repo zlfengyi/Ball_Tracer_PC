@@ -9,7 +9,7 @@
   4. 多视图 DLT 三角测量求 3D 世界坐标
   5. 计算重投影误差评估定位精度
 
-标定参数从 src/config/multi_calib.json 加载。
+默认标定参数从 src/config/four_camera_calib.json 加载。
 
 管线中两种使用方式：
   A. locate(images)  — 检测 + 三角测量一步到位
@@ -32,7 +32,8 @@ from .ball_detector import BallDetector, BallDetection
 from .cv_linalg import matvec, projection_matrix, smallest_right_singular_vector
 
 _SRC_DIR = Path(__file__).resolve().parent
-_DEFAULT_CALIB_CONFIG = _SRC_DIR / "config" / "multi_calib.json"
+_DEFAULT_CALIB_CONFIG = _SRC_DIR / "config" / "four_camera_calib.json"
+_WORLD_SCALE_M_PER_MM = 1.0 / 1000.0
 
 
 @dataclass
@@ -56,8 +57,13 @@ class BallLocalizer:
 
     用法::
 
-        localizer = BallLocalizer()  # 自动加载 config/multi_calib.json
-        result = localizer.locate({"DA8199285": img1, "DA8199402": img2, "DA8199243": img3})
+        localizer = BallLocalizer()  # 自动加载 config/four_camera_calib.json
+        result = localizer.locate({
+            "DA7403103": img1,
+            "DA8571029": img2,
+            "DA7403087": img3,
+            "DA8474746": img4,
+        })
         if result is not None:
             print(f"网球 3D: ({result.x:.1f}, {result.y:.1f}, {result.z:.1f}) mm")
     """
@@ -182,10 +188,12 @@ class BallLocalizer:
             err = np.sqrt((proj[0] - det.x) ** 2 + (proj[1] - det.y) ** 2)
             errs.append(err)
 
+        pts_3d_m = pts_3d * _WORLD_SCALE_M_PER_MM
+
         return Ball3D(
-            x=float(pts_3d[0]),
-            y=float(pts_3d[1]),
-            z=float(pts_3d[2]),
+            x=float(pts_3d_m[0]),
+            y=float(pts_3d_m[1]),
+            z=float(pts_3d_m[2]),
             cameras_used=serials,
             pixels=pixels,
             confidence=min(detections[sn].confidence for sn in serials),
