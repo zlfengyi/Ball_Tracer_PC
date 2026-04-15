@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import queue
 from pathlib import Path
 
 from src.run_tracker import (
+    CarLocJob,
+    _submit_latest_car_loc_job,
     _infer_engine_batch_from_model_path,
     _infer_model_input_size_from_model_path,
     _resolve_engine_batch,
@@ -101,3 +104,22 @@ def test_resolve_engine_batch_prefers_fixed_engine_batch_over_runtime_chunking()
 
     assert engine_batch == 3
     assert detector.calls == [3]
+
+
+def test_submit_latest_car_loc_job_replaces_stale_pending_job():
+    job_queue: queue.Queue[CarLocJob | None] = queue.Queue(maxsize=1)
+    frame_entry_by_idx = {
+        10: {"car_loc_status": "pending"},
+        12: {"car_loc_status": "pending"},
+    }
+    stale = CarLocJob(frame_idx=10, exposure_pc=1.0, elapsed_s=0.0, images={})
+    latest = CarLocJob(frame_idx=12, exposure_pc=2.0, elapsed_s=0.1, images={})
+
+    job_queue.put_nowait(stale)
+    dropped = _submit_latest_car_loc_job(job_queue, frame_entry_by_idx, latest)
+
+    queued = job_queue.get_nowait()
+    assert dropped == 1
+    assert queued == latest
+    assert frame_entry_by_idx[10]["car_loc_status"] == "dropped"
+    assert frame_entry_by_idx[12]["car_loc_status"] == "pending"

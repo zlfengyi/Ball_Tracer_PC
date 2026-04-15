@@ -31,6 +31,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from src.ball_detector import BallDetection
 from src.ball_localizer import Ball3D
+from src.car_localizer import CarLoc, CarLocalizer
 from src.racket_localizer import RacketDetection, RacketLoc, RacketLocalizer
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
@@ -305,6 +306,31 @@ def build_relative_frame_time_s(
     return max(0.0, float(timestamp) - float(time_reference))
 
 
+def describe_car_loc_status(
+    frame_data: dict,
+    sample_every_frames: int | None,
+) -> tuple[str, tuple[int, int, int]] | None:
+    status = frame_data.get("car_loc_status")
+    if not isinstance(status, str) or not status:
+        return None
+
+    sample_text = ""
+    if isinstance(sample_every_frames, int) and sample_every_frames > 1:
+        sample_text = f"  sample=1/{sample_every_frames}"
+
+    if status == "skipped":
+        return (f"AprilTag: skipped{sample_text}", (160, 160, 160))
+    if status == "miss":
+        return (f"AprilTag: sampled, no tag{sample_text}", (0, 165, 255))
+    if status == "hit":
+        return (f"AprilTag: sampled{sample_text}", (0, 200, 255))
+    if status == "dropped":
+        return (f"AprilTag: dropped backlog{sample_text}", (0, 96, 255))
+    if status == "pending":
+        return ("AprilTag: pending", (180, 180, 180))
+    return None
+
+
 def convert_racket_loc_mm_to_m(loc: RacketLoc) -> RacketLoc:
     return RacketLoc(
         x=float(loc.x) / 1000.0,
@@ -321,6 +347,17 @@ def scale_panel_to_full(panel: np.ndarray) -> np.ndarray:
     """把半分辨率 panel 拉回原始坐标系大小，便于复用在线分片逻辑。"""
     h, w = panel.shape[:2]
     return cv2.resize(panel, (w * 2, h * 2), interpolation=cv2.INTER_LINEAR)
+
+
+def extract_fullres_panels(
+    img: np.ndarray,
+    serials: list[str],
+) -> dict[str, np.ndarray]:
+    panels_half, _, _ = split_stitched_panels(img, serials)
+    return {
+        sn: scale_panel_to_full(panel)
+        for sn, panel in panels_half.items()
+    }
 
 
 def init_racket_pipeline(
@@ -348,11 +385,7 @@ def init_racket_pipeline(
         min_valid_keypoints=min_face_valid_keypoints,
     )
 
-    panels_half, _, _ = split_stitched_panels(first_frame, serials)
-    panels_full = {
-        sn: scale_panel_to_full(panel)
-        for sn, panel in panels_half.items()
-    }
+    panels_full = extract_fullres_panels(first_frame, serials)
     try:
         localizer.locate(panels_full)
     except ModuleNotFoundError as e:
@@ -374,11 +407,7 @@ def detect_racket_frame(
     pipeline: RacketPipeline,
 ) -> tuple[dict[str, RacketDetection], Optional[RacketLoc]]:
     """Run the ArmCalibration racket detector on one stitched frame."""
-    panels_half, _, _ = split_stitched_panels(img, serials)
-    panels_full = {
-        sn: scale_panel_to_full(panel)
-        for sn, panel in panels_half.items()
-    }
+    panels_full = extract_fullres_panels(img, serials)
     detections, loc = pipeline.localizer.locate(panels_full)
     if loc is not None:
         loc = convert_racket_loc_mm_to_m(loc)
@@ -496,6 +525,25 @@ def serialize_racket_3d(obj3d: RacketLoc) -> dict:
     }
 
 
+def serialize_car_loc(obj3d: CarLoc, *, elapsed_s: float | None) -> dict:
+    return {
+        "x": round(obj3d.x, 4),
+        "y": round(obj3d.y, 4),
+        "z": round(obj3d.z, 4),
+        "yaw": round(obj3d.yaw, 4),
+        "t": obj3d.t,
+        "elapsed_s": round(elapsed_s, 3) if elapsed_s is not None else None,
+        "tag_id": obj3d.tag_id,
+        "reference": "car_base",
+        "cameras_used": obj3d.cameras_used,
+        "reprojection_error": round(obj3d.reprojection_error, 2),
+        "pixels": {
+            sn: [round(float(px)), round(float(py))]
+            for sn, (px, py) in obj3d.pixels.items()
+        },
+    }
+
+
 def apply_racket_results(
     frame_data: dict,
     detections: dict[str, RacketDetection],
@@ -516,6 +564,37 @@ def apply_racket_results(
 
     if racket3d is not None:
         frame_data["racket3d"] = serialize_racket_3d(racket3d)
+
+
+def apply_car_result(
+    frame_data: dict,
+    car_loc: Optional[CarLoc],
+    *,
+    elapsed_s: float | None,
+) -> None:
+    frame_data.pop("car_loc", None)
+    frame_data["car_loc_sampled"] = True
+    frame_data["car_loc_status"] = "miss"
+    if car_loc is not None:
+        frame_data["car_loc"] = serialize_car_loc(car_loc, elapsed_s=elapsed_s)
+        frame_data["car_loc_status"] = "hit"
+
+
+def clear_car_results(data: dict) -> None:
+    for frame_data in data.get("frames", []):
+        if not isinstance(frame_data, dict):
+            continue
+        frame_data.pop("car_loc", None)
+        frame_data.pop("car_loc_sampled", None)
+        frame_data.pop("car_loc_status", None)
+    data["car_locs"] = []
+
+    summary = data.get("summary")
+    if isinstance(summary, dict):
+        summary.pop("car_locs", None)
+        summary.pop("car_loc_sampled_frames", None)
+        summary.pop("car_loc_misses", None)
+        summary.pop("car_loc_dropped_frames", None)
 
 
 def clear_racket_results(data: dict) -> None:
@@ -715,6 +794,7 @@ def annotate_frame(
     layout_cols: int,
     *,
     show_racket: bool = False,
+    car_sample_every_frames: int | None = None,
     relative_time_s: float | None = None,
 ) -> np.ndarray:
     """在拼接画面上绘制球/球拍/3D/状态等离线标注。"""
@@ -841,6 +921,10 @@ def annotate_frame(
         )
     lines.append((state_str, state_color))
 
+    car_status_line = describe_car_loc_status(frame_data, car_sample_every_frames)
+    if car_status_line is not None:
+        lines.append(car_status_line)
+
     if frame_car_loc:
         cams = "+".join(s[-3:] for s in frame_car_loc["cameras_used"])
         lines.append((
@@ -911,6 +995,15 @@ def main() -> None:
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    car_cfg = data.get("config", {}).get("car_localizer", {})
+    car_enabled = bool(car_cfg.get("enabled", True))
+    tracker_car_sample_every_frames = None
+    if isinstance(car_cfg.get("sample_every_frames"), int):
+        tracker_car_sample_every_frames = max(
+            int(car_cfg["sample_every_frames"]),
+            1,
+        )
+    car_sample_every_frames = 1 if car_enabled else None
     cols, rows = infer_stitched_grid(n_cams, w, h)
     panel_w = w // cols
     panel_h = h // rows
@@ -918,8 +1011,12 @@ def main() -> None:
     time_reference = extract_time_reference(data)
     sync_video_frame_metadata(data, frame_mapping, has_exact_mapping)
 
+    if car_enabled:
+        clear_car_results(data)
     if racket_enabled:
         clear_racket_results(data)
+
+    car_localizer = CarLocalizer() if car_enabled else None
 
     writer = None
     if not args.no_output_video:
@@ -936,6 +1033,13 @@ def main() -> None:
         print("输出视频: disabled (--no-output-video)")
     else:
         print(f"输出视频: {output_path}")
+    if car_enabled:
+        print("AprilTag 离线补标: every frame")
+        if tracker_car_sample_every_frames is not None:
+            print(
+                "Tracker 原始 AprilTag 采样: "
+                f"1/{tracker_car_sample_every_frames}"
+            )
     if racket_enabled:
         print(f"球拍模型: {args.racket_model}")
         print(f"球拍关键点模型: {args.racket_pose_model}")
@@ -945,6 +1049,8 @@ def main() -> None:
 
     frame_idx = 0
     n_annotated = 0
+    car_observations: list[dict] = []
+    car_frames_processed = 0
     racket_pipeline: Optional[RacketPipeline] = None
     racket_observations: list[dict] = []
     racket_frames_processed = 0
@@ -959,6 +1065,22 @@ def main() -> None:
 
         if frame_idx < len(frame_mapping):
             fd = frames_data[frame_mapping[frame_idx]]
+            frame_time = build_panel_timestamp(fd, frame_idx, fps)
+            relative_time_s = build_relative_frame_time_s(
+                fd, frame_idx, fps, time_reference
+            )
+
+            if car_localizer is not None:
+                panels = extract_fullres_panels(img, serials)
+                car_loc = car_localizer.locate(panels, t=frame_time)
+                apply_car_result(fd, car_loc, elapsed_s=relative_time_s)
+                car_frames_processed += 1
+                if car_loc is not None:
+                    car_observations.append({
+                        "frame_idx": fd.get("idx", frame_mapping[frame_idx]),
+                        "video_frame_idx": frame_idx,
+                        **serialize_car_loc(car_loc, elapsed_s=relative_time_s),
+                    })
 
             if racket_enabled:
                 if racket_pipeline is None:
@@ -978,10 +1100,6 @@ def main() -> None:
                         f"min_face_valid={racket_pipeline.min_face_valid_keypoints}"
                     )
 
-                frame_time = build_panel_timestamp(fd, frame_idx, fps)
-                relative_time_s = build_relative_frame_time_s(
-                    fd, frame_idx, fps, time_reference
-                )
                 racket_dets, racket3d = detect_racket_frame(
                     img, serials, racket_pipeline
                 )
@@ -1017,9 +1135,8 @@ def main() -> None:
                 panel_h,
                 cols,
                 show_racket=racket_enabled,
-                relative_time_s=build_relative_frame_time_s(
-                    fd, frame_idx, fps, time_reference
-                ),
+                car_sample_every_frames=car_sample_every_frames,
+                relative_time_s=relative_time_s,
             )
             n_annotated += 1
         else:
@@ -1030,10 +1147,21 @@ def main() -> None:
         frame_idx += 1
 
         if frame_idx % 200 == 0:
-            if racket_enabled:
+            if racket_enabled and car_enabled:
+                print(
+                    f"  {frame_idx}/{total} 帧... "
+                    f"car_3d={len(car_observations)}  "
+                    f"racket_3d={len(racket_observations)}"
+                )
+            elif racket_enabled:
                 print(
                     f"  {frame_idx}/{total} 帧... "
                     f"racket_3d={len(racket_observations)}"
+                )
+            elif car_enabled:
+                print(
+                    f"  {frame_idx}/{total} 帧... "
+                    f"car_3d={len(car_observations)}"
                 )
             else:
                 print(f"  {frame_idx}/{total} 帧...")
@@ -1041,6 +1169,22 @@ def main() -> None:
     cap.release()
     if writer is not None:
         writer.release()
+
+    if car_enabled:
+        config = data.setdefault("config", {})
+        summary = data.setdefault("summary", {})
+        car_cfg_out = config.setdefault("car_localizer", {})
+        if tracker_car_sample_every_frames is not None:
+            car_cfg_out["tracker_sample_every_frames"] = tracker_car_sample_every_frames
+        car_cfg_out["sample_every_frames"] = 1
+        car_cfg_out["result_source"] = "annotate_video_full_frames"
+        data["car_locs"] = car_observations
+        summary["car_locs"] = len(car_observations)
+        summary["car_loc_sampled_frames"] = car_frames_processed
+        summary["car_loc_misses"] = max(
+            car_frames_processed - len(car_observations),
+            0,
+        )
 
     if racket_enabled:
         config = data.setdefault("config", {})
@@ -1058,11 +1202,6 @@ def main() -> None:
         summary["racket_observations_3d"] = len(racket_observations)
         summary["racket_frames_processed"] = racket_frames_processed
 
-        with open(json_output_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-
-        print(f"JSON 已更新: {json_output_path}")
-        print(f"球拍 3D 观测数: {len(racket_observations)}")
         if racket_json_output_path is not None:
             racket_payload = build_racket_json_payload(
                 data,
@@ -1072,6 +1211,14 @@ def main() -> None:
             with open(racket_json_output_path, "w", encoding="utf-8") as f:
                 json.dump(racket_payload, f, ensure_ascii=False, indent=2)
             print(f"球拍 JSON 已输出: {racket_json_output_path}")
+
+    if car_enabled or racket_enabled:
+        with open(json_output_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        print(f"JSON 已更新: {json_output_path}")
+
+    if racket_enabled:
+        print(f"球拍 3D 观测数: {len(racket_observations)}")
 
     if writer is not None:
         print(f"完成：{n_annotated} 帧已标注，输出到 {output_path}")

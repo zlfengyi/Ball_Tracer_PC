@@ -91,6 +91,99 @@ def _json_script(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False).replace("</", "<\\/")
 
 
+def _build_tracker_view_payload(payload: dict | None, *, car_source_payload: dict | None = None) -> dict | None:
+    if not isinstance(payload, dict):
+        return None
+
+    config = payload.get("config") if isinstance(payload.get("config"), dict) else {}
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    car_source = car_source_payload if isinstance(car_source_payload, dict) else payload
+    car_config = car_source.get("config") if isinstance(car_source.get("config"), dict) else {}
+    car_summary = car_source.get("summary") if isinstance(car_source.get("summary"), dict) else {}
+
+    slim_frames: list[dict[str, Any]] = []
+    for frame in payload.get("frames") or []:
+        if not isinstance(frame, dict):
+            continue
+        slim_frame: dict[str, Any] = {}
+        for key in (
+            "idx",
+            "exposure_pc",
+            "elapsed_s",
+            "video_frame_idx",
+            "video_mapping_exact",
+        ):
+            if key in frame:
+                slim_frame[key] = frame[key]
+        for key in ("ball3d", "racket3d"):
+            value = frame.get(key)
+            if isinstance(value, dict):
+                slim_frame[key] = value
+        if slim_frame:
+            slim_frames.append(slim_frame)
+
+    slim_config: dict[str, Any] = {}
+    for key in (
+        "first_frame_exposure_pc",
+        "fps",
+        "duration_s",
+        "distance_unit",
+        "ideal_hit_z",
+        "cor",
+        "noise_mm",
+        "min_stage1_points",
+        "video_frame_mapping_exact",
+        "replay_source",
+    ):
+        if key in config:
+            slim_config[key] = config[key]
+    car_localizer_cfg = car_config.get("car_localizer")
+    if isinstance(car_localizer_cfg, dict):
+        slim_config["car_localizer"] = {
+            key: car_localizer_cfg[key]
+            for key in ("sample_every_frames", "result_source", "tracker_sample_every_frames")
+            if key in car_localizer_cfg
+        }
+
+    slim_summary: dict[str, Any] = {}
+    for key in (
+        "total_frames",
+        "actual_fps",
+        "end_to_end_fps",
+        "processing_duration_s",
+        "end_to_end_duration_s",
+        "timeouts",
+        "observations_3d",
+        "predictions",
+        "car_locs",
+        "car_loc_sampled_frames",
+        "car_loc_misses",
+        "car_loc_dropped_frames",
+        "racket_observations_3d",
+        "racket_frames_processed",
+        "video_frames_mapped",
+        "video_frame_mapping_exact",
+        "reset_times",
+    ):
+        source_summary = car_summary if key in ("car_locs", "car_loc_sampled_frames", "car_loc_misses", "car_loc_dropped_frames") else summary
+        if key in source_summary:
+            slim_summary[key] = source_summary[key]
+    if isinstance(summary.get("timing_ms"), dict):
+        slim_summary["timing_ms"] = summary["timing_ms"]
+
+    return {
+        "config": slim_config,
+        "summary": slim_summary,
+        "observations": payload.get("observations") or [],
+        "predictions": payload.get("predictions") or [],
+        "car_locs": car_source.get("car_locs") or [],
+        "racket_observations": payload.get("racket_observations") or [],
+        "frames": slim_frames,
+        "video_frame_indices": payload.get("video_frame_indices") or [],
+        "state_transitions": payload.get("state_transitions") or [],
+    }
+
+
 def _has_pc_timestamp_keys(item: Any) -> bool:
     if not isinstance(item, dict):
         return False
@@ -2047,7 +2140,16 @@ class TrackerReportHandler(BaseHTTPRequestHandler):
             return
         payload, _, _ = self.server.choose_tracker_payload(run)
         if payload is not None:
-            body = HTML_TEMPLATE.replace("%%DATA_JSON%%", json.dumps(payload, ensure_ascii=False))
+            base_tracker_payload = (
+                self.server.load_json(run.tracker_json)
+                if run.tracker_json is not None and run.tracker_json.exists()
+                else None
+            )
+            view_payload = _build_tracker_view_payload(payload, car_source_payload=base_tracker_payload)
+            body = HTML_TEMPLATE.replace(
+                "%%DATA_JSON%%",
+                json.dumps(view_payload, ensure_ascii=False),
+            )
             self._send_html(body)
             return
         if run.tracker_html is not None and run.tracker_html.exists():

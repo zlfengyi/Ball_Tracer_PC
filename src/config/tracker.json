@@ -18,9 +18,7 @@
     },
     "car_localizer": {
         "enabled": true,
-        "active_interval_s": 0.1,
-        "idle_interval_s": 0.5,
-        "idle_after_misses": 3
+        "sample_every_frames": 2
     },
     "video_output": {
         "codec": "avc1",

@@ -159,6 +159,12 @@ const D = %%DATA_JSON%%;
 (function(){
 const cfg = D.config || {};
 const summary = D.summary || {};
+const PLOT_CONFIG = {
+  responsive:true,
+  displayModeBar:true,
+  scrollZoom:false,
+  plotGlPixelRatio:1,
+};
 const preds = D.predictions || [];
 const frames = Array.isArray(D.frames) ? D.frames : [];
 const writtenVideoFrameIds = Array.isArray(D.video_frame_indices) ? D.video_frame_indices : [];
@@ -166,9 +172,9 @@ const distanceScale = cfg.distance_unit === 'm' ? 1.0 : 0.001;
 const scaleVec3 = p => ({...p, x:p.x*distanceScale, y:p.y*distanceScale, z:p.z*distanceScale});
 const obsRaw = (D.observations || []).map(o=>scaleVec3(o));
 const racketObsRaw = (D.racket_observations || []).map(o=>scaleVec3(o));
-const car = (D.car_locs || []).map(c=>({...c, x:c.x*distanceScale, y:c.y*distanceScale, z:c.z*distanceScale}));
-const s0 = preds.filter(p=>p.stage===0).map(p=>({...p, x:p.x*distanceScale, y:p.y*distanceScale, z:p.z*distanceScale}));
-const s1 = preds.filter(p=>p.stage===1).map(p=>({...p, x:p.x*distanceScale, y:p.y*distanceScale, z:p.z*distanceScale}));
+const carFull = (D.car_locs || []).map(c=>({...c, x:c.x*distanceScale, y:c.y*distanceScale, z:c.z*distanceScale}));
+const s0Full = preds.filter(p=>p.stage===0).map(p=>({...p, x:p.x*distanceScale, y:p.y*distanceScale, z:p.z*distanceScale}));
+const s1Full = preds.filter(p=>p.stage===1).map(p=>({...p, x:p.x*distanceScale, y:p.y*distanceScale, z:p.z*distanceScale}));
 const resets = D.reset_times || summary.reset_times || [];
 const throws = D.throws || [];
 const sourceType = cfg.replay_source ? 'Replay JSON' : 'Tracker JSON';
@@ -184,7 +190,7 @@ const firstNumeric = (items, key) => {
 const firstFrameT0 =
   isNum(cfg.first_frame_exposure_pc) ? cfg.first_frame_exposure_pc :
   (frames.length > 0 && isNum(frames[0].exposure_pc) ? frames[0].exposure_pc : null);
-const fallbackT0 = [firstNumeric(obsRaw, 't'), firstNumeric(racketObsRaw, 't'), firstNumeric(car, 't'), firstNumeric(preds, 'ct')]
+const fallbackT0 = [firstNumeric(obsRaw, 't'), firstNumeric(racketObsRaw, 't'), firstNumeric(carFull, 't'), firstNumeric(preds, 'ct')]
   .find(v => v !== null);
 const t0 = firstFrameT0 !== null ? firstFrameT0 : (fallbackT0 !== null ? fallbackT0 : 0);
 const relTime = v => isNum(v) ? (v - t0) : 0;
@@ -225,10 +231,10 @@ const frameRacketObs = preferredFrames
     idx: f.idx,
     video_frame_idx: f.video_frame_idx,
   }));
-const obs = frameBallObs.length > 0
+const obsFull = frameBallObs.length > 0
   ? frameBallObs
   : obsRaw.map(o => ({...o, rel_s: relTime(o.t), idx: null, video_frame_idx: null}));
-const racket = frameRacketObs.length > 0
+const racketFull = frameRacketObs.length > 0
   ? frameRacketObs
   : racketObsRaw.map(o => ({
       ...o,
@@ -236,6 +242,11 @@ const racket = frameRacketObs.length > 0
       idx: Number.isInteger(o.frame_idx) ? o.frame_idx : null,
       video_frame_idx: Number.isInteger(o.video_frame_idx) ? o.video_frame_idx : null,
     }));
+const obs = obsFull;
+const racket = racketFull;
+const car = carFull;
+const s0 = s0Full;
+const s1 = s1Full;
 const pairedFrames = preferredFrames.filter(f => f.ball3d && f.racket3d);
 const frameStartLabel =
   frames.length > 0 && isNum(frames[0].exposure_pc)
@@ -243,6 +254,17 @@ const frameStartLabel =
     : null;
 const ballSourceLabel = frameBallObs.length > 0 ? 'video-linked frames' : 'tracker observations';
 const racketSourceLabel = frameRacketObs.length > 0 ? 'video-linked frames' : 'racket observations';
+const g2 = trace => ({type:'scattergl', ...trace});
+const buildPlots = [];
+const builtPlots = new Set();
+function ensurePlot(idx){
+  if(builtPlots.has(idx)) return;
+  const builder = buildPlots[idx];
+  if(typeof builder !== 'function') return;
+  builder();
+  builtPlots.add(idx);
+}
+window.ensurePlot = ensurePlot;
 
 const stat=(k,v)=>`<span>${k}: <span class="v">${v!=null?v:'-'}</span></span>`;
 document.getElementById('st').innerHTML=[
@@ -252,15 +274,19 @@ document.getElementById('st').innerHTML=[
   frameStartLabel ? stat('Frame0 perf', frameStartLabel) : '',
   cfg.video_frame_mapping_exact != null ? stat('Frame map', cfg.video_frame_mapping_exact ? 'exact' : 'fallback') : '',
   summary.video_frames_mapped ? stat('Mapped video frames', summary.video_frames_mapped) : '',
-  stat('Ball 3D', obs.length),
+  stat('Ball 3D', obsFull.length),
   stat('Ball src', ballSourceLabel),
-  racket.length ? stat('Racket 3D', racket.length) : '',
+  racketFull.length ? stat('Racket 3D', racketFull.length) : '',
   racket.length ? stat('Racket src', racketSourceLabel) : '',
   videoLinkedFrames.length ? stat('Video-linked frames', videoLinkedFrames.length) : '',
   pairedFrames.length ? stat('Ball+Racket same-frame', pairedFrames.length) : '',
-  stat('S0 preds', s0.length),
-  stat('S1 preds', s1.length),
-  car.length ? stat('Car locs', car.length) : '',
+  stat('S0 preds', s0Full.length),
+  stat('S1 preds', s1Full.length),
+  carFull.length ? stat('Car locs', carFull.length) : '',
+  (cfg.car_localizer && Number.isInteger(cfg.car_localizer.sample_every_frames))
+    ? stat('Car sample', `1/${cfg.car_localizer.sample_every_frames}`)
+    : '',
+  stat('2D render', 'full scattergl'),
   stat('Resets', resets.length),
   throws.length ? stat('Throws', throws.length) : '',
   fps ? stat('FPS', fps.toFixed ? fps.toFixed(1) : fps) : '',
@@ -276,76 +302,76 @@ const DL={paper_bgcolor:'#1a1a2e',plot_bgcolor:'#16213e',font:{color:'#e0e0e0',s
   hovermode:'closest',margin:{l:60,r:30,t:40,b:50}};
 const GS={gridcolor:'#0f3460',zerolinecolor:'#0f3460'};
 
-{
+buildPlots[0] = () => {
   const oT=obs.map(o=>isNum(o.rel_s) ? o.rel_s : relTime(o.t));
   const rT=racket.map(r=>isNum(r.rel_s) ? r.rel_s : relTime(r.t));
   const tr=[
-    {x:oT, y:obs.map(o=>o.x), name:'Ball X', mode:'markers',
+    g2({x:oT, y:obs.map(o=>o.x), name:'Ball X', mode:'markers',
      marker:{color:'#7f8c8d',symbol:'circle',size:2,opacity:0.5},
      hovertemplate:'t=%{x:.3f}s<br>x=%{y:.3f} m<extra>Ball X</extra>',
-     visible:'legendonly'},
-    {x:oT, y:obs.map(o=>o.y), name:'Ball Y', mode:'markers',
+     visible:'legendonly'}),
+    g2({x:oT, y:obs.map(o=>o.y), name:'Ball Y', mode:'markers',
      marker:{color:'#95a5a6',symbol:'circle',size:2,opacity:0.5},
      hovertemplate:'t=%{x:.3f}s<br>y=%{y:.3f} m<extra>Ball Y</extra>',
-     visible:'legendonly'},
-    {x:oT, y:obs.map(o=>o.z), name:'Ball Z', mode:'markers',
+     visible:'legendonly'}),
+    g2({x:oT, y:obs.map(o=>o.z), name:'Ball Z', mode:'markers',
      marker:{color:'#bdc3c7',symbol:'circle',size:2.5,opacity:0.6},
-     hovertemplate:'t=%{x:.3f}s<br>z=%{y:.3f} m<extra>Ball Z</extra>'},
+     hovertemplate:'t=%{x:.3f}s<br>z=%{y:.3f} m<extra>Ball Z</extra>'}),
 
     ...(racket.length ? [
-    {x:rT, y:racket.map(r=>r.x), name:'Racket X', mode:'markers',
+    g2({x:rT, y:racket.map(r=>r.x), name:'Racket X', mode:'markers',
      marker:{color:'#ff66cc',symbol:'x',size:5},
      hovertemplate:'t=%{x:.3f}s<br>racket x=%{y:.3f} m<extra>Racket X</extra>',
-     visible:'legendonly'},
-    {x:rT, y:racket.map(r=>r.y), name:'Racket Y', mode:'markers',
+     visible:'legendonly'}),
+    g2({x:rT, y:racket.map(r=>r.y), name:'Racket Y', mode:'markers',
      marker:{color:'#ff33aa',symbol:'x',size:5},
      hovertemplate:'t=%{x:.3f}s<br>racket y=%{y:.3f} m<extra>Racket Y</extra>',
-     visible:'legendonly'},
-    {x:rT, y:racket.map(r=>r.z), name:'Racket Z', mode:'markers',
+     visible:'legendonly'}),
+    g2({x:rT, y:racket.map(r=>r.z), name:'Racket Z', mode:'markers',
      marker:{color:'#cc00ff',symbol:'x',size:5},
-     hovertemplate:'t=%{x:.3f}s<br>racket z=%{y:.3f} m<extra>Racket Z</extra>'},
+     hovertemplate:'t=%{x:.3f}s<br>racket z=%{y:.3f} m<extra>Racket Z</extra>'}),
     ] : []),
 
-    {x:s0.map(p=>relTime(p.ct)), y:s0.map(p=>p.x), name:'S0 X', mode:'markers',
+    g2({x:s0.map(p=>relTime(p.ct)), y:s0.map(p=>p.x), name:'S0 X', mode:'markers',
      marker:{color:'#3498db',symbol:'triangle-up',size:5},
-     hovertemplate:'t=%{x:.3f}s<br>pred x=%{y:.3f} m<extra>S0 X</extra>'},
-    {x:s0.map(p=>relTime(p.ct)), y:s0.map(p=>p.y), name:'S0 Y', mode:'markers',
+     hovertemplate:'t=%{x:.3f}s<br>pred x=%{y:.3f} m<extra>S0 X</extra>'}),
+    g2({x:s0.map(p=>relTime(p.ct)), y:s0.map(p=>p.y), name:'S0 Y', mode:'markers',
      marker:{color:'#2980b9',symbol:'triangle-up',size:5},
-     hovertemplate:'t=%{x:.3f}s<br>pred y=%{y:.3f} m<extra>S0 Y</extra>'},
-    {x:s0.map(p=>relTime(p.ct)), y:s0.map(p=>p.z), name:'S0 Z', mode:'markers',
+     hovertemplate:'t=%{x:.3f}s<br>pred y=%{y:.3f} m<extra>S0 Y</extra>'}),
+    g2({x:s0.map(p=>relTime(p.ct)), y:s0.map(p=>p.z), name:'S0 Z', mode:'markers',
      marker:{color:'#1abc9c',symbol:'triangle-up',size:5},
-     hovertemplate:'t=%{x:.3f}s<br>pred z=%{y:.3f} m<extra>S0 Z</extra>'},
+     hovertemplate:'t=%{x:.3f}s<br>pred z=%{y:.3f} m<extra>S0 Z</extra>'}),
 
-    {x:s1.map(p=>relTime(p.ct)), y:s1.map(p=>p.x), name:'S1 X', mode:'markers',
+    g2({x:s1.map(p=>relTime(p.ct)), y:s1.map(p=>p.x), name:'S1 X', mode:'markers',
      marker:{color:'#e74c3c',symbol:'square',size:5,line:{width:0.5,color:'#fff'}},
-     hovertemplate:'t=%{x:.3f}s<br>pred x=%{y:.3f} m<extra>S1 X</extra>'},
-    {x:s1.map(p=>relTime(p.ct)), y:s1.map(p=>p.y), name:'S1 Y', mode:'markers',
+     hovertemplate:'t=%{x:.3f}s<br>pred x=%{y:.3f} m<extra>S1 X</extra>'}),
+    g2({x:s1.map(p=>relTime(p.ct)), y:s1.map(p=>p.y), name:'S1 Y', mode:'markers',
      marker:{color:'#c0392b',symbol:'square',size:5,line:{width:0.5,color:'#fff'}},
-     hovertemplate:'t=%{x:.3f}s<br>pred y=%{y:.3f} m<extra>S1 Y</extra>'},
-    {x:s1.map(p=>relTime(p.ct)), y:s1.map(p=>p.z), name:'S1 Z', mode:'markers',
+     hovertemplate:'t=%{x:.3f}s<br>pred y=%{y:.3f} m<extra>S1 Y</extra>'}),
+    g2({x:s1.map(p=>relTime(p.ct)), y:s1.map(p=>p.z), name:'S1 Z', mode:'markers',
      marker:{color:'#e67e22',symbol:'square',size:5,line:{width:0.5,color:'#fff'}},
-     hovertemplate:'t=%{x:.3f}s<br>pred z=%{y:.3f} m<extra>S1 Z</extra>'},
+     hovertemplate:'t=%{x:.3f}s<br>pred z=%{y:.3f} m<extra>S1 Z</extra>'}),
 
-    {x:s0.map(p=>relTime(p.ct)), y:s0.map(p=>(p.ht-p.ct)*1000), name:'S0 lead(ms)', mode:'markers',
+    g2({x:s0.map(p=>relTime(p.ct)), y:s0.map(p=>(p.ht-p.ct)*1000), name:'S0 lead(ms)', mode:'markers',
      marker:{color:'#9b59b6',symbol:'triangle-up',size:4}, yaxis:'y2',
-     hovertemplate:'t=%{x:.3f}s<br>lead=%{y:.1f} ms<extra>S0 lead</extra>'},
-    {x:s1.map(p=>relTime(p.ct)), y:s1.map(p=>(p.ht-p.ct)*1000), name:'S1 lead(ms)', mode:'markers',
+     hovertemplate:'t=%{x:.3f}s<br>lead=%{y:.1f} ms<extra>S0 lead</extra>'}),
+    g2({x:s1.map(p=>relTime(p.ct)), y:s1.map(p=>(p.ht-p.ct)*1000), name:'S1 lead(ms)', mode:'markers',
      marker:{color:'#8e44ad',symbol:'square',size:4}, yaxis:'y2',
-     hovertemplate:'t=%{x:.3f}s<br>lead=%{y:.1f} ms<extra>S1 lead</extra>'},
+     hovertemplate:'t=%{x:.3f}s<br>lead=%{y:.1f} ms<extra>S1 lead</extra>'}),
 
     ...(car.length ? [
-    {x:car.map(c=>relTime(c.t)), y:car.map(c=>c.x), name:'Car X', mode:'markers',
+    g2({x:car.map(c=>relTime(c.t)), y:car.map(c=>c.x), name:'Car X', mode:'markers',
      marker:{color:'#2ecc71',symbol:'circle',size:2},
      hovertemplate:'t=%{x:.3f}s<br>car x=%{y:.3f} m<extra>Car X</extra>',
-     visible:'legendonly'},
-    {x:car.map(c=>relTime(c.t)), y:car.map(c=>c.y), name:'Car Y', mode:'markers',
+     visible:'legendonly'}),
+    g2({x:car.map(c=>relTime(c.t)), y:car.map(c=>c.y), name:'Car Y', mode:'markers',
      marker:{color:'#27ae60',symbol:'circle',size:2},
      hovertemplate:'t=%{x:.3f}s<br>car y=%{y:.3f} m<extra>Car Y</extra>',
-     visible:'legendonly'},
-    {x:car.map(c=>relTime(c.t)), y:car.map(c=>c.z), name:'Car Z', mode:'markers',
+     visible:'legendonly'}),
+    g2({x:car.map(c=>relTime(c.t)), y:car.map(c=>c.z), name:'Car Z', mode:'markers',
      marker:{color:'#f1c40f',symbol:'circle',size:2},
      hovertemplate:'t=%{x:.3f}s<br>car z=%{y:.3f} m<extra>Car Z</extra>',
-     visible:'legendonly'},
+     visible:'legendonly'}),
     ] : []),
   ];
 
@@ -354,42 +380,42 @@ const GS={gridcolor:'#0f3460',zerolinecolor:'#0f3460'};
     title:{text:'All Curves - click legend to toggle, scroll to zoom',font:{size:13,color:'#a0a0c0'}},
     xaxis:{title:'Time (s)',...GS}, yaxis:{title:'Value (m)',...GS},
     yaxis2:{title:'Lead (ms)',...GS,overlaying:'y',side:'right'},
-  },{responsive:true}).then(()=>{wl('c0','l0');wz('c0');});
-}
+  },PLOT_CONFIG).then(()=>{wl('c0','l0');wz('c0');});
+};
 
-{
+buildPlots[1] = () => {
   const oT=obs.map(o=>isNum(o.rel_s) ? o.rel_s : relTime(o.t));
   const rT=racket.map(r=>isNum(r.rel_s) ? r.rel_s : relTime(r.t));
   const tr=[];
   ['x','y','z'].forEach((k,i)=>{
     const ya=i===0?'y':`y${i+1}`;
-    tr.push({x:oT,y:obs.map(o=>o[k]),name:`Ball ${k.toUpperCase()}`,mode:'markers',
+    tr.push(g2({x:oT,y:obs.map(o=>o[k]),name:`Ball ${k.toUpperCase()}`,mode:'markers',
       marker:{color:'#7f8c8d',symbol:'circle',size:2,opacity:0.4},
       hovertemplate:`t=%{x:.3f}s<br>${k}=%{y:.3f} m<extra>Ball ${k.toUpperCase()}</extra>`,
-      yaxis:ya,xaxis:'x'});
+      yaxis:ya,xaxis:'x'}));
     if (racket.length) {
-      tr.push({x:rT,y:racket.map(r=>r[k]),name:`Racket ${k.toUpperCase()}`,mode:'markers',
+      tr.push(g2({x:rT,y:racket.map(r=>r[k]),name:`Racket ${k.toUpperCase()}`,mode:'markers',
         marker:{color:['#ff66cc','#ff33aa','#cc00ff'][i],symbol:'x',size:4},
         hovertemplate:`t=%{x:.3f}s<br>racket ${k}=%{y:.3f} m<extra>Racket</extra>`,
-        yaxis:ya,xaxis:'x'});
+        yaxis:ya,xaxis:'x'}));
     }
-    tr.push({x:s0.map(p=>relTime(p.ct)),y:s0.map(p=>p[k]),name:`S0 ${k.toUpperCase()}`,mode:'markers',
+    tr.push(g2({x:s0.map(p=>relTime(p.ct)),y:s0.map(p=>p[k]),name:`S0 ${k.toUpperCase()}`,mode:'markers',
       marker:{color:'#3498db',symbol:'triangle-up',size:4},
       hovertemplate:`t=%{x:.3f}s<br>pred ${k}=%{y:.3f} m<extra>S0</extra>`,
-      yaxis:ya,xaxis:'x'});
-    tr.push({x:s1.map(p=>relTime(p.ct)),y:s1.map(p=>p[k]),name:`S1 ${k.toUpperCase()}`,mode:'markers',
+      yaxis:ya,xaxis:'x'}));
+    tr.push(g2({x:s1.map(p=>relTime(p.ct)),y:s1.map(p=>p[k]),name:`S1 ${k.toUpperCase()}`,mode:'markers',
       marker:{color:'#e74c3c',symbol:'square',size:4,line:{width:0.5,color:'#fff'}},
       hovertemplate:`t=%{x:.3f}s<br>pred ${k}=%{y:.3f} m<extra>S1</extra>`,
-      yaxis:ya,xaxis:'x'});
+      yaxis:ya,xaxis:'x'}));
   });
-  tr.push({x:s0.map(p=>relTime(p.ct)),y:s0.map(p=>(p.ht-p.ct)*1000),name:'S0 lead',mode:'markers',
+  tr.push(g2({x:s0.map(p=>relTime(p.ct)),y:s0.map(p=>(p.ht-p.ct)*1000),name:'S0 lead',mode:'markers',
     marker:{color:'#9b59b6',symbol:'triangle-up',size:3},
     hovertemplate:'t=%{x:.3f}s<br>lead=%{y:.1f} ms<extra>S0</extra>',
-    yaxis:'y4',xaxis:'x'});
-  tr.push({x:s1.map(p=>relTime(p.ct)),y:s1.map(p=>(p.ht-p.ct)*1000),name:'S1 lead',mode:'markers',
+    yaxis:'y4',xaxis:'x'}));
+  tr.push(g2({x:s1.map(p=>relTime(p.ct)),y:s1.map(p=>(p.ht-p.ct)*1000),name:'S1 lead',mode:'markers',
     marker:{color:'#8e44ad',symbol:'square',size:3},
     hovertemplate:'t=%{x:.3f}s<br>lead=%{y:.1f} ms<extra>S1</extra>',
-    yaxis:'y4',xaxis:'x'});
+    yaxis:'y4',xaxis:'x'}));
 
   Plotly.newPlot('c1',tr,{
     ...DL,
@@ -399,10 +425,10 @@ const GS={gridcolor:'#0f3460',zerolinecolor:'#0f3460'};
     yaxis2:{title:'Y (m)',...GS,domain:[0.53,0.75]},
     yaxis3:{title:'Z (m)',...GS,domain:[0.28,0.50]},
     yaxis4:{title:'Lead (ms)',...GS,domain:[0.0,0.25]},
-  },{responsive:true}).then(()=>{wl('c1','l1');wz('c1');});
-}
+  },PLOT_CONFIG).then(()=>{wl('c1','l1');wz('c1');});
+};
 
-{
+buildPlots[2] = () => {
   Plotly.newPlot('c2',[
     {x:obs.map(o=>o.x),y:obs.map(o=>o.y),z:obs.map(o=>o.z),
      mode:'markers',type:'scatter3d',name:'Ball',
@@ -438,28 +464,29 @@ const GS={gridcolor:'#0f3460',zerolinecolor:'#0f3460'};
     scene:{xaxis:{title:'X(m)',...GS,backgroundcolor:'#16213e'},
            yaxis:{title:'Y(m)',...GS,backgroundcolor:'#16213e'},
            zaxis:{title:'Z(m)',...GS,backgroundcolor:'#16213e'},bgcolor:'#16213e'},
-  },{responsive:true}).then(()=>{wl('c2','l2');wz('c2');});
-}
+  },PLOT_CONFIG).then(()=>{wl('c2','l2');wz('c2');});
+};
 
-if(car.length > 0){
+buildPlots[3] = () => {
+  if(car.length <= 0) return;
   const cT=car.map(c=>relTime(c.t));
   const yawDeg=car.map(c=>c.yaw*180/Math.PI);
   const tr=[];
   ['x','y','z'].forEach((k,i)=>{
     const ya=i===0?'y':`y${i+1}`;
-    tr.push({x:cT,y:car.map(c=>c[k]),name:`Car ${k.toUpperCase()}`,mode:'markers',
+    tr.push(g2({x:cT,y:car.map(c=>c[k]),name:`Car ${k.toUpperCase()}`,mode:'markers',
       marker:{color:['#2ecc71','#27ae60','#f1c40f'][i],size:2},
       hovertemplate:`t=%{x:.3f}s<br>${k}=%{y:.3f} m<extra>Car ${k.toUpperCase()}</extra>`,
-      yaxis:ya,xaxis:'x'});
+      yaxis:ya,xaxis:'x'}));
   });
-  tr.push({x:cT,y:yawDeg,name:'Car Yaw',mode:'markers',
+  tr.push(g2({x:cT,y:yawDeg,name:'Car Yaw',mode:'markers',
     marker:{color:'#e94560',size:2},
     hovertemplate:'t=%{x:.3f}s<br>yaw=%{y:.1f}deg<extra>Car Yaw</extra>',
-    yaxis:'y4',xaxis:'x'});
-  tr.push({x:cT,y:car.map(c=>c.reprojection_error),name:'Reproj Err',mode:'markers',
+    yaxis:'y4',xaxis:'x'}));
+  tr.push(g2({x:cT,y:car.map(c=>c.reprojection_error),name:'Reproj Err',mode:'markers',
     marker:{color:'#e67e22',size:2},
     hovertemplate:'t=%{x:.3f}s<br>err=%{y:.2f} px<extra>Reproj</extra>',
-    yaxis:'y5',xaxis:'x'});
+    yaxis:'y5',xaxis:'x'}));
 
   Plotly.newPlot('c3',tr,{
     ...DL,
@@ -470,11 +497,12 @@ if(car.length > 0){
     yaxis3:{title:'Z (m)',...GS,domain:[0.42,0.59]},
     yaxis4:{title:'Yaw (deg)',...GS,domain:[0.22,0.39]},
     yaxis5:{title:'Reproj (px)',...GS,domain:[0.0,0.19]},
-  },{responsive:true}).then(()=>{wl('c3','l3');wz('c3');});
-}
+  },PLOT_CONFIG).then(()=>{wl('c3','l3');wz('c3');});
+};
 })();
 
 function sw(i){
+  ensurePlot(i);
   document.querySelectorAll('.tab').forEach((t,j)=>t.classList.toggle('on',j===i));
   document.querySelectorAll('.pnl').forEach((p,j)=>p.classList.toggle('on',j===i));
   window.dispatchEvent(new Event('resize'));
@@ -646,6 +674,7 @@ document.querySelectorAll('.zb').forEach(btn=>{
     else zxReset(id);
   });
 });
+ensurePlot(0);
 sap('c0');
 </script>
 </body>

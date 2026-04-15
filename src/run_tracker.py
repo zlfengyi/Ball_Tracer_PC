@@ -248,6 +248,45 @@ class WriteJob:
     car_loc: Optional[CarLoc] = None
 
 
+@dataclass
+class CarLocJob:
+    frame_idx: int
+    exposure_pc: float
+    elapsed_s: float | None
+    images: dict[str, np.ndarray]
+
+
+@dataclass
+class CarLocResult:
+    frame_idx: int
+    exposure_pc: float
+    elapsed_s: float | None
+    car_loc: Optional[CarLoc]
+
+
+def _submit_latest_car_loc_job(
+    job_queue: queue.Queue[CarLocJob | None],
+    frame_entry_by_idx: dict[int, dict],
+    job: CarLocJob,
+) -> int:
+    dropped = 0
+    while True:
+        try:
+            job_queue.put_nowait(job)
+            return dropped
+        except queue.Full:
+            try:
+                stale = job_queue.get_nowait()
+            except queue.Empty:
+                continue
+            if stale is None:
+                raise RuntimeError("car_loc queue entered shutdown while submitting")
+            frame_entry = frame_entry_by_idx.get(stale.frame_idx)
+            if frame_entry is not None and frame_entry.get("car_loc_status") == "pending":
+                frame_entry["car_loc_status"] = "dropped"
+            dropped += 1
+
+
 class NullRos2Sink:
     mode = "off"
 
@@ -448,6 +487,11 @@ class PcEventLoggerProcess:
     def was_started(self) -> bool:
         return self._proc is not None
 
+    def returncode(self) -> int | None:
+        if self._proc is None:
+            return None
+        return self._proc.poll()
+
     def wait_until_ready(self, timeout_sec: float) -> bool:
         if self._proc is None:
             return False
@@ -580,7 +624,8 @@ class DirectRos2Sink:
         self._executor.shutdown()
         self._executor.remove_node(self._node)
         self._node.destroy_node()
-        self._rclpy.shutdown()
+        if self._rclpy.ok():
+            self._rclpy.shutdown()
         print("  ROS2 直连已关闭")
 
 
@@ -1473,9 +1518,10 @@ def main() -> int:
     ]
     car_loc_cfg = tracker_cfg.get("car_localizer", {})
     car_loc_enabled = car_loc_cfg.get("enabled", True)
-    car_loc_active_interval_s = car_loc_cfg.get("active_interval_s", 0.1)
-    car_loc_idle_interval_s = car_loc_cfg.get("idle_interval_s", 0.5)
-    car_loc_idle_after_misses = car_loc_cfg.get("idle_after_misses", 3)
+    car_loc_sample_every_frames = max(
+        int(car_loc_cfg.get("sample_every_frames", 3)),
+        1,
+    )
     video_output_cfg = tracker_cfg.get("video_output", {})
     video_output_codec = _normalize_video_codec(
         video_output_cfg.get("codec", "avc1")
@@ -1579,10 +1625,8 @@ def main() -> int:
             f"{_format_xyz_m(*car_localizer.apriltag_to_car_base_offset_m)}"
         )
         print(
-            "  小车定位节流: "
-            f"active_interval={car_loc_active_interval_s:.2f}s, "
-            f"idle_interval={car_loc_idle_interval_s:.2f}s, "
-            f"idle_after_misses={car_loc_idle_after_misses}"
+            "  小车定位采样: "
+            f"every {car_loc_sample_every_frames} frame(s)"
         )
     else:
         print("  小车定位: disabled")
@@ -1608,25 +1652,32 @@ def main() -> int:
         if _pc_logger_proc.is_running():
             ready = _pc_logger_proc.wait_until_ready(pc_logger_startup_wait_sec)
             if not ready:
-                print(
-                    "  pc logger 就绪等待超时，继续运行；初始配置由命令行参数提供"
+                if _pc_logger_proc.is_running():
+                    print(
+                        "  pc logger 就绪等待超时，继续运行；初始配置由命令行参数提供"
+                    )
+                else:
+                    print(
+                        "  pc logger 启动失败，进程在就绪前退出"
+                        f" (returncode={_pc_logger_proc.returncode()})"
+                    )
+            if _pc_logger_proc.is_running():
+                _publish_logger_control(
+                    _ros2_sink,
+                    build_logger_control_payload(
+                        "new_file",
+                        reason="tracker_start",
+                        command_id=f"{run_id}-new-file",
+                        run_id=run_id,
+                        group_id=group_id,
+                        target_path=pc_logger_path,
+                        tracker_output_dir=output_dir,
+                        tracker_json_path=json_path,
+                        tracker_video_path=None if args.no_video else video_path,
+                    ),
+                    repeat=3,
+                    interval_s=0.2,
                 )
-            _publish_logger_control(
-                _ros2_sink,
-                build_logger_control_payload(
-                    "new_file",
-                    reason="tracker_start",
-                    command_id=f"{run_id}-new-file",
-                    run_id=run_id,
-                    group_id=group_id,
-                    target_path=pc_logger_path,
-                    tracker_output_dir=output_dir,
-                    tracker_json_path=json_path,
-                    tracker_video_path=None if args.no_video else video_path,
-                ),
-                repeat=3,
-                interval_s=0.2,
-            )
     elif not save_logs:
         print("  pc logger 已禁用：--no-log")
     elif args.ros2_mode == "off":
@@ -1635,7 +1686,11 @@ def main() -> int:
     log_observations: list[dict] = []
     log_predictions: list[dict] = []
     log_car_locs: list[dict] = []
+    car_loc_sampled_frames = 0
+    car_loc_missed_frames = 0
+    car_loc_dropped_frames = 0
     log_frames: list[dict] = []
+    frame_entry_by_idx: dict[int, dict] = {}
     log_state_transitions: list[dict] = []
     capture_fps = 0.0
 
@@ -1809,53 +1864,33 @@ def main() -> int:
         from concurrent.futures import ThreadPoolExecutor
         _decode_pool = ThreadPoolExecutor(max_workers=len(cam_serials))
 
-        # ── 小车定位后台线程（不阻塞主循环）──
-        _car_lock = threading.Lock()
-        _car_latest: CarLoc | None = None
-        _car_images: dict[str, np.ndarray] | None = None
-        _car_event = threading.Event()
-        _car_stop = threading.Event()
+        # ── 小车定位后台线程（结果严格绑定源帧，不允许复用到后续帧）──
+        _car_job_queue: queue.Queue[CarLocJob | None] | None = None
+        _car_result_queue: queue.Queue[CarLocResult] | None = None
+        _car_thread: threading.Thread | None = None
+        if car_localizer is not None:
+            _car_job_queue = queue.Queue(maxsize=1)
+            _car_result_queue = queue.Queue()
 
-        def _car_worker():
-            nonlocal _car_latest
-            miss_count = 0
-            next_attempt_t = 0.0
-            while not _car_stop.is_set():
-                _car_event.wait(timeout=0.5)
-                if _car_stop.is_set():
-                    break
-                _car_event.clear()
-                if car_localizer is None:
-                    continue
-
-                now_t = time.perf_counter()
-                if now_t < next_attempt_t:
-                    continue
-
-                with _car_lock:
-                    imgs = _car_images
-                if imgs is None:
-                    continue
-
-                t_car = time.perf_counter()
-                result = car_localizer.locate(imgs, t=t_car)
-                if result is None:
-                    miss_count += 1
-                    interval_s = (
-                        car_loc_idle_interval_s
-                        if miss_count >= car_loc_idle_after_misses
-                        else car_loc_active_interval_s
+            def _car_worker():
+                while True:
+                    job = _car_job_queue.get()
+                    if job is None:
+                        break
+                    _car_result_queue.put(
+                        CarLocResult(
+                            frame_idx=job.frame_idx,
+                            exposure_pc=job.exposure_pc,
+                            elapsed_s=job.elapsed_s,
+                            car_loc=car_localizer.locate(
+                                job.images,
+                                t=job.exposure_pc,
+                            ),
+                        )
                     )
-                else:
-                    miss_count = 0
-                    interval_s = car_loc_active_interval_s
 
-                next_attempt_t = time.perf_counter() + max(interval_s, 0.0)
-                with _car_lock:
-                    _car_latest = result
-
-        _car_thread = threading.Thread(target=_car_worker, daemon=True)
-        _car_thread.start()
+            _car_thread = threading.Thread(target=_car_worker, daemon=True)
+            _car_thread.start()
 
         # ── 信号处理（确保被终止时也能保存数据）──
         _shutdown = threading.Event()
@@ -1869,6 +1904,73 @@ def main() -> int:
         signal.signal(signal.SIGTERM, _signal_handler)
         if hasattr(signal, 'SIGBREAK'):
             signal.signal(signal.SIGBREAK, _signal_handler)
+
+        def _apply_car_loc_result(car_result: CarLocResult) -> None:
+            nonlocal car_loc_missed_frames
+            frame_entry = frame_entry_by_idx.get(car_result.frame_idx)
+            if frame_entry is None:
+                raise RuntimeError(
+                    f"missing frame_entry for car_loc frame_idx={car_result.frame_idx}"
+                )
+
+            car_loc = car_result.car_loc
+            if car_loc is None:
+                frame_entry["car_loc_status"] = "miss"
+                car_loc_missed_frames += 1
+                return
+
+            frame_entry["car_loc_status"] = "hit"
+            frame_entry["car_loc"] = {
+                "x": round(car_loc.x, 4),
+                "y": round(car_loc.y, 4),
+                "z": round(car_loc.z, 4),
+                "yaw": round(car_loc.yaw, 4),
+                "t": car_result.exposure_pc,
+                "elapsed_s": round(car_result.elapsed_s, 3)
+                if car_result.elapsed_s is not None else None,
+                "tag_id": car_loc.tag_id,
+                "reference": "car_base",
+                "cameras_used": car_loc.cameras_used,
+                "pixels": {
+                    sn: [round(u), round(v)]
+                    for sn, (u, v) in car_loc.pixels.items()
+                },
+            }
+
+            log_car_locs.append({
+                "frame_idx": car_result.frame_idx,
+                "x": round(car_loc.x, 4),
+                "y": round(car_loc.y, 4),
+                "z": round(car_loc.z, 4),
+                "yaw": round(car_loc.yaw, 4),
+                "t": car_result.exposure_pc,
+                "elapsed_s": round(car_result.elapsed_s, 3)
+                if car_result.elapsed_s is not None else None,
+                "tag_id": car_loc.tag_id,
+                "reference": "car_base",
+                "cameras_used": car_loc.cameras_used,
+                "reprojection_error": round(car_loc.reprojection_error, 2),
+            })
+
+            _ros2_sink.publish_car_loc({
+                "topic": "car_loc",
+                "x": round(car_loc.x, 4),
+                "y": round(car_loc.y, 4),
+                "z": round(car_loc.z, 4),
+                "yaw": round(car_loc.yaw, 4),
+                "t": round(car_result.exposure_pc, 6),
+                "tag_id": car_loc.tag_id,
+            })
+
+        def _drain_car_loc_results() -> None:
+            if _car_result_queue is None:
+                return
+            while True:
+                try:
+                    car_result = _car_result_queue.get_nowait()
+                except queue.Empty:
+                    break
+                _apply_car_loc_result(car_result)
 
         # ── 主循环 ────────────────────────────────────────────────────
         frame_idx = 0
@@ -2026,37 +2128,16 @@ def main() -> int:
                     })
                     prev_state = tracker_result.state
 
-                # ── 小车 AprilTag 定位（后台线程异步执行）──
-                with _car_lock:
-                    _car_images = images
-                    car_loc = _car_latest
-                _car_event.set()
+                frame_elapsed_s = (
+                    exposure_pc - first_frame_exposure_pc
+                    if first_frame_exposure_pc is not None else None
+                )
+                car_loc_sampled = (
+                    car_localizer is not None
+                    and (frame_idx % car_loc_sample_every_frames) == 0
+                )
+                car_loc = None
 
-                if car_loc is not None:
-                    log_car_locs.append({
-                        "x": round(car_loc.x, 4),
-                        "y": round(car_loc.y, 4),
-                        "z": round(car_loc.z, 4),
-                        "yaw": round(car_loc.yaw, 4),
-                        "t": car_loc.t,
-                        "tag_id": car_loc.tag_id,
-                        "reference": "car_base",
-                        "cameras_used": car_loc.cameras_used,
-                        "reprojection_error": round(
-                            car_loc.reprojection_error, 2),
-                    })
-
-                # ── UDP 发送给 ROS2 桥接 ──
-                if car_loc is not None:
-                    _ros2_sink.publish_car_loc({
-                        "topic": "car_loc",
-                        "x": round(car_loc.x, 4),
-                        "y": round(car_loc.y, 4),
-                        "z": round(car_loc.z, 4),
-                        "yaw": round(car_loc.yaw, 4),
-                        "t": round(car_loc.t, 6),
-                        "tag_id": car_loc.tag_id,
-                    })
                 if tracker_result.prediction is not None:
                     p = tracker_result.prediction
                     _ros2_sink.publish_predict_hit({
@@ -2076,10 +2157,7 @@ def main() -> int:
                         detections=all_detections,
                         serials=cam_serials,
                         exposure_perf=exposure_pc,
-                        elapsed_s=(
-                            exposure_pc - first_frame_exposure_pc
-                            if first_frame_exposure_pc is not None else None
-                        ),
+                        elapsed_s=frame_elapsed_s,
                         ball3d=ball3d,
                         tracker_result=tracker_result,
                         frame_idx=frame_idx,
@@ -2092,13 +2170,17 @@ def main() -> int:
                 frame_entry = {
                     "idx": frame_idx,
                     "exposure_pc": exposure_pc,
-                    "elapsed_s": round(
-                        exposure_pc - first_frame_exposure_pc, 3
-                    ) if first_frame_exposure_pc is not None else None,
+                    "elapsed_s": round(frame_elapsed_s, 3)
+                    if frame_elapsed_s is not None else None,
                     "has_3d": ball3d is not None,
                     "state": tracker_result.state.value,
                     "latency_ms": round(latency_ms, 1),
                 }
+                if car_localizer is not None:
+                    frame_entry["car_loc_sampled"] = car_loc_sampled
+                    frame_entry["car_loc_status"] = (
+                        "pending" if car_loc_sampled else "skipped"
+                    )
                 # 检测框（含 bbox）
                 frame_dets = {}
                 frame_det_counts = {}
@@ -2148,20 +2230,23 @@ def main() -> int:
                         "stage": pred.stage,
                         "lead_ms": round((pred.ht - pred.ct) * 1000),
                     }
-                # 小车位置
-                if car_loc is not None:
-                    frame_entry["car_loc"] = {
-                        "x": round(car_loc.x, 4),
-                        "y": round(car_loc.y, 4),
-                        "z": round(car_loc.z, 4),
-                        "yaw": round(car_loc.yaw, 4),
-                        "tag_id": car_loc.tag_id,
-                        "reference": "car_base",
-                        "cameras_used": car_loc.cameras_used,
-                        "pixels": {sn: [round(u), round(v)]
-                                   for sn, (u, v) in car_loc.pixels.items()},
-                    }
                 log_frames.append(frame_entry)
+                frame_entry_by_idx[frame_idx] = frame_entry
+                if car_loc_sampled:
+                    if _car_job_queue is None:
+                        raise RuntimeError("car_loc job queue is not initialized")
+                    car_loc_sampled_frames += 1
+                    car_loc_dropped_frames += _submit_latest_car_loc_job(
+                        _car_job_queue,
+                        frame_entry_by_idx,
+                        CarLocJob(
+                            frame_idx=frame_idx,
+                            exposure_pc=exposure_pc,
+                            elapsed_s=frame_elapsed_s,
+                            images={sn: img.copy() for sn, img in images.items()},
+                        ),
+                    )
+                _drain_car_loc_results()
                 _t_other_sum += time.perf_counter() - _t2
 
                 frame_idx += 1
@@ -2205,9 +2290,13 @@ def main() -> int:
             writer_stats = writer_thread.stats()
 
     # ── 关闭小车定位线程 ──
-    _car_stop.set()
-    _car_event.set()
-    _car_thread.join(timeout=2.0)
+    if _car_job_queue is not None:
+        _car_job_queue.put(None)
+    if _car_thread is not None:
+        _car_thread.join(timeout=10.0)
+        if _car_thread.is_alive():
+            raise RuntimeError("car_loc worker did not finish before shutdown")
+    _drain_car_loc_results()
 
     # ── 关闭 ROS2 桥接子进程 ──
     if _pc_logger_proc is not None and _pc_logger_proc.is_running():
@@ -2311,9 +2400,7 @@ def main() -> int:
             },
             "car_localizer": {
                 "enabled": car_loc_enabled,
-                "active_interval_s": car_loc_active_interval_s,
-                "idle_interval_s": car_loc_idle_interval_s,
-                "idle_after_misses": car_loc_idle_after_misses,
+                "sample_every_frames": car_loc_sample_every_frames,
                 "position_reference": "car_base",
                 "apriltag_center_to_car_base_offset_m": (
                     [round(v, 4) for v in car_localizer.apriltag_to_car_base_offset_m]
@@ -2391,6 +2478,9 @@ def main() -> int:
             "observations_3d": len(log_observations),
             "predictions": len(log_predictions),
             "car_locs": len(log_car_locs),
+            "car_loc_sampled_frames": car_loc_sampled_frames,
+            "car_loc_misses": car_loc_missed_frames,
+            "car_loc_dropped_frames": car_loc_dropped_frames,
             "state_transitions": len(log_state_transitions),
             "reset_times": tracker.reset_times,
             "video_frames_dropped": drop_count,
@@ -2433,7 +2523,13 @@ def main() -> int:
     print(f"  实际帧率:   {frame_idx / elapsed if elapsed > 0 else 0:.1f} fps")
     print(f"  3D 观测:    {len(log_observations)}")
     print(f"  预测数:     {len(log_predictions)}")
-    print(f"  小车定位:   {len(log_car_locs)}")
+    print(
+        "  小车定位:   "
+        f"hits={len(log_car_locs)}  "
+        f"sampled={car_loc_sampled_frames}  "
+        f"misses={car_loc_missed_frames}  "
+        f"dropped={car_loc_dropped_frames}"
+    )
     print(f"  状态转换:   {len(log_state_transitions)}")
     print(f"  超时次数:   {timeout_count}")
     print(f"  延迟(ms):   avg={lat_avg:.0f}  min={lat_min:.0f}  max={lat_max:.0f}")
@@ -2463,7 +2559,13 @@ def main() -> int:
     if save_logs:
         print(f"  JSON:       {json_path}")
         if _pc_logger_proc is not None and _pc_logger_proc.was_started():
-            print(f"  PC Logger:  {pc_logger_path}")
+            if pc_logger_path.exists():
+                print(f"  PC Logger:  {pc_logger_path}")
+            else:
+                print(
+                    "  PC Logger:  missing"
+                    f" (target={pc_logger_path})"
+                )
         if "html" in generated_artifacts:
             print(f"  HTML:       {generated_artifacts['html']}")
         if "annotated_video" in generated_artifacts:
