@@ -56,6 +56,12 @@ class ArmPoePositionModel:
             vehicle_cfg.get("apriltag_center_to_car_base_offset_mm", [0.0, 0.0, 0.0]),
             dtype=np.float64,
         ).reshape(3)
+        z_correction_cfg = cfg.get("z_axis_correction")
+        self._z_offset_base_mm = 0.0
+        if isinstance(z_correction_cfg, dict) and z_correction_cfg.get("enabled", True):
+            value = z_correction_cfg.get("offset_base_mm")
+            if isinstance(value, (int, float)):
+                self._z_offset_base_mm = float(value)
         self._axes: list[PoeAxis] = []
         for axis_cfg in poe_cfg["space_axes_base"]:
             self._axes.append(
@@ -114,6 +120,10 @@ class ArmPoePositionModel:
     def apriltag_to_car_base_offset_mm(self) -> np.ndarray:
         return self._apriltag_to_car_base_offset_mm.copy()
 
+    @property
+    def z_offset_base_mm(self) -> float:
+        return float(self._z_offset_base_mm)
+
     def extract_joint_vector(
         self,
         joint_names: Sequence[str],
@@ -144,7 +154,11 @@ class ArmPoePositionModel:
             [self._home_point_base[0], self._home_point_base[1], self._home_point_base[2], 1.0],
             dtype=np.float64,
         )
-        return ph[:3]
+        point_base = ph[:3]
+        if self._z_offset_base_mm != 0.0:
+            point_base = point_base.copy()
+            point_base[2] += self._z_offset_base_mm
+        return point_base
 
     def forward_world(self, joint_values_rad: Sequence[float]) -> np.ndarray:
         point_base = self.forward_base(joint_values_rad)

@@ -32,6 +32,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import signal
 import datetime
 import json
@@ -1152,13 +1153,16 @@ def _resolve_engine_batch(
     n_ball_detect_cams: int,
     n_cams: int,
 ) -> int:
+    last_error: Exception | None = None
+    warmup_shape = getattr(warmup_img, "shape", None)
+    warmup_dtype = getattr(warmup_img, "dtype", None)
     fixed_engine_batch = _infer_engine_batch_from_model_path(detector.model_path)
     if fixed_engine_batch is not None and fixed_engine_batch >= 1:
         try:
             detector.detect_batch([warmup_img] * fixed_engine_batch)
             return fixed_engine_batch
-        except Exception:
-            pass
+        except Exception as exc:
+            last_error = exc
 
     try_batches: list[int] = []
     for try_batch in [n_ball_detect_cams, n_cams, n_ball_detect_cams - 1, 2, 1]:
@@ -1168,10 +1172,22 @@ def _resolve_engine_batch(
         try:
             detector.detect_batch([warmup_img] * try_batch)
             return try_batch
-        except Exception:
+        except Exception as exc:
+            last_error = exc
             continue
 
-    return 0
+    if last_error is not None:
+        raise RuntimeError(
+            "detector warmup failed for all candidate batch sizes "
+            f"{try_batches} on {detector.model_path.name} "
+            f"(shape={warmup_shape}, dtype={warmup_dtype}): {last_error}"
+        ) from last_error
+
+    raise RuntimeError(
+        "detector warmup failed before trying any TensorRT batch size "
+        f"for {detector.model_path.name} "
+        f"(shape={warmup_shape}, dtype={warmup_dtype})"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1635,6 +1651,27 @@ def main() -> int:
     _ros2_sink = _create_ros2_sink(args.ros2_mode)
     _time_sync_proc = _create_time_sync_process(args.ros2_mode)
     _pc_logger_proc: PcEventLoggerProcess | None = None
+    _sidecars_closed = False
+    _sidecar_lock = threading.Lock()
+
+    def _close_sidecars(*, pc_logger_timeout_sec: float) -> None:
+        nonlocal _sidecars_closed
+        with _sidecar_lock:
+            if _sidecars_closed:
+                return
+            _sidecars_closed = True
+        try:
+            if _pc_logger_proc is not None:
+                _pc_logger_proc.close(timeout_sec=pc_logger_timeout_sec)
+        except Exception:
+            pass
+        try:
+            if _time_sync_proc is not None:
+                _time_sync_proc.close()
+        except Exception:
+            pass
+
+    atexit.register(lambda: _close_sidecars(pc_logger_timeout_sec=0.5))
     if pc_logger_enabled and args.ros2_mode != "off":
         _pc_logger_proc = PcEventLoggerProcess(
             target_path=pc_logger_path,
@@ -2332,10 +2369,10 @@ def main() -> int:
             repeat=2,
             interval_s=0.1,
         )
-        _pc_logger_proc.close(timeout_sec=5.0)
-    _ros2_sink.close()
-    if _time_sync_proc is not None:
-        _time_sync_proc.close()
+    try:
+        _ros2_sink.close()
+    finally:
+        _close_sidecars(pc_logger_timeout_sec=5.0)
 
     total_elapsed = time.perf_counter() - t_start
     elapsed = processing_elapsed

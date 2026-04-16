@@ -465,5 +465,24 @@
         "q5": -0.05445869983956353
       }
     ]
+  },
+  "z_axis_correction": {
+    "enabled": true,
+    "type": "tracker_constant_offset_base_z",
+    "offset_base_mm": -26.717045370454663,
+    "written_at": "2026-04-15T23:30:02",
+    "source_runs": [
+      "tracker_20260407_175402",
+      "tracker_20260407_105426",
+      "tracker_20260404_023557",
+      "tracker_20260404_002300"
+    ],
+    "sample_count": 7205,
+    "source_result": "ArmCalibration\\data\\008_tracker_z_correction_04152329\\tracker_z_correction_result.json",
+    "note": "z-only correction fitted from high-quality tracker vision vs POE samples; x/y remain unchanged.",
+    "filters": {
+      "max_joint_delta_s": 0.08,
+      "max_racket_reproj_px": 10.0
+    }
   }
 }

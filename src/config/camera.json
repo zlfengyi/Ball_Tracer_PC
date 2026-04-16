@@ -4,6 +4,7 @@
     "fps": 35.0,
     "exposure_us": 1800.0,
     "gain_db": 23.5,
+    "pixel_format": "BayerRG8",
     "master_min_bandwidth": false,
     "recalib_every": 2100
 }

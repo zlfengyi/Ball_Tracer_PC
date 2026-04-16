@@ -198,7 +198,7 @@ def calibrate_time_offset(cam: Any) -> float:
 
 
 def frame_to_numpy(frame: Frame, *, rotate_180: Optional[bool] = None):
-    """将 Frame 转为 numpy BGR / 灰度图像。默认做 180° 旋转，支持 Mono8、BayerXX8、RGB8、BGR8。"""
+    """将 Frame 转为 numpy BGR 图像。默认做 180° 旋转，支持 Mono8、BayerXX8、RGB8、BGR8。"""
     import cv2
     import numpy as np
 
@@ -211,7 +211,9 @@ def frame_to_numpy(frame: Frame, *, rotate_180: Optional[bool] = None):
     # Mono8
     if pt == PixelType_Gvsp_Mono8:
         img = np.frombuffer(frame.data, dtype=np.uint8, count=w * h).reshape(h, w)
-        return cv2.rotate(img, cv2.ROTATE_180) if rotate_180 else img
+        if rotate_180:
+            img = cv2.rotate(img, cv2.ROTATE_180)
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
 
     # BGR8 — 直接 reshape
     if pt == PixelType_Gvsp_BGR8_Packed:
