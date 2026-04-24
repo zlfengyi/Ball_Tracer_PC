@@ -7,6 +7,7 @@ import json
 import math
 import re
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,7 +25,10 @@ from src.arm_poe import ArmPoePositionModel
 from test_src.generate_curve3_html import HTML_TEMPLATE, _merge_racket_json
 
 
-DEFAULT_TRACKER_OUTPUT_DIR = _ROOT / "tracker_output"
+DEFAULT_TRACKER_OUTPUT_DIRS: tuple[Path, ...] = (
+    Path("D:/tennis-man/data"),
+    Path("D:/tennis-man/ball_tracer_pc/tracker_output"),
+)
 DEFAULT_POE_CONFIG_PATH = _ROOT / "src" / "config" / "arm_poe_racket_center.json"
 _RUN_RE = re.compile(r"^(tracker_\d{8}_\d{6})(.*)$")
 _MAX_ARM_POINTS = 4000
@@ -38,6 +42,7 @@ class RunArtifacts:
     tracker_video: Path | None = None
     pc_logger_json: Path | None = None
     pc_logger_ready: Path | None = None
+    curve4_json: Path | None = None
     extra_jsons: list[Path] = field(default_factory=list)
     extra_htmls: list[Path] = field(default_factory=list)
     extra_videos: list[Path] = field(default_factory=list)
@@ -60,6 +65,7 @@ class RunArtifacts:
             self.tracker_video,
             self.pc_logger_json,
             self.pc_logger_ready,
+            self.curve4_json,
         ):
             if item is not None:
                 paths.append(item)
@@ -319,6 +325,7 @@ def _extract_tracker_racket_series(
 
 
 def _safe_child(root: Path, name: str) -> Path | None:
+    """Resolve `name` (may contain '/') under `root`, rejecting escapes."""
     candidate = (root / name).resolve()
     try:
         candidate.relative_to(root.resolve())
@@ -327,34 +334,67 @@ def _safe_child(root: Path, name: str) -> Path | None:
     return candidate
 
 
-def _scan_runs(root: Path) -> list[RunArtifacts]:
+_RUN_DIR_RE = re.compile(r"^tracker_\d{8}_\d{6}$")
+
+
+def _assign_file_to_record(record: RunArtifacts, path: Path, suffix: str) -> None:
+    record.all_files.append(path)
+    if suffix == ".json":
+        record.tracker_json = path
+    elif suffix == ".html":
+        record.tracker_html = path
+    elif suffix == ".avi":
+        record.tracker_video = path
+    elif suffix == "_pc_logger.json":
+        record.pc_logger_json = path
+    elif suffix == "_pc_logger.ready":
+        record.pc_logger_ready = path
+    elif suffix == "_curve4.json":
+        record.curve4_json = path
+    elif path.suffix.lower() == ".json":
+        record.extra_jsons.append(path)
+    elif path.suffix.lower() == ".html":
+        record.extra_htmls.append(path)
+    elif path.suffix.lower() in {".avi", ".mp4"}:
+        record.extra_videos.append(path)
+
+
+def _scan_runs(roots: Iterable[Path]) -> list[RunArtifacts]:
+    """Scan one or more `roots` for tracker runs.
+
+    Within each root two layouts are supported simultaneously:
+      A. Flat: all `tracker_<stem><suffix>` files live directly under the root.
+      B. Nested: each run has its own subdir `<root>/tracker_<stem>/` that
+         contains all its artifacts.
+    Runs that share the same stem across roots are merged into one record.
+    """
     by_stem: dict[str, RunArtifacts] = {}
-    for path in root.iterdir():
-        if not path.is_file():
+
+    for root in roots:
+        if not root.is_dir():
             continue
-        match = _RUN_RE.match(path.name)
-        if match is None:
-            continue
-        stem = match.group(1)
-        suffix = match.group(2)
-        record = by_stem.setdefault(stem, RunArtifacts(stem=stem))
-        record.all_files.append(path)
-        if suffix == ".json":
-            record.tracker_json = path
-        elif suffix == ".html":
-            record.tracker_html = path
-        elif suffix == ".avi":
-            record.tracker_video = path
-        elif suffix == "_pc_logger.json":
-            record.pc_logger_json = path
-        elif suffix == "_pc_logger.ready":
-            record.pc_logger_ready = path
-        elif path.suffix.lower() == ".json":
-            record.extra_jsons.append(path)
-        elif path.suffix.lower() == ".html":
-            record.extra_htmls.append(path)
-        elif path.suffix.lower() in {".avi", ".mp4"}:
-            record.extra_videos.append(path)
+        for path in root.iterdir():
+            if path.is_file():
+                match = _RUN_RE.match(path.name)
+                if match is None:
+                    continue
+                stem = match.group(1)
+                suffix = match.group(2)
+                record = by_stem.setdefault(stem, RunArtifacts(stem=stem))
+                _assign_file_to_record(record, path, suffix)
+            elif path.is_dir():
+                if not _RUN_DIR_RE.match(path.name):
+                    continue
+                stem = path.name
+                record = by_stem.setdefault(stem, RunArtifacts(stem=stem))
+                for child in path.iterdir():
+                    if not child.is_file():
+                        continue
+                    match = _RUN_RE.match(child.name)
+                    if match is None or match.group(1) != stem:
+                        continue
+                    _assign_file_to_record(record, child, match.group(2))
+
     runs = [run for run in by_stem.values() if run.tracker_json is not None or run.tracker_html is not None]
     return sorted(runs, key=lambda item: item.latest_mtime_ns(), reverse=True)
 
@@ -365,11 +405,15 @@ class TrackerReportServer(ThreadingHTTPServer):
         server_address: tuple[str, int],
         handler_class: type[BaseHTTPRequestHandler],
         *,
-        tracker_output_dir: Path,
+        tracker_output_dirs: Iterable[Path],
         poe_config_path: Path,
     ) -> None:
         super().__init__(server_address, handler_class)
-        self.tracker_output_dir = Path(tracker_output_dir).resolve()
+        self.tracker_output_dirs: tuple[Path, ...] = tuple(
+            Path(p).resolve() for p in tracker_output_dirs
+        )
+        if not self.tracker_output_dirs:
+            raise ValueError("tracker_output_dirs must contain at least one path")
         self.poe_config_path = Path(poe_config_path).resolve()
         self._cache_lock = Lock()
         self._json_cache: dict[tuple[str, int, int], dict] = {}
@@ -396,7 +440,7 @@ class TrackerReportServer(ThreadingHTTPServer):
         return payload
 
     def list_runs(self) -> list[RunArtifacts]:
-        return _scan_runs(self.tracker_output_dir)
+        return _scan_runs(self.tracker_output_dirs)
 
     def get_run(self, stem: str) -> RunArtifacts | None:
         for run in self.list_runs():
@@ -404,7 +448,15 @@ class TrackerReportServer(ThreadingHTTPServer):
                 return run
         return None
 
-    def choose_tracker_payload(self, run: RunArtifacts) -> tuple[dict | None, str, list[Path]]:
+    def choose_tracker_payload(
+        self,
+        run: RunArtifacts,
+        *,
+        source: str = "default",
+    ) -> tuple[dict | None, str, list[Path]]:
+        if source == "curve4" and run.curve4_json is not None and run.curve4_json.exists():
+            return self.load_json(run.curve4_json), run.curve4_json.name, [run.curve4_json]
+
         if run.tracker_json is None and run.extra_jsons:
             preferred = sorted(run.extra_jsons, key=lambda item: item.stat().st_mtime_ns, reverse=True)[0]
             return self.load_json(preferred), preferred.name, [preferred]
@@ -1072,7 +1124,14 @@ class TrackerReportHandler(BaseHTTPRequestHandler):
             self._serve_run(unquote(route.removeprefix("/run/")))
             return
         if route.startswith("/tracker-view/"):
-            self._serve_tracker_view(unquote(route.removeprefix("/tracker-view/")))
+            from urllib.parse import parse_qs
+            query = parse_qs(parsed.query or "")
+            source_values = query.get("source", [])
+            source = source_values[0] if source_values else "default"
+            self._serve_tracker_view(
+                unquote(route.removeprefix("/tracker-view/")),
+                source=source,
+            )
             return
         if route.startswith("/artifact/"):
             self._serve_artifact(unquote(route.removeprefix("/artifact/")))
@@ -1103,6 +1162,14 @@ class TrackerReportHandler(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
 
     def _artifact_url(self, path: Path) -> str:
+        path_resolved = path.resolve()
+        for root in self.server.tracker_output_dirs:
+            try:
+                rel = path_resolved.relative_to(root)
+            except ValueError:
+                continue
+            parts = [quote(part) for part in rel.parts]
+            return "/artifact/" + "/".join(parts)
         return f"/artifact/{quote(path.name)}"
 
     def _run_rows_html(self, runs: list[RunArtifacts]) -> str:
@@ -1118,6 +1185,8 @@ class TrackerReportHandler(BaseHTTPRequestHandler):
             summary_bits = []
             if run.pc_logger_json is not None:
                 summary_bits.append("pc_logger")
+            if run.curve4_json is not None:
+                summary_bits.append("curve4")
             if any(path.name.endswith("_with_racket.json") for path in run.extra_jsons):
                 summary_bits.append("with_racket")
             elif any(path.name.endswith("_racket.json") for path in run.extra_jsons):
@@ -1186,7 +1255,7 @@ class TrackerReportHandler(BaseHTTPRequestHandler):
     <div class="hero">
       <h1>Tracker Unified Report Server</h1>
       <p class="muted">选择一个 tracker run，页面会自动聚合同名的 base tracker JSON/HTML、pc logger JSON，以及后续标注生成的 <code>*_racket.json</code> / <code>*_with_racket.json</code> 等伴随文件。</p>
-      <p class="muted">tracker_output: <code>{html.escape(str(self.server.tracker_output_dir))}</code></p>
+      <p class="muted">tracker_output: {" ".join(f"<code>{html.escape(str(p))}</code>" for p in self.server.tracker_output_dirs)}</p>
       <p class="muted">POE config: <code>{html.escape(str(self.server.poe_config_path))}</code></p>
     </div>
     <div class="card">
@@ -1318,9 +1387,44 @@ class TrackerReportHandler(BaseHTTPRequestHandler):
       <div class="card">
         <div class="section-title">
           <h2>Tracker Viewer</h2>
-          <div class="tiny">source: <code>{html.escape(arm_report["tracker_source_label"])}</code></div>
+          <div class="tiny">source: <code id="tracker-source-label">{html.escape(arm_report["tracker_source_label"])}</code></div>
         </div>
-        <iframe src="/tracker-view/{quote(stem)}" loading="eager"></iframe>
+        <div class="trace-controls" style="margin-bottom:12px">
+          <button type="button" class="trace-toggle" id="src-btn-default" data-source="default">curve3 (base)</button>
+          <button type="button" class="trace-toggle{(' off' if run.curve4_json is None else '')}" id="src-btn-curve4" data-source="curve4"{(' disabled' if run.curve4_json is None else '')}>curve4 (drag replay)</button>
+        </div>
+        <iframe id="tracker-view-frame" src="/tracker-view/{quote(stem)}" loading="eager"></iframe>
+        <script>
+          (function() {{
+            const frame = document.getElementById('tracker-view-frame');
+            const label = document.getElementById('tracker-source-label');
+            const defaultLabel = {json.dumps(arm_report["tracker_source_label"])};
+            const curve4Available = {('true' if run.curve4_json is not None else 'false')};
+            const curve4Name = {json.dumps(run.curve4_json.name if run.curve4_json else '')};
+            const stem = {json.dumps(stem)};
+            const btnDefault = document.getElementById('src-btn-default');
+            const btnCurve4 = document.getElementById('src-btn-curve4');
+            function setActive(btn) {{
+              document.querySelectorAll('#src-btn-default, #src-btn-curve4').forEach(b => {{
+                if (b === btn) b.classList.remove('off');
+                else if (!b.disabled) b.classList.add('off');
+              }});
+            }}
+            setActive(btnDefault);
+            btnDefault.addEventListener('click', () => {{
+              frame.src = `/tracker-view/${{encodeURIComponent(stem)}}`;
+              label.textContent = defaultLabel;
+              setActive(btnDefault);
+            }});
+            if (curve4Available) {{
+              btnCurve4.addEventListener('click', () => {{
+                frame.src = `/tracker-view/${{encodeURIComponent(stem)}}?source=curve4`;
+                label.textContent = curve4Name;
+                setActive(btnCurve4);
+              }});
+            }}
+          }})();
+        </script>
       </div>
     </div>
 
@@ -2133,12 +2237,12 @@ class TrackerReportHandler(BaseHTTPRequestHandler):
 </html>"""
         self._send_html(body)
 
-    def _serve_tracker_view(self, stem: str) -> None:
+    def _serve_tracker_view(self, stem: str, *, source: str = "default") -> None:
         run = self.server.get_run(stem)
         if run is None:
             self.send_error(HTTPStatus.NOT_FOUND, "Tracker run not found")
             return
-        payload, _, _ = self.server.choose_tracker_payload(run)
+        payload, _, _ = self.server.choose_tracker_payload(run, source=source)
         if payload is not None:
             base_tracker_payload = (
                 self.server.load_json(run.tracker_json)
@@ -2158,8 +2262,13 @@ class TrackerReportHandler(BaseHTTPRequestHandler):
         self.send_error(HTTPStatus.NOT_FOUND, "No tracker html/json source found")
 
     def _serve_artifact(self, name: str) -> None:
-        path = _safe_child(self.server.tracker_output_dir, name)
-        if path is None or not path.exists():
+        path: Path | None = None
+        for root in self.server.tracker_output_dirs:
+            candidate = _safe_child(root, name)
+            if candidate is not None and candidate.exists():
+                path = candidate
+                break
+        if path is None:
             self.send_error(HTTPStatus.NOT_FOUND, "Artifact not found")
             return
         suffix = path.suffix.lower()
@@ -2184,7 +2293,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
-    parser.add_argument("--tracker-output-dir", type=Path, default=DEFAULT_TRACKER_OUTPUT_DIR)
+    parser.add_argument(
+        "--tracker-output-dir",
+        type=Path,
+        action="append",
+        dest="tracker_output_dirs",
+        default=None,
+        help=(
+            "Directory containing tracker_<stamp>.* artifacts (flat) or "
+            "tracker_<stamp>/ subdirs (nested). May be passed multiple times. "
+            f"Default: {', '.join(str(p) for p in DEFAULT_TRACKER_OUTPUT_DIRS)}"
+        ),
+    )
     parser.add_argument("--poe-config", type=Path, default=DEFAULT_POE_CONFIG_PATH)
     return parser
 
@@ -2192,14 +2312,17 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    output_dirs = tuple(args.tracker_output_dirs) if args.tracker_output_dirs else DEFAULT_TRACKER_OUTPUT_DIRS
     server = TrackerReportServer(
         (str(args.host), int(args.port)),
         TrackerReportHandler,
-        tracker_output_dir=Path(args.tracker_output_dir),
+        tracker_output_dirs=output_dirs,
         poe_config_path=Path(args.poe_config),
     )
     print(f"Tracker unified report server listening on http://{args.host}:{args.port}")
-    print(f"tracker_output: {Path(args.tracker_output_dir).resolve()}")
+    for p in server.tracker_output_dirs:
+        marker = "" if p.exists() else "  (missing)"
+        print(f"tracker_output: {p}{marker}")
     print(f"POE config: {Path(args.poe_config).resolve()}")
     if server._poe_error:
         print(f"POE unavailable: {server._poe_error}")

@@ -2,6 +2,7 @@ param(
     [double]$Duration = 300,
     [switch]$NoVideo,
     [switch]$NoLog,
+    [switch]$FullResVideo,
     [ValidateSet('auto', 'direct', 'off')]
     [string]$Ros2Mode = 'direct',
     [ValidateSet('auto', 'ros2', 'clean')]
@@ -9,6 +10,10 @@ param(
     [int]$RosDomainId = 2,
     [switch]$ProbeOnly
 )
+
+if ($FullResVideo -and $NoVideo) {
+    throw "-FullResVideo and -NoVideo are mutually exclusive."
+}
 
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 [Console]::InputEncoding = $utf8NoBom
@@ -217,7 +222,7 @@ Write-Host "BALL_TRACER_CAMERA_REVERSE_180=$($env:BALL_TRACER_CAMERA_REVERSE_180
 Write-Host "BALL_TRACER_SOFTWARE_ROTATE_180=$($env:BALL_TRACER_SOFTWARE_ROTATE_180)"
 
 if (-not $ProbeOnly) {
-    $saveVideoText = if ($NoVideo) { "off" } else { "on" }
+    $saveVideoText = if ($NoVideo) { "off" } elseif ($FullResVideo) { "full_res_per_camera" } else { "on" }
     $saveLogText = if ($NoLog) { "off" } else { "on" }
     Write-Host "Starting tracker (duration=${Duration}s, save_video=$saveVideoText, save_log=$saveLogText)."
     Write-Host "Press Ctrl+C to stop; run_tracker.py will finish shutdown cleanly before exit."
@@ -229,6 +234,9 @@ if ($NoVideo) {
 }
 if ($NoLog) {
     $args += "--no-log"
+}
+if ($FullResVideo) {
+    $args += "--full-res-video"
 }
 
 & $selection.Python @args

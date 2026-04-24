@@ -29,6 +29,7 @@ from .curve3 import (
     BallObservation, PredictHitPos, Curve3Tracker, FittedCurve, fit_curve,
     TrackerState, TrackerResult,
 )
+from .curve4 import Curve4Tracker, DragFit, K_DRAG as K_DRAG_CURVE4
 
 __all__ = [
     "Frame",
@@ -53,6 +54,9 @@ __all__ = [
     "fit_curve",
     "TrackerState",
     "TrackerResult",
+    "Curve4Tracker",
+    "DragFit",
+    "K_DRAG_CURVE4",
     "TileManager",
     "TileRect",
 ]

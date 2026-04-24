@@ -7,7 +7,7 @@
   2. TileManager 为每台相机选择 1000x1000 切片（跟踪/搜索模式）
   3. BallDetector YOLO 批量检测切片中的网球
   4. 若 ≥2 台相机各检测到 1 个网球 → BallLocalizer.triangulate() 多视图三角测量得到 3D 位置
-  5. 将 3D 位置送入 Curve3Tracker 进行轨迹追踪与击球点预测
+  5. 将 3D 位置送入 Curve4Tracker 进行轨迹追踪与击球点预测（drag-aware 模型）
   6. 原始图像交给后台写入线程：
      - 缩小到半分辨率
      - 拼接为单路原始视频
@@ -18,7 +18,7 @@
 性能设计：
   - YOLO 推理在 1000x1000 切片上运行（跟踪模式：追踪球位置；搜索模式：轮询预定义区域）
   - 图像缩放和编码在后台线程完成
-  - 主线程只做：取帧 → Bayer解码 → 分片 → YOLO → 三角测量 → curve3 → 入队
+  - 主线程只做：取帧 → Bayer解码 → 分片 → YOLO → 三角测量 → curve4 → 入队
 
 用法：
   python run_tracker.py [--duration 60] [--no-video] [--output-dir tracker_output]
@@ -45,7 +45,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -74,9 +74,9 @@ from src import (
     CarLoc,
     StationaryObjectFilter,
 )
-from src.curve3 import (
+from src.curve4 import (
     BallObservation,
-    Curve3Tracker,
+    Curve4Tracker,
     TrackerState,
     TrackerResult,
 )
@@ -171,50 +171,16 @@ def _print_ros_comm_config(prefix: str, topic_specs: list[tuple[str, int]]) -> N
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  标注参数
+#  标注参数（仅供 VideoWriterThread 的时间戳 badge 使用）
 # ══════════════════════════════════════════════════════════════════════════
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
-FONT_SCALE = 1.1
-FONT_THICKNESS = 2
-BOX_COLORS = [
-    (0, 255, 0),       # 绿色 — 1号相机
-    (0, 165, 255),     # 橙色 — 2号相机
-    (255, 100, 100),   # 蓝色 — 3号相机
-    (255, 0, 255),     # 紫色 — 4号相机
-]
 STITCHED_SERIAL_ORDER = [
     "DA7403103",  # 103
     "DA8474746",  # 746
     "DA7403087",  # 087
     "DA8571029",  # 029
 ]
-TEXT_COLOR = (255, 255, 255)        # 白色文字
-TEXT_3D_COLOR = (0, 255, 255)       # 黄色 — 3D 坐标
-STATIONARY_BOX_COLOR = (180, 180, 180)
-STATE_COLORS = {
-    TrackerState.IDLE:         (128, 128, 128),   # 灰色
-    TrackerState.TRACKING_S0:  (255, 200, 0),     # 青色
-    TrackerState.IN_LANDING:   (0, 165, 255),     # 橙色
-    TrackerState.TRACKING_S1:  (0, 255, 0),       # 绿色
-    TrackerState.DONE:         (0, 0, 255),        # 红色
-}
-
-
-def _format_detection_counts(
-    detections: dict[str, list[BallDetection]],
-    serials: list[str],
-) -> str:
-    parts = []
-    for sn in serials:
-        dets = detections.get(sn, [])
-        tennis_ball_count = sum(det.is_tennis_ball for det in dets)
-        stationary_count = sum(det.is_stationary_object for det in dets)
-        if stationary_count > 0:
-            parts.append(f"{sn[-3:]}=b{tennis_ball_count}/s{stationary_count}")
-        else:
-            parts.append(f"{sn[-3:]}=b{tennis_ball_count}")
-    return "  ".join(parts)
 
 
 def _format_xyz_m(x: float, y: float, z: float) -> str:
@@ -235,22 +201,17 @@ def _serial_matches_selector(serial: str, selector: str) -> bool:
 
 @dataclass
 class WriteJob:
-    """主线程投递给写入线程的工作包。"""
+    """主线程投递给视频写入线程的工作包（仅含视频编码所需字段）。"""
     images: dict[str, np.ndarray]              # {序列号: 全分辨率图像}
-    detections: dict[str, list[BallDetection]] # {序列号: 检测结果列表}
     serials: list[str]                         # 相机序列号顺序
     exposure_perf: float                       # perf_counter 时间
     elapsed_s: float | None
-    ball3d: Optional[Ball3D]
-    tracker_result: TrackerResult
     frame_idx: int
-    latency_ms: float
-    tiles: dict[str, TileRect] = field(default_factory=dict)  # 当前帧切片区域
-    car_loc: Optional[CarLoc] = None
 
 
 @dataclass
 class CarLocJob:
+    """主线程投递给 car_loc 工作线程的工作包。"""
     frame_idx: int
     exposure_pc: float
     elapsed_s: float | None
@@ -258,23 +219,38 @@ class CarLocJob:
 
 
 @dataclass
-class CarLocResult:
+class ArchiveJob:
+    """主线程投递给归档线程的每帧业务数据（不含 images，JSON 构造用）。"""
     frame_idx: int
     exposure_pc: float
     elapsed_s: float | None
-    car_loc: Optional[CarLoc]
+    latency_ms: float
+    all_detections: dict[str, list[BallDetection]]
+    frame_tiles: dict[str, TileRect]
+    ball3d: Optional[Ball3D]
+    tracker_result: TrackerResult
+    car_loc_sampled: bool
 
 
-def _submit_latest_car_loc_job(
+@dataclass
+class CarLocEvent:
+    """car_loc 工作线程或主线程（drop 时）发给归档线程的事件。"""
+    frame_idx: int
+    exposure_pc: float
+    elapsed_s: float | None
+    status: str  # "hit" / "miss" / "dropped"
+    car_loc: Optional[CarLoc] = None
+
+
+def _car_submit_latest(
     job_queue: queue.Queue[CarLocJob | None],
-    frame_entry_by_idx: dict[int, dict],
     job: CarLocJob,
-) -> int:
-    dropped = 0
+) -> Optional[CarLocJob]:
+    """向 maxsize=1 的 car_loc 队列投递任务；队列满时弹出旧任务并返回。"""
     while True:
         try:
             job_queue.put_nowait(job)
-            return dropped
+            return None
         except queue.Full:
             try:
                 stale = job_queue.get_nowait()
@@ -282,10 +258,11 @@ def _submit_latest_car_loc_job(
                 continue
             if stale is None:
                 raise RuntimeError("car_loc queue entered shutdown while submitting")
-            frame_entry = frame_entry_by_idx.get(stale.frame_idx)
-            if frame_entry is not None and frame_entry.get("car_loc_status") == "pending":
-                frame_entry["car_loc_status"] = "dropped"
-            dropped += 1
+            try:
+                job_queue.put_nowait(job)
+                return stale
+            except queue.Full:
+                continue
 
 
 class NullRos2Sink:
@@ -725,30 +702,8 @@ def _generate_post_run_artifacts(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  图像标注（在写入线程中调用）
+#  视频时间戳 badge（仅在 VideoWriterThread 中调用）
 # ══════════════════════════════════════════════════════════════════════════
-
-
-def _draw_detections(
-    img: np.ndarray,
-    detections: list[BallDetection],
-    color: tuple[int, int, int],
-) -> None:
-    """在图像上绘制 YOLO 检测框和置信度。"""
-    for det in detections:
-        draw_color = color if det.is_tennis_ball else STATIONARY_BOX_COLOR
-        label = "ball" if det.is_tennis_ball else "static"
-        cv2.rectangle(
-            img,
-            (int(det.x1), int(det.y1)),
-            (int(det.x2), int(det.y2)),
-            draw_color, 2,
-        )
-        cv2.putText(
-            img, f"{label} {det.confidence:.2f}",
-            (int(det.x1), int(det.y1) - 5),
-            FONT, FONT_SCALE, draw_color, FONT_THICKNESS,
-        )
 
 
 def _draw_badge(
@@ -810,141 +765,6 @@ def _grid_slot(
     col = index % cols
     row = index // cols
     return col * panel_w, row * panel_h
-
-
-def _stitch_panels_grid(
-    panels: list[np.ndarray],
-    *,
-    cols: int = 2,
-    separator_color: tuple[int, int, int] = (100, 100, 100),
-) -> np.ndarray:
-    if not panels:
-        return np.zeros((100, 100, 3), dtype=np.uint8)
-
-    panel_h, panel_w = panels[0].shape[:2]
-    cols, rows = _grid_dimensions(len(panels), cols=cols)
-    stitched = np.zeros((panel_h * rows, panel_w * cols, 3), dtype=panels[0].dtype)
-
-    for idx, panel in enumerate(panels):
-        x, y = _grid_slot(idx, panel_w, panel_h, cols=cols)
-        stitched[y:y + panel_h, x:x + panel_w] = panel
-
-    for col in range(1, cols):
-        x = panel_w * col
-        cv2.line(stitched, (x, 0), (x, stitched.shape[0]), separator_color, 1)
-    for row in range(1, rows):
-        y = panel_h * row
-        cv2.line(stitched, (0, y), (stitched.shape[1], y), separator_color, 1)
-
-    return stitched
-
-
-def annotate_frame(
-    images: dict[str, np.ndarray],
-    detections: dict[str, list[BallDetection]],
-    serials: list[str],
-    exposure_perf: float,
-    ball3d: Ball3D | None,
-    tracker_result: TrackerResult,
-    frame_idx: int,
-    latency_ms: float = 0.0,
-    tiles: dict[str, TileRect] | None = None,
-    car_loc: CarLoc | None = None,
-    cam_scales: dict[str, tuple[float, float]] | None = None,
-) -> np.ndarray:
-    """
-    拼接多台相机图像并标注检测结果和追踪状态。
-
-    接收的图像已经是半分辨率，检测框坐标也已缩放。
-    """
-    panel_shape = next((img.shape for img in images.values()), None)
-    if panel_shape is None:
-        return np.zeros((100, 100, 3), dtype=np.uint8)
-
-    panels = []
-    for i, sn in enumerate(serials):
-        if sn in images:
-            img = images[sn].copy()
-        else:
-            img = np.zeros(panel_shape, dtype=np.uint8)
-        color = BOX_COLORS[i % len(BOX_COLORS)]
-        dets = detections.get(sn, [])
-        _draw_detections(img, dets, color)
-        ball_count = sum(det.is_tennis_ball for det in dets)
-        static_count = sum(det.is_stationary_object for det in dets)
-        # 切片区域框
-        if tiles and sn in tiles:
-            t = tiles[sn]
-            cv2.rectangle(img, (t.x, t.y), (t.x + t.w, t.y + t.h),
-                          (255, 255, 0), 2)
-        # AprilTag 标记（像素坐标按相机实际缩放比例转换）
-        if car_loc and sn in car_loc.pixels:
-            px, py = car_loc.pixels[sn]
-            sx, sy = cam_scales.get(sn, (0.5, 0.5)) if cam_scales else (0.5, 0.5)
-            cx, cy = int(px * sx), int(py * sy)
-            cv2.drawMarker(img, (cx, cy), (0, 200, 255),
-                           cv2.MARKER_DIAMOND, 20, 2)
-        car_count = 1 if car_loc and sn in car_loc.pixels else 0
-        _draw_badge(
-            img,
-            f"{sn[-3:]}  BALL {ball_count}  STATIC {static_count}  CAR {car_count}",
-            10,
-            10,
-            color,
-        )
-        panels.append(img)
-
-    stitched = _stitch_panels_grid(panels, cols=2)
-    h, w = stitched.shape[:2]
-
-    # 从底部向上绘制文字信息
-    line_h = 40
-    # 先收集所有要绘制的行（从上到下的逻辑顺序）
-    lines: list[tuple[str, tuple[int, int, int]]] = []
-
-    lines.append((
-        f"#{frame_idx}  perf={exposure_perf:.6f}s"
-        f"  lat={latency_ms:.0f}ms",
-        TEXT_COLOR,
-    ))
-
-    if ball3d is not None:
-        cams = "+".join(s[-3:] for s in ball3d.cameras_used)
-        lines.append((
-            f"3D: {_format_xyz_m(ball3d.x, ball3d.y, ball3d.z)}  "
-            f"reproj={ball3d.reprojection_error:.1f}px  "
-            f"cams={cams}  conf={ball3d.confidence:.2f}",
-            TEXT_3D_COLOR,
-        ))
-
-    state = tracker_result.state
-    state_color = STATE_COLORS.get(state, TEXT_COLOR)
-    state_str = f"curve3: {state.value}"
-    pred = tracker_result.prediction
-    if pred is not None:
-        lead_ms = (pred.ht - pred.ct) * 1000
-        state_str += (
-            f"  hit={_format_xyz_m(pred.x, pred.y, pred.z)} "
-            f"stage={pred.stage} lead={lead_ms:.0f}ms"
-        )
-    lines.append((state_str, state_color))
-
-    if car_loc is not None:
-        cams = "+".join(s[-3:] for s in car_loc.cameras_used)
-        lines.append((
-            f"car: {_format_xyz_m(car_loc.x, car_loc.y, car_loc.z)}  "
-            f"yaw={math.degrees(car_loc.yaw):.1f}deg  "
-            f"reproj={car_loc.reprojection_error:.1f}px  cams={cams}",
-            (0, 200, 255),
-        ))
-
-    # 从底部向上绘制
-    y = h - 15
-    for text, color in reversed(lines):
-        cv2.putText(stitched, text, (10, y), FONT, FONT_SCALE, color, FONT_THICKNESS)
-        y -= line_h
-
-    return stitched
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1197,9 +1017,13 @@ def _resolve_engine_batch(
 
 class VideoWriterThread:
     """
-    后台线程：接收 WriteJob → 缩放到半分辨率 → 标注 → 编码写入视频。
+    后台线程：接收 WriteJob → 编码写入视频。
 
     队列满时（maxsize=30，即 1 秒缓冲），丢弃最旧的帧以避免主线程阻塞。
+
+    两种模式：
+      - 默认（grid）：每相机缩到 1/2 分辨率，2x2 拼接 + 时间戳 badge，单文件输出
+      - full_res：每相机独立全分辨率 mp4，无拼接、无 badge（用于训练数据采集）
     """
 
     def __init__(
@@ -1213,17 +1037,25 @@ class VideoWriterThread:
         backend: str = "auto",
         prefer_hw_accel: bool = True,
         display: bool = False,
+        full_res: bool = False,
+        cam_serials: list[str] | None = None,
     ):
         self._video_path = video_path
+        self._frame_w = frame_w
+        self._frame_h = frame_h
         self._half_w = frame_w // 2
         self._half_h = frame_h // 2
         self._n_cams = n_cams
         self._grid_cols, self._grid_rows = _grid_dimensions(n_cams, cols=2)
-        self._display = display
+        self._display = display and not full_res
         self._fps = fps
         self._codec = _normalize_video_codec(codec)
         self._backend = str(backend or "auto").strip().lower()
         self._prefer_hw_accel = bool(prefer_hw_accel)
+        self._full_res = bool(full_res)
+        self._cam_serials = list(cam_serials or [])
+        if self._full_res and not self._cam_serials:
+            raise ValueError("full_res mode requires cam_serials")
         self._queue: queue.Queue[WriteJob | None] = queue.Queue(maxsize=30)
         self._stopped = False
         self._drop_count = 0
@@ -1233,30 +1065,56 @@ class VideoWriterThread:
         self._process_time_sum = 0.0
         self._process_time_max = 0.0
 
-        output_size = (
-            self._half_w * self._grid_cols,
-            self._half_h * self._grid_rows,
-        )
-        self._stitched = np.zeros(
-            (output_size[1], output_size[0], 3),
-            dtype=np.uint8,
-        )
-        self._panel_views: list[np.ndarray] = []
-        for idx in range(self._n_cams):
-            x, y = _grid_slot(
-                idx,
-                self._half_w,
-                self._half_h,
-                cols=self._grid_cols,
+        if self._full_res:
+            base = Path(video_path)
+            self._video_paths = [
+                str(base.with_name(f"{base.stem}_{sn[-3:]}{base.suffix}"))
+                for sn in self._cam_serials
+            ]
+            output_size = (frame_w, frame_h)
+            self._stitched = None
+            self._panel_views = []
+        else:
+            self._video_paths = [video_path]
+            output_size = (
+                self._half_w * self._grid_cols,
+                self._half_h * self._grid_rows,
             )
-            self._panel_views.append(
-                self._stitched[y:y + self._half_h, x:x + self._half_w]
+            self._stitched = np.zeros(
+                (output_size[1], output_size[0], 3),
+                dtype=np.uint8,
             )
+            self._panel_views = []
+            for idx in range(self._n_cams):
+                x, y = _grid_slot(
+                    idx,
+                    self._half_w,
+                    self._half_h,
+                    cols=self._grid_cols,
+                )
+                self._panel_views.append(
+                    self._stitched[y:y + self._half_h, x:x + self._half_w]
+                )
 
-        self._writer = None
+        self._writers: list[cv2.VideoWriter] = []
         self._actual_codec = None
         self._backend_name = "DEFAULT"
         self._hw_accel_requested = False
+        for path in self._video_paths:
+            writer, codec_name, backend_name, hw_accel = self._open_writer(
+                path, output_size
+            )
+            self._writers.append(writer)
+            self._actual_codec = codec_name
+            self._backend_name = backend_name
+            self._hw_accel_requested = hw_accel
+
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _open_writer(
+        self, path: str, output_size: tuple[int, int]
+    ) -> tuple[cv2.VideoWriter, str, str, bool]:
         prefer_mp4 = _video_container_suffix(self._codec) == ".mp4"
         for backend_name, api_preference in _candidate_video_backends(
             self._backend,
@@ -1269,70 +1127,45 @@ class VideoWriterThread:
                 try:
                     if api_preference is None:
                         writer = cv2.VideoWriter(
-                            video_path,
-                            fourcc,
-                            fps,
-                            output_size,
+                            path, fourcc, self._fps, output_size,
                         )
                     else:
                         params = None
                         if backend_name == "FFMPEG" and self._prefer_hw_accel:
                             hw_prop = getattr(
-                                cv2,
-                                "VIDEOWRITER_PROP_HW_ACCELERATION",
-                                None,
+                                cv2, "VIDEOWRITER_PROP_HW_ACCELERATION", None,
                             )
                             accel_any = getattr(
-                                cv2,
-                                "VIDEO_ACCELERATION_ANY",
-                                None,
+                                cv2, "VIDEO_ACCELERATION_ANY", None,
                             )
                             if hw_prop is not None and accel_any is not None:
                                 params = [int(hw_prop), int(accel_any)]
                                 hw_accel_requested = True
                         if params is not None:
                             writer = cv2.VideoWriter(
-                                video_path,
-                                api_preference,
-                                fourcc,
-                                fps,
-                                output_size,
-                                params=params,
+                                path, api_preference, fourcc,
+                                self._fps, output_size, params=params,
                             )
                         else:
                             writer = cv2.VideoWriter(
-                                video_path,
-                                api_preference,
-                                fourcc,
-                                fps,
-                                output_size,
+                                path, api_preference, fourcc,
+                                self._fps, output_size,
                             )
                 except Exception:
                     writer = None
-
                 if writer is None:
                     continue
                 if writer.isOpened():
-                    self._writer = writer
-                    self._actual_codec = codec_name
-                    self._hw_accel_requested = hw_accel_requested
                     try:
-                        self._backend_name = writer.getBackendName()
+                        actual_backend = writer.getBackendName()
                     except Exception:
-                        self._backend_name = backend_name
-                    break
+                        actual_backend = backend_name
+                    return writer, codec_name, actual_backend, hw_accel_requested
                 writer.release()
-            if self._writer is not None:
-                break
-
-        if self._writer is None:
-            raise RuntimeError(
-                "Failed to open VideoWriter for "
-                f"{video_path} with codec={self._codec} backend={self._backend}"
-            )
-
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+        raise RuntimeError(
+            "Failed to open VideoWriter for "
+            f"{path} with codec={self._codec} backend={self._backend}"
+        )
 
     def submit(self, job: WriteJob) -> None:
         """投递工作包（非阻塞）。队列满时丢弃最旧帧。"""
@@ -1355,10 +1188,19 @@ class VideoWriterThread:
         """通知线程停止，等待队列排空，释放资源。返回丢弃帧数。"""
         self._queue.put(None)
         self._thread.join(timeout=10.0)
-        self._writer.release()
+        for w in self._writers:
+            w.release()
         if self._display:
             cv2.destroyAllWindows()
         return self._drop_count
+
+    @property
+    def video_paths(self) -> list[str]:
+        return list(self._video_paths)
+
+    @property
+    def full_res(self) -> bool:
+        return self._full_res
 
     def written_frame_indices(self) -> list[int]:
         """返回实际写入视频的主线程 frame_idx 顺序。"""
@@ -1401,11 +1243,21 @@ class VideoWriterThread:
             self._process(job)
 
     def _process(self, job: WriteJob) -> None:
-        """缩放 → 拼接 → 写入原始视频（不标注）。"""
+        """编码写入原始视频（无标注）。"""
         t0 = time.perf_counter()
         try:
             if not job.serials:
                 return
+            if self._full_res:
+                for idx, sn in enumerate(self._cam_serials):
+                    if idx >= len(self._writers):
+                        break
+                    img = job.images.get(sn)
+                    if img is not None:
+                        self._writers[idx].write(img)
+                self._written_frame_indices.append(job.frame_idx)
+                return
+
             self._stitched.fill(0)
             for idx, sn in enumerate(job.serials):
                 if idx >= len(self._panel_views):
@@ -1448,7 +1300,7 @@ class VideoWriterThread:
                 font_scale=0.9,
                 thickness=2,
             )
-            self._writer.write(self._stitched)
+            self._writers[0].write(self._stitched)
             self._written_frame_indices.append(job.frame_idx)
 
             if self._display:
@@ -1459,6 +1311,234 @@ class VideoWriterThread:
             self._process_count += 1
             self._process_time_sum += dt
             self._process_time_max = max(self._process_time_max, dt)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  归档线程（构造 frame_entry / 维护 log 列表 / 合并 car_loc 结果）
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class ArchiveThread:
+    """
+    独立线程：串行消费 ArchiveJob 和 CarLocEvent。
+
+    职责：
+      - 构造每帧 frame_entry dict，追加到 log_frames；
+      - 根据 ball3d / prediction / state 变化维护 log_observations /
+        log_predictions / log_state_transitions；
+      - 处理 car_loc 事件（hit / miss / dropped），更新 frame_entry 并追加
+        log_car_locs。
+
+    主线程退出时调用 stop()，拿到 result() 中的 5 个 log 列表、
+    frame_entry_by_idx（给 video_frame_idx 回填用）、以及 car_loc_missed 计数。
+    """
+
+    def __init__(
+        self,
+        cam_serials: list[str],
+        has_car_localizer: bool,
+    ) -> None:
+        self._cam_serials = list(cam_serials)
+        self._has_car_localizer = bool(has_car_localizer)
+        self._queue: queue.Queue[ArchiveJob | CarLocEvent | None] = queue.Queue()
+        self._log_frames: list[dict] = []
+        self._log_observations: list[dict] = []
+        self._log_predictions: list[dict] = []
+        self._log_car_locs: list[dict] = []
+        self._log_state_transitions: list[dict] = []
+        self._frame_entry_by_idx: dict[int, dict] = {}
+        # 归档线程消费 ArchiveJob 和 CarLocEvent 两种消息。car_loc worker
+        # 处理较快时，CarLocEvent 可能先于对应的 ArchiveJob 到达队列（主线程
+        # 先派发 CarLocJob、后派发 ArchiveJob，但 worker 端是否先完成不确定）。
+        # 此时暂存到 _pending_events，待 ArchiveJob 创建 entry 后再应用。
+        self._pending_events: dict[int, CarLocEvent] = {}
+        self._car_loc_missed = 0
+        self._prev_state = TrackerState.IDLE
+        self._thread = threading.Thread(
+            target=self._run, name="ArchiveThread", daemon=True,
+        )
+        self._thread.start()
+
+    def submit(self, msg: ArchiveJob | CarLocEvent) -> None:
+        self._queue.put_nowait(msg)
+
+    def stop(self, *, timeout_s: float = 10.0) -> None:
+        self._queue.put(None)
+        self._thread.join(timeout=timeout_s)
+        if self._thread.is_alive():
+            raise RuntimeError("archive thread did not finish before shutdown")
+
+    def result(self) -> dict:
+        return {
+            "log_frames": self._log_frames,
+            "log_observations": self._log_observations,
+            "log_predictions": self._log_predictions,
+            "log_car_locs": self._log_car_locs,
+            "log_state_transitions": self._log_state_transitions,
+            "frame_entry_by_idx": self._frame_entry_by_idx,
+            "car_loc_missed_frames": self._car_loc_missed,
+        }
+
+    def _run(self) -> None:
+        while True:
+            msg = self._queue.get()
+            if msg is None:
+                return
+            if isinstance(msg, ArchiveJob):
+                self._process_archive(msg)
+            else:
+                self._process_car_loc_event(msg)
+
+    def _process_archive(self, job: ArchiveJob) -> None:
+        state = job.tracker_result.state
+        if state != self._prev_state:
+            self._log_state_transitions.append({
+                "frame": job.frame_idx,
+                "t": job.exposure_pc,
+                "from": self._prev_state.value,
+                "to": state.value,
+            })
+            self._prev_state = state
+
+        entry: dict = {
+            "idx": job.frame_idx,
+            "exposure_pc": job.exposure_pc,
+            "elapsed_s": (
+                round(job.elapsed_s, 3) if job.elapsed_s is not None else None
+            ),
+            "has_3d": job.ball3d is not None,
+            "state": state.value,
+            "latency_ms": round(job.latency_ms, 1),
+        }
+        if self._has_car_localizer:
+            entry["car_loc_sampled"] = job.car_loc_sampled
+            entry["car_loc_status"] = (
+                "pending" if job.car_loc_sampled else "skipped"
+            )
+
+        frame_dets: dict[str, list[dict]] = {}
+        frame_det_counts: dict[str, dict[str, int]] = {}
+        for sn in self._cam_serials:
+            dets = job.all_detections.get(sn, [])
+            if not dets:
+                continue
+            frame_det_counts[sn] = {
+                "tennis_ball": sum(d.is_tennis_ball for d in dets),
+                "stationary_object": sum(
+                    d.is_stationary_object for d in dets
+                ),
+            }
+            frame_dets[sn] = [
+                {
+                    "x": round(d.x), "y": round(d.y),
+                    "x1": round(d.x1), "y1": round(d.y1),
+                    "x2": round(d.x2), "y2": round(d.y2),
+                    "conf": round(d.confidence, 3),
+                    "label": d.label,
+                }
+                for d in dets
+            ]
+        if frame_dets:
+            entry["detections"] = frame_dets
+            entry["detection_counts"] = frame_det_counts
+
+        if job.frame_tiles:
+            entry["tiles"] = {
+                sn: {"x": t.x, "y": t.y, "w": t.w, "h": t.h}
+                for sn, t in job.frame_tiles.items()
+            }
+
+        if job.ball3d is not None:
+            b = job.ball3d
+            entry["ball3d"] = {
+                "x": round(b.x, 4), "y": round(b.y, 4), "z": round(b.z, 4),
+                "reproj": round(b.reprojection_error, 1),
+                "conf": round(b.confidence, 3),
+                "cameras": b.cameras_used,
+            }
+            self._log_observations.append({
+                "x": b.x, "y": b.y, "z": b.z,
+                "t": job.exposure_pc,
+                "reproj_err": b.reprojection_error,
+                "confidence": b.confidence,
+                "cameras_used": b.cameras_used,
+            })
+
+        pred = job.tracker_result.prediction
+        if pred is not None:
+            entry["prediction"] = {
+                "x": round(pred.x, 4),
+                "y": round(pred.y, 4),
+                "z": round(pred.z, 4),
+                "stage": pred.stage,
+                "lead_ms": round((pred.ht - pred.ct) * 1000),
+            }
+            self._log_predictions.append({
+                "x": pred.x, "y": pred.y, "z": pred.z,
+                "stage": pred.stage, "ct": pred.ct, "ht": pred.ht,
+            })
+
+        self._log_frames.append(entry)
+        self._frame_entry_by_idx[job.frame_idx] = entry
+        # 若该帧的 car_loc 结果先到，现在回填
+        pending = self._pending_events.pop(job.frame_idx, None)
+        if pending is not None:
+            self._apply_car_loc(entry, pending)
+
+    def _process_car_loc_event(self, ev: CarLocEvent) -> None:
+        entry = self._frame_entry_by_idx.get(ev.frame_idx)
+        if entry is None:
+            # ArchiveJob 还没到，先缓存，后面创建 entry 时再应用
+            self._pending_events[ev.frame_idx] = ev
+            return
+        self._apply_car_loc(entry, ev)
+
+    def _apply_car_loc(self, entry: dict, ev: CarLocEvent) -> None:
+        if ev.status == "dropped":
+            if entry.get("car_loc_status") == "pending":
+                entry["car_loc_status"] = "dropped"
+            return
+        if ev.status == "miss":
+            entry["car_loc_status"] = "miss"
+            self._car_loc_missed += 1
+            return
+        loc = ev.car_loc
+        if loc is None:
+            return
+        entry["car_loc_status"] = "hit"
+        entry["car_loc"] = {
+            "x": round(loc.x, 4),
+            "y": round(loc.y, 4),
+            "z": round(loc.z, 4),
+            "yaw": round(loc.yaw, 4),
+            "t": ev.exposure_pc,
+            "elapsed_s": (
+                round(ev.elapsed_s, 3)
+                if ev.elapsed_s is not None else None
+            ),
+            "tag_id": loc.tag_id,
+            "reference": "car_base",
+            "cameras_used": loc.cameras_used,
+            "pixels": {
+                sn: [round(u), round(v)]
+                for sn, (u, v) in loc.pixels.items()
+            },
+        }
+        self._log_car_locs.append({
+            "frame_idx": ev.frame_idx,
+            "x": round(loc.x, 4),
+            "y": round(loc.y, 4),
+            "z": round(loc.z, 4),
+            "yaw": round(loc.yaw, 4),
+            "t": ev.exposure_pc,
+            "elapsed_s": (
+                round(ev.elapsed_s, 3) if ev.elapsed_s is not None else None
+            ),
+            "tag_id": loc.tag_id,
+            "reference": "car_base",
+            "cameras_used": loc.cameras_used,
+            "reprojection_error": round(loc.reprojection_error, 2),
+        })
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1490,6 +1570,10 @@ def main() -> int:
         default="direct",
         help="ROS2 output mode",
     )
+    parser.add_argument(
+        "--full-res-video", action="store_true",
+        help="保存每相机全分辨率视频（多个 mp4，无拼接、无 badge；编码慢、丢帧多，但保留原图细节供训练数据用）"
+    )
     args = parser.parse_args()
     save_logs = not args.no_log
 
@@ -1514,7 +1598,7 @@ def main() -> int:
     search_hold_frames = tracker_cfg.get("search_hold_frames", 4)
     min_cameras_for_3d = tracker_cfg.get("min_cameras_for_3d", 2)
     max_reproj_error_px = tracker_cfg.get("max_reproj_error_px", 15.0)
-    curve3_cfg = tracker_cfg.get("curve3", {})
+    curve4_cfg = tracker_cfg.get("curve4", {})
     detection_cfg = tracker_cfg.get("detection_postprocess", {})
     detection_duplicate_iou_threshold = detection_cfg.get(
         "duplicate_iou_threshold", 0.95
@@ -1612,10 +1696,11 @@ def main() -> int:
     calib_serials = list(localizer.serials)
     print(f"  标定相机: {calib_serials}")
 
-    print("[3/5] 初始化 Curve3Tracker...")
-    tracker = Curve3Tracker(**curve3_cfg)
+    print("[3/5] 初始化 Curve4Tracker...")
+    tracker = Curve4Tracker(**curve4_cfg)
     print(f"  ideal_hit_z={tracker.ideal_hit_z:.3f}m, cor={tracker.cor}, "
-          f"cor_xy={tracker.cor_xy}")
+          f"cor_xy={tracker.cor_xy}, k_drag={tracker.k_drag:.4f}, "
+          f"weight_ratio={tracker.weight_ratio}")
     stationary_filter = None
     if stationary_enabled:
         stationary_filter = StationaryObjectFilter(
@@ -1679,7 +1764,9 @@ def main() -> int:
             group_id=group_id,
             tracker_output_dir=output_dir,
             tracker_json_path=json_path,
-            tracker_video_path=None if args.no_video else video_path,
+            tracker_video_path=(
+                None if args.no_video or args.full_res_video else video_path
+            ),
             idle_record_period_sec=pc_logger_idle_record_period_sec,
             high_rate_tail_sec=pc_logger_high_rate_tail_sec,
             min_save_interval_sec=pc_logger_min_save_interval_sec,
@@ -1710,7 +1797,11 @@ def main() -> int:
                         target_path=pc_logger_path,
                         tracker_output_dir=output_dir,
                         tracker_json_path=json_path,
-                        tracker_video_path=None if args.no_video else video_path,
+                        tracker_video_path=(
+                            None
+                            if args.no_video or args.full_res_video
+                            else video_path
+                        ),
                     ),
                     repeat=3,
                     interval_s=0.2,
@@ -1720,15 +1811,11 @@ def main() -> int:
     elif args.ros2_mode == "off":
         print("  pc logger 已禁用：ROS2 mode=off")
 
-    log_observations: list[dict] = []
-    log_predictions: list[dict] = []
-    log_car_locs: list[dict] = []
+    # log_frames / log_observations / log_predictions / log_car_locs /
+    # log_state_transitions / frame_entry_by_idx / car_loc_missed_frames
+    # 都由 ArchiveThread 维护，shutdown 后再回收。
     car_loc_sampled_frames = 0
-    car_loc_missed_frames = 0
     car_loc_dropped_frames = 0
-    log_frames: list[dict] = []
-    frame_entry_by_idx: dict[int, dict] = {}
-    log_state_transitions: list[dict] = []
     capture_fps = 0.0
 
     # ── 打开同步相机 ────────────────────────────────────────────────────
@@ -1889,44 +1976,69 @@ def main() -> int:
                 backend=video_output_backend,
                 prefer_hw_accel=video_output_hw_accel,
                 display=args.display,
+                full_res=args.full_res_video,
+                cam_serials=cam_serials,
             )
-            print(
-                f"  视频输出: {video_path}"
-                f" (codec={writer_thread.actual_codec}, "
-                f"backend={writer_thread.backend_name}, "
-                f"hw_accel={'on' if writer_thread.hw_accel_requested else 'off'})"
-            )
+            if writer_thread.full_res:
+                print("  视频输出 (全分辨率, 每相机一个文件):")
+                for path in writer_thread.video_paths:
+                    print(f"    {path}")
+                print(
+                    f"  (codec={writer_thread.actual_codec}, "
+                    f"backend={writer_thread.backend_name}, "
+                    f"hw_accel={'on' if writer_thread.hw_accel_requested else 'off'})"
+                )
+            else:
+                print(
+                    f"  视频输出: {video_path}"
+                    f" (codec={writer_thread.actual_codec}, "
+                    f"backend={writer_thread.backend_name}, "
+                    f"hw_accel={'on' if writer_thread.hw_accel_requested else 'off'})"
+                )
 
         # ── 并行解码线程池 ──
         from concurrent.futures import ThreadPoolExecutor
         _decode_pool = ThreadPoolExecutor(max_workers=len(cam_serials))
 
-        # ── 小车定位后台线程（结果严格绑定源帧，不允许复用到后续帧）──
+        # ── 归档线程（线3）：视频以外的 JSON/log 构造 ──
+        archive_thread = ArchiveThread(
+            cam_serials=cam_serials,
+            has_car_localizer=car_localizer is not None,
+        )
+
+        # ── 小车定位后台线程（线2）：直接 publish /pc_car_loc 并通知归档 ──
         _car_job_queue: queue.Queue[CarLocJob | None] | None = None
-        _car_result_queue: queue.Queue[CarLocResult] | None = None
         _car_thread: threading.Thread | None = None
         if car_localizer is not None:
             _car_job_queue = queue.Queue(maxsize=1)
-            _car_result_queue = queue.Queue()
 
             def _car_worker():
                 while True:
                     job = _car_job_queue.get()
                     if job is None:
                         break
-                    _car_result_queue.put(
-                        CarLocResult(
-                            frame_idx=job.frame_idx,
-                            exposure_pc=job.exposure_pc,
-                            elapsed_s=job.elapsed_s,
-                            car_loc=car_localizer.locate(
-                                job.images,
-                                t=job.exposure_pc,
-                            ),
-                        )
-                    )
+                    loc = car_localizer.locate(job.images, t=job.exposure_pc)
+                    if loc is not None:
+                        _ros2_sink.publish_car_loc({
+                            "topic": "car_loc",
+                            "x": round(loc.x, 4),
+                            "y": round(loc.y, 4),
+                            "z": round(loc.z, 4),
+                            "yaw": round(loc.yaw, 4),
+                            "t": round(job.exposure_pc, 6),
+                            "tag_id": loc.tag_id,
+                        })
+                    archive_thread.submit(CarLocEvent(
+                        frame_idx=job.frame_idx,
+                        exposure_pc=job.exposure_pc,
+                        elapsed_s=job.elapsed_s,
+                        status="hit" if loc is not None else "miss",
+                        car_loc=loc,
+                    ))
 
-            _car_thread = threading.Thread(target=_car_worker, daemon=True)
+            _car_thread = threading.Thread(
+                target=_car_worker, name="CarLocWorker", daemon=True,
+            )
             _car_thread.start()
 
         # ── 信号处理（确保被终止时也能保存数据）──
@@ -1942,78 +2054,10 @@ def main() -> int:
         if hasattr(signal, 'SIGBREAK'):
             signal.signal(signal.SIGBREAK, _signal_handler)
 
-        def _apply_car_loc_result(car_result: CarLocResult) -> None:
-            nonlocal car_loc_missed_frames
-            frame_entry = frame_entry_by_idx.get(car_result.frame_idx)
-            if frame_entry is None:
-                raise RuntimeError(
-                    f"missing frame_entry for car_loc frame_idx={car_result.frame_idx}"
-                )
-
-            car_loc = car_result.car_loc
-            if car_loc is None:
-                frame_entry["car_loc_status"] = "miss"
-                car_loc_missed_frames += 1
-                return
-
-            frame_entry["car_loc_status"] = "hit"
-            frame_entry["car_loc"] = {
-                "x": round(car_loc.x, 4),
-                "y": round(car_loc.y, 4),
-                "z": round(car_loc.z, 4),
-                "yaw": round(car_loc.yaw, 4),
-                "t": car_result.exposure_pc,
-                "elapsed_s": round(car_result.elapsed_s, 3)
-                if car_result.elapsed_s is not None else None,
-                "tag_id": car_loc.tag_id,
-                "reference": "car_base",
-                "cameras_used": car_loc.cameras_used,
-                "pixels": {
-                    sn: [round(u), round(v)]
-                    for sn, (u, v) in car_loc.pixels.items()
-                },
-            }
-
-            log_car_locs.append({
-                "frame_idx": car_result.frame_idx,
-                "x": round(car_loc.x, 4),
-                "y": round(car_loc.y, 4),
-                "z": round(car_loc.z, 4),
-                "yaw": round(car_loc.yaw, 4),
-                "t": car_result.exposure_pc,
-                "elapsed_s": round(car_result.elapsed_s, 3)
-                if car_result.elapsed_s is not None else None,
-                "tag_id": car_loc.tag_id,
-                "reference": "car_base",
-                "cameras_used": car_loc.cameras_used,
-                "reprojection_error": round(car_loc.reprojection_error, 2),
-            })
-
-            _ros2_sink.publish_car_loc({
-                "topic": "car_loc",
-                "x": round(car_loc.x, 4),
-                "y": round(car_loc.y, 4),
-                "z": round(car_loc.z, 4),
-                "yaw": round(car_loc.yaw, 4),
-                "t": round(car_result.exposure_pc, 6),
-                "tag_id": car_loc.tag_id,
-            })
-
-        def _drain_car_loc_results() -> None:
-            if _car_result_queue is None:
-                return
-            while True:
-                try:
-                    car_result = _car_result_queue.get_nowait()
-                except queue.Empty:
-                    break
-                _apply_car_loc_result(car_result)
-
         # ── 主循环 ────────────────────────────────────────────────────
         frame_idx = 0
         first_frame_exposure_pc: float | None = None
         t_start = time.perf_counter()
-        prev_state = TrackerState.IDLE
         timeout_count = 0
         _t_capture_sum = 0.0
         _t_decode_sum = 0.0
@@ -2055,7 +2099,34 @@ def main() -> int:
                 exposure_pc = sum(exp_starts) / len(exp_starts)
                 if first_frame_exposure_pc is None:
                     first_frame_exposure_pc = exposure_pc
-                # ── YOLO 分片检测 ──
+                frame_elapsed_s = exposure_pc - first_frame_exposure_pc
+
+                # ── 车辆定位立即派发（线2，和 YOLO 并行；不复制图像）──
+                car_loc_sampled = (
+                    car_localizer is not None
+                    and (frame_idx % car_loc_sample_every_frames) == 0
+                )
+                if car_loc_sampled:
+                    car_loc_sampled_frames += 1
+                    stale = _car_submit_latest(
+                        _car_job_queue,
+                        CarLocJob(
+                            frame_idx=frame_idx,
+                            exposure_pc=exposure_pc,
+                            elapsed_s=frame_elapsed_s,
+                            images=images,
+                        ),
+                    )
+                    if stale is not None:
+                        car_loc_dropped_frames += 1
+                        archive_thread.submit(CarLocEvent(
+                            frame_idx=stale.frame_idx,
+                            exposure_pc=stale.exposure_pc,
+                            elapsed_s=stale.elapsed_s,
+                            status="dropped",
+                        ))
+
+                # ── YOLO 分片检测（线1）──
                 img_sns = [sn for sn in cam_serials if sn in images]
                 ball_detect_sns = [
                     sn for sn in img_sns
@@ -2111,35 +2182,14 @@ def main() -> int:
                     candidate = localizer.triangulate(good_dets)
                     if candidate.reprojection_error <= max_reproj_error_px:
                         ball3d = candidate
-
-                        # 3D 定位成功 → 跟踪模式
                         for sn, det in good_dets.items():
                             tile_mgr.on_3d_located(
                                 sn, det.x, det.y, exposure_pc)
-
-                        obs = BallObservation(
+                        tracker_result = tracker.update(BallObservation(
                             x=ball3d.x, y=ball3d.y,
                             z=ball3d.z, t=exposure_pc,
-                        )
-                        tracker_result = tracker.update(obs)
-
-                        log_observations.append({
-                            "x": ball3d.x, "y": ball3d.y, "z": ball3d.z,
-                            "t": exposure_pc,
-                            "reproj_err": ball3d.reprojection_error,
-                            "confidence": ball3d.confidence,
-                            "cameras_used": ball3d.cameras_used,
-                        })
-
-                        if tracker_result.prediction is not None:
-                            p = tracker_result.prediction
-                            log_predictions.append({
-                                "x": p.x, "y": p.y, "z": p.z,
-                                "stage": p.stage,
-                                "ct": p.ct, "ht": p.ht,
-                            })
+                        ))
                     else:
-                        # 重投影误差过大 → 当作 2D 检测
                         for sn in good_dets:
                             tile_mgr.on_2d_detected(sn, frame_tiles[sn])
                         tracker_result = TrackerResult(
@@ -2147,7 +2197,6 @@ def main() -> int:
                             state=tracker.tracker_state,
                         )
                 else:
-                    # 不足相机数 → 检测到球的相机进入持续模式
                     for sn in good_dets:
                         tile_mgr.on_2d_detected(sn, frame_tiles[sn])
                     tracker_result = TrackerResult(
@@ -2155,26 +2204,7 @@ def main() -> int:
                         state=tracker.tracker_state,
                     )
 
-                # ── 状态变化记录 ──
-                if tracker_result.state != prev_state:
-                    log_state_transitions.append({
-                        "frame": frame_idx,
-                        "t": exposure_pc,
-                        "from": prev_state.value,
-                        "to": tracker_result.state.value,
-                    })
-                    prev_state = tracker_result.state
-
-                frame_elapsed_s = (
-                    exposure_pc - first_frame_exposure_pc
-                    if first_frame_exposure_pc is not None else None
-                )
-                car_loc_sampled = (
-                    car_localizer is not None
-                    and (frame_idx % car_loc_sample_every_frames) == 0
-                )
-                car_loc = None
-
+                # ── 发布 /predict_hit_pos（线1 延迟敏感出口）──
                 if tracker_result.prediction is not None:
                     p = tracker_result.prediction
                     _ros2_sink.publish_predict_hit({
@@ -2187,103 +2217,29 @@ def main() -> int:
                         "duration": round(p.ht - p.ct, 4),
                     })
 
-                # ── 投递给后台写入线程（非阻塞）──
+                # ── 投递视频写入线程（线3，非阻塞，图像传引用不复制）──
                 if writer_thread is not None:
                     writer_thread.submit(WriteJob(
                         images=images,
-                        detections=all_detections,
                         serials=cam_serials,
                         exposure_perf=exposure_pc,
                         elapsed_s=frame_elapsed_s,
-                        ball3d=ball3d,
-                        tracker_result=tracker_result,
                         frame_idx=frame_idx,
-                        latency_ms=latency_ms,
-                        tiles=frame_tiles,
-                        car_loc=car_loc,
                     ))
 
-                # ── 日志（含完整标注数据）──
-                frame_entry = {
-                    "idx": frame_idx,
-                    "exposure_pc": exposure_pc,
-                    "elapsed_s": round(frame_elapsed_s, 3)
-                    if frame_elapsed_s is not None else None,
-                    "has_3d": ball3d is not None,
-                    "state": tracker_result.state.value,
-                    "latency_ms": round(latency_ms, 1),
-                }
-                if car_localizer is not None:
-                    frame_entry["car_loc_sampled"] = car_loc_sampled
-                    frame_entry["car_loc_status"] = (
-                        "pending" if car_loc_sampled else "skipped"
-                    )
-                # 检测框（含 bbox）
-                frame_dets = {}
-                frame_det_counts = {}
-                for sn in cam_serials:
-                    dets = all_detections.get(sn, [])
-                    if dets:
-                        frame_det_counts[sn] = {
-                            "tennis_ball": sum(d.is_tennis_ball for d in dets),
-                            "stationary_object": sum(
-                                d.is_stationary_object for d in dets
-                            ),
-                        }
-                        frame_dets[sn] = [
-                            {"x": round(d.x), "y": round(d.y),
-                             "x1": round(d.x1), "y1": round(d.y1),
-                             "x2": round(d.x2), "y2": round(d.y2),
-                             "conf": round(d.confidence, 3),
-                             "label": d.label}
-                            for d in dets
-                        ]
-                if frame_dets:
-                    frame_entry["detections"] = frame_dets
-                    frame_entry["detection_counts"] = frame_det_counts
-                # 切片区域
-                if frame_tiles:
-                    frame_entry["tiles"] = {
-                        sn: {"x": t.x, "y": t.y, "w": t.w, "h": t.h}
-                        for sn, t in frame_tiles.items()
-                    }
-                # 3D 球位置
-                if ball3d is not None:
-                    frame_entry["ball3d"] = {
-                        "x": round(ball3d.x, 4),
-                        "y": round(ball3d.y, 4),
-                        "z": round(ball3d.z, 4),
-                        "reproj": round(ball3d.reprojection_error, 1),
-                        "conf": round(ball3d.confidence, 3),
-                        "cameras": ball3d.cameras_used,
-                    }
-                # 预测
-                pred = tracker_result.prediction
-                if pred is not None:
-                    frame_entry["prediction"] = {
-                        "x": round(pred.x, 4),
-                        "y": round(pred.y, 4),
-                        "z": round(pred.z, 4),
-                        "stage": pred.stage,
-                        "lead_ms": round((pred.ht - pred.ct) * 1000),
-                    }
-                log_frames.append(frame_entry)
-                frame_entry_by_idx[frame_idx] = frame_entry
-                if car_loc_sampled:
-                    if _car_job_queue is None:
-                        raise RuntimeError("car_loc job queue is not initialized")
-                    car_loc_sampled_frames += 1
-                    car_loc_dropped_frames += _submit_latest_car_loc_job(
-                        _car_job_queue,
-                        frame_entry_by_idx,
-                        CarLocJob(
-                            frame_idx=frame_idx,
-                            exposure_pc=exposure_pc,
-                            elapsed_s=frame_elapsed_s,
-                            images={sn: img.copy() for sn, img in images.items()},
-                        ),
-                    )
-                _drain_car_loc_results()
+                # ── 投递归档线程（线3，非阻塞，只传业务数据）──
+                archive_thread.submit(ArchiveJob(
+                    frame_idx=frame_idx,
+                    exposure_pc=exposure_pc,
+                    elapsed_s=frame_elapsed_s,
+                    latency_ms=latency_ms,
+                    all_detections=all_detections,
+                    frame_tiles=frame_tiles,
+                    ball3d=ball3d,
+                    tracker_result=tracker_result,
+                    car_loc_sampled=car_loc_sampled,
+                ))
+
                 _t_other_sum += time.perf_counter() - _t2
 
                 frame_idx += 1
@@ -2302,8 +2258,6 @@ def main() -> int:
                     print(
                         f"  [{elapsed:.1f}s] {frame_idx} frames "
                         f"({fps:.1f} fps)  "
-                        f"3D={len(log_observations)}  "
-                        f"preds={len(log_predictions)}  "
                         f"state={tracker_result.state.value}  "
                         f"avg: cap={_t_capture_sum/n*1000:.1f}ms "
                         f"decode={_t_decode_sum/n*1000:.1f}ms "
@@ -2317,6 +2271,16 @@ def main() -> int:
 
         # ── 清理 ──
         processing_elapsed = time.perf_counter() - t_start
+        # 先关 car_loc（确保把最后的 CarLocEvent 送到归档线程）
+        if _car_job_queue is not None:
+            _car_job_queue.put(None)
+        if _car_thread is not None:
+            _car_thread.join(timeout=10.0)
+            if _car_thread.is_alive():
+                raise RuntimeError(
+                    "car_loc worker did not finish before shutdown"
+                )
+        # 再关视频写入线程
         drop_count = 0
         written_frame_indices: list[int] = []
         writer_stats: dict[str, float | int | bool] = {"enabled": False}
@@ -2325,15 +2289,22 @@ def main() -> int:
             drop_count = writer_thread.stop()
             written_frame_indices = writer_thread.written_frame_indices()
             writer_stats = writer_thread.stats()
-
-    # ── 关闭小车定位线程 ──
-    if _car_job_queue is not None:
-        _car_job_queue.put(None)
-    if _car_thread is not None:
-        _car_thread.join(timeout=10.0)
-        if _car_thread.is_alive():
-            raise RuntimeError("car_loc worker did not finish before shutdown")
-    _drain_car_loc_results()
+        # 最后关归档线程
+        archive_thread.stop()
+        archive_result = archive_thread.result()
+        log_frames = archive_result["log_frames"]
+        log_observations = archive_result["log_observations"]
+        log_predictions = archive_result["log_predictions"]
+        log_car_locs = archive_result["log_car_locs"]
+        log_state_transitions = archive_result["log_state_transitions"]
+        frame_entry_by_idx = archive_result["frame_entry_by_idx"]
+        car_loc_missed_frames = archive_result["car_loc_missed_frames"]
+        # 将视频帧序号回填到对应 frame_entry
+        for video_frame_idx, frame_id in enumerate(written_frame_indices):
+            frame_data = frame_entry_by_idx.get(frame_id)
+            if frame_data is not None:
+                frame_data["video_frame_idx"] = video_frame_idx
+                frame_data["video_mapping_exact"] = True
 
     # ── 关闭 ROS2 桥接子进程 ──
     if _pc_logger_proc is not None and _pc_logger_proc.is_running():
@@ -2348,7 +2319,9 @@ def main() -> int:
                 target_path=pc_logger_path,
                 tracker_output_dir=output_dir,
                 tracker_json_path=json_path,
-                tracker_video_path=None if args.no_video else video_path,
+                tracker_video_path=(
+                    None if args.no_video or args.full_res_video else video_path
+                ),
             ),
             repeat=2,
             interval_s=0.1,
@@ -2364,7 +2337,9 @@ def main() -> int:
                 target_path=pc_logger_path,
                 tracker_output_dir=output_dir,
                 tracker_json_path=json_path,
-                tracker_video_path=None if args.no_video else video_path,
+                tracker_video_path=(
+                    None if args.no_video or args.full_res_video else video_path
+                ),
             ),
             repeat=2,
             interval_s=0.1,
@@ -2382,17 +2357,6 @@ def main() -> int:
     lat_min = min(latencies) if latencies else 0
     lat_max = max(latencies) if latencies else 0
     n_timing = max(frame_idx, 1)
-    if written_frame_indices:
-        frame_entry_by_idx = {
-            frame_data.get("idx"): frame_data
-            for frame_data in log_frames
-            if isinstance(frame_data, dict)
-        }
-        for video_frame_idx, frame_id in enumerate(written_frame_indices):
-            frame_data = frame_entry_by_idx.get(frame_id)
-            if frame_data is not None:
-                frame_data["video_frame_idx"] = video_frame_idx
-                frame_data["video_mapping_exact"] = True
 
     timing_summary = {
         "capture_avg": round(_t_capture_sum / n_timing * 1000.0, 1),
@@ -2412,6 +2376,8 @@ def main() -> int:
             "ideal_hit_z": tracker.ideal_hit_z,
             "cor": tracker.cor,
             "cor_xy": tracker.cor_xy,
+            "k_drag": tracker.k_drag,
+            "weight_ratio": tracker.weight_ratio,
             "model_path": str(detector.model_path),
             "ball_detection_serials": ball_detect_serials,
             "ball_detection_disabled_serials": sorted(
@@ -2446,7 +2412,16 @@ def main() -> int:
                 ),
             },
             "video_output": {
-                "artifact_path": str(video_path.resolve()) if not args.no_video else None,
+                "artifact_path": (
+                    str(video_path.resolve())
+                    if not args.no_video and not args.full_res_video
+                    else None
+                ),
+                "artifact_paths": (
+                    [str(Path(p).resolve()) for p in writer_thread.video_paths]
+                    if writer_thread is not None and writer_thread.full_res
+                    else None
+                ),
                 "requested_codec": video_output_codec,
                 "requested_backend": video_output_backend,
                 "requested_hw_accel": video_output_hw_accel,
@@ -2460,7 +2435,11 @@ def main() -> int:
                     if writer_thread is not None
                     else video_output_backend
                 ),
-                "layout": "grid",
+                "layout": (
+                    "per_camera_full_res"
+                    if writer_thread is not None and writer_thread.full_res
+                    else "grid"
+                ),
                 "grid_cols": _grid_dimensions(len(cam_serials), cols=2)[0],
                 "grid_rows": _grid_dimensions(len(cam_serials), cols=2)[1],
                 "serial_order": cam_serials,
@@ -2543,12 +2522,19 @@ def main() -> int:
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
     if save_logs and post_run_enabled:
+        # full_res 模式下产出多个独立 mp4，标注视频脚本只识别拼接 grid，所以跳过它
+        post_run_video_path = (
+            video_path
+            if not args.no_video and not args.full_res_video
+            else None
+        )
         generated_artifacts = _generate_post_run_artifacts(
             json_path=json_path,
-            video_path=video_path if not args.no_video else None,
+            video_path=post_run_video_path,
             generate_html=post_run_generate_html,
             generate_annotated_video=(
-                post_run_generate_annotated_video and not args.no_video
+                post_run_generate_annotated_video
+                and post_run_video_path is not None
             ),
             annotated_video_no_racket=post_run_annotated_video_no_racket,
         )
@@ -2590,7 +2576,12 @@ def main() -> int:
             f"qmax={writer_stats['queue_max_size']}"
         )
     if not args.no_video:
-        print(f"  视频:       {video_path}")
+        if writer_thread is not None and writer_thread.full_res:
+            print("  视频(全分辨率):")
+            for path in writer_thread.video_paths:
+                print(f"    {path}")
+        else:
+            print(f"  视频:       {video_path}")
         if drop_count > 0:
             print(f"  视频丢帧:   {drop_count}")
     if save_logs:

@@ -97,7 +97,7 @@ def test_build_arm_report_uses_joint_stamp_pc_ns(tmp_path):
     server = TrackerReportServer(
         ("127.0.0.1", 0),
         TrackerReportHandler,
-        tracker_output_dir=tmp_path,
+        tracker_output_dirs=[tmp_path],
         poe_config_path=tmp_path / "missing_poe_config.json",
     )
     try:
@@ -209,7 +209,7 @@ def test_build_arm_report_includes_time_sync_offset_rows(tmp_path):
     server = TrackerReportServer(
         ("127.0.0.1", 0),
         TrackerReportHandler,
-        tracker_output_dir=tmp_path,
+        tracker_output_dirs=[tmp_path],
         poe_config_path=tmp_path / "missing_poe_config.json",
     )
     try:

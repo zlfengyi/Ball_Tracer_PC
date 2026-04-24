@@ -41,13 +41,15 @@
         "startup_wait_sec": 5.0
     },
 
-    "curve3": {
+    "curve4": {
         "ideal_hit_z": 0.8,
-        "cor": 0.70,
-        "cor_xy": 0.42,
+        "cor": 0.7914,
+        "cor_xy": 0.4466,
         "motion_window_s": 0.2,
         "motion_min_y": 0.5,
         "land_skip_time": 0.05,
-        "reset_timeout": 0.5
+        "reset_timeout": 0.5,
+        "k_drag": 0.024,
+        "weight_ratio": 1.0
     }
 }
