@@ -230,6 +230,10 @@ class ArchiveJob:
     ball3d: Optional[Ball3D]
     tracker_result: TrackerResult
     car_loc_sampled: bool
+    # tracker.update() 返回时的 perf_counter 时间戳（tracker_result.prediction 生成完的
+    # 时刻）；用于计算 compute latency = compute_t - ct（ct 为曝光时刻）。None 表示该帧
+    # 没有 prediction 产出或 tracker 根本没被调用。
+    compute_done_t: Optional[float] = None
 
 
 @dataclass
@@ -1466,17 +1470,27 @@ class ArchiveThread:
 
         pred = job.tracker_result.prediction
         if pred is not None:
+            compute_t = job.compute_done_t
+            compute_latency_ms = (
+                round((compute_t - pred.ct) * 1000)
+                if compute_t is not None else None
+            )
             entry["prediction"] = {
                 "x": round(pred.x, 4),
                 "y": round(pred.y, 4),
                 "z": round(pred.z, 4),
                 "stage": pred.stage,
                 "lead_ms": round((pred.ht - pred.ct) * 1000),
+                "compute_latency_ms": compute_latency_ms,
             }
-            self._log_predictions.append({
+            log_pred = {
                 "x": pred.x, "y": pred.y, "z": pred.z,
                 "stage": pred.stage, "ct": pred.ct, "ht": pred.ht,
-            })
+            }
+            if compute_t is not None:
+                # perf_counter 时刻，tracker.update() 返回那一刻；报表 latency = compute_t - ct
+                log_pred["compute_t"] = compute_t
+            self._log_predictions.append(log_pred)
 
         self._log_frames.append(entry)
         self._frame_entry_by_idx[job.frame_idx] = entry
@@ -2178,6 +2192,7 @@ def main() -> int:
                         good_dets[sn] = ball_dets[0]
 
                 # 尝试三角测量并检查重投影误差
+                compute_done_t: Optional[float] = None
                 if len(good_dets) >= min_cameras_for_3d:
                     candidate = localizer.triangulate(good_dets)
                     if candidate.reprojection_error <= max_reproj_error_px:
@@ -2189,6 +2204,9 @@ def main() -> int:
                             x=ball3d.x, y=ball3d.y,
                             z=ball3d.z, t=exposure_pc,
                         ))
+                        # 在 tracker.update() 刚返回的时刻抓 perf_counter，作为本预测的
+                        # 算完时间。compute_latency = compute_done_t - ct 即算几 ms 延迟。
+                        compute_done_t = time.perf_counter()
                     else:
                         for sn in good_dets:
                             tile_mgr.on_2d_detected(sn, frame_tiles[sn])
@@ -2238,6 +2256,7 @@ def main() -> int:
                     ball3d=ball3d,
                     tracker_result=tracker_result,
                     car_loc_sampled=car_loc_sampled,
+                    compute_done_t=compute_done_t,
                 ))
 
                 _t_other_sum += time.perf_counter() - _t2

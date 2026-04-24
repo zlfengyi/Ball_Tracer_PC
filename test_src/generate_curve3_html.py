@@ -359,6 +359,19 @@ buildPlots[0] = () => {
      marker:{color:'#8e44ad',symbol:'square',size:4}, yaxis:'y2',
      hovertemplate:'t=%{x:.3f}s<br>lead=%{y:.1f} ms<extra>S1 lead</extra>'}),
 
+    // compute_latency = compute_t - ct（算完时刻 − 曝光时刻；tracker 内部耗时）
+    // 旧 JSON 没有 compute_t 时过滤掉，避免 null 画成 0
+    g2({x:s0.filter(p=>p.compute_t!=null).map(p=>relTime(p.ct)),
+        y:s0.filter(p=>p.compute_t!=null).map(p=>(p.compute_t-p.ct)*1000),
+        name:'S0 compute(ms)', mode:'markers',
+        marker:{color:'#f39c12',symbol:'triangle-up',size:4}, yaxis:'y2',
+        hovertemplate:'t=%{x:.3f}s<br>compute=%{y:.1f} ms<extra>S0 compute</extra>'}),
+    g2({x:s1.filter(p=>p.compute_t!=null).map(p=>relTime(p.ct)),
+        y:s1.filter(p=>p.compute_t!=null).map(p=>(p.compute_t-p.ct)*1000),
+        name:'S1 compute(ms)', mode:'markers',
+        marker:{color:'#d35400',symbol:'square',size:4}, yaxis:'y2',
+        hovertemplate:'t=%{x:.3f}s<br>compute=%{y:.1f} ms<extra>S1 compute</extra>'}),
+
     ...(car.length ? [
     g2({x:car.map(c=>relTime(c.t)), y:car.map(c=>c.x), name:'Car X', mode:'markers',
      marker:{color:'#2ecc71',symbol:'circle',size:2},
@@ -415,6 +428,18 @@ buildPlots[1] = () => {
   tr.push(g2({x:s1.map(p=>relTime(p.ct)),y:s1.map(p=>(p.ht-p.ct)*1000),name:'S1 lead',mode:'markers',
     marker:{color:'#8e44ad',symbol:'square',size:3},
     hovertemplate:'t=%{x:.3f}s<br>lead=%{y:.1f} ms<extra>S1</extra>',
+    yaxis:'y4',xaxis:'x'}));
+  tr.push(g2({x:s0.filter(p=>p.compute_t!=null).map(p=>relTime(p.ct)),
+    y:s0.filter(p=>p.compute_t!=null).map(p=>(p.compute_t-p.ct)*1000),
+    name:'S0 compute',mode:'markers',
+    marker:{color:'#f39c12',symbol:'triangle-up',size:3},
+    hovertemplate:'t=%{x:.3f}s<br>compute=%{y:.1f} ms<extra>S0</extra>',
+    yaxis:'y4',xaxis:'x'}));
+  tr.push(g2({x:s1.filter(p=>p.compute_t!=null).map(p=>relTime(p.ct)),
+    y:s1.filter(p=>p.compute_t!=null).map(p=>(p.compute_t-p.ct)*1000),
+    name:'S1 compute',mode:'markers',
+    marker:{color:'#d35400',symbol:'square',size:3},
+    hovertemplate:'t=%{x:.3f}s<br>compute=%{y:.1f} ms<extra>S1</extra>',
     yaxis:'y4',xaxis:'x'}));
 
   Plotly.newPlot('c1',tr,{
