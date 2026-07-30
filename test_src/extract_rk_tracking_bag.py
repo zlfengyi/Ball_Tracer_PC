@@ -183,6 +183,7 @@ def main() -> int:
                 yaw=payload.get("yaw"),
                 vx=payload.get("vx"),
                 vy=payload.get("vy"),
+                imu_t=(payload.get("imu_t") - t0) if _finite(payload.get("imu_t")) else None,
                 phase=payload.get("phase"),
                 steer_angle=payload.get("steer_angle"),
                 remaining=payload.get("remaining") if target_active else None,
