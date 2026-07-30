@@ -33,15 +33,17 @@
 
 ### AprilTag 与 p_car
 
-- 多目视觉先三角化得到的是 `p_apriltag`，它表示 **AprilTag 中心** 在世界坐标系下的位置
+- 多目视觉按 tag 平面竖直、上边水平，用固定中心高度和真实边长拟合得到 `p_apriltag`，它表示 **AprilTag 中心** 在世界坐标系下的位置
 - 然后再按固定偏移换算为 `p_car`
-- 当前项目约定直接在 **世界坐标轴** 下使用这个偏移，不再额外乘车体朝向
+- 水平偏移定义在 **车体坐标轴** 下，并按当前 `yaw_car` 旋转到世界坐标系
 
 公式是：
 
 ```text
 p_apriltag = (x, y, z)
-p_car      = (x + 0.04, y + 0.16, z - 0.61)   [m]
+d_body     = (0.04, 0.16, -0.61)
+p_car.xy   = p_apriltag.xy + Rz(yaw_car) * d_body.xy
+p_car.z    = z + d_body.z                                      [m]
 ```
 
 也就是：
@@ -50,7 +52,7 @@ p_car      = (x + 0.04, y + 0.16, z - 0.61)   [m]
 apriltag_center_to_car_base_offset = (40, 160, -610)   [mm]
 ```
 
-物理含义（2026-07-05 重新测量）：tag 中心相对小车原点（世界轴向）在 x −40mm（左方）、y −160mm（后方）、z +610mm（地面上方），反号即得上面的偏移。
+物理含义（2026-07-05 重新测量）：tag 中心相对小车原点在车体系 x −40mm（左方）、y −160mm（后方）、z +610mm（地面上方），反号即得上面的偏移。
 
 ## 2. 配置字段含义
 
@@ -83,13 +85,18 @@ apriltag_center_to_car_base_offset = (40, 160, -610)   [mm]
 - `car_base_definition`
   说明 `p_car` 表示车底盘中心，并且这个点与机械臂 `base` 是同一个物理点
 - `apriltag_center_measurement`
-  说明 `p_apriltag` 是 AprilTag 中心的多目三角化结果
+  说明 `p_apriltag` 由平面竖直、上边水平、固定中心高度和固定黑边边长的 AprilTag 四角刚体拟合得到
 - `p_car_definition`
-  说明 `p_car` 不是直接三角化出来的 tag 点，而是 `p_apriltag` 加上固定偏移
+  说明 `p_car` 不是 tag 中心，而是按车体 yaw 旋转安装偏移后得到的底盘中心
+- `apriltag_black_edge_m / apriltag_center_height_m`
+  分别给出实测黑色方形边长 `0.161m` 和竖直安装的 tag 中心高度 `0.61m`
+- `apriltag_to_car_yaw_offset_rad`
+  给出 tag 的 `0→1` 方向到车体 yaw 的固定偏移；当前 `0.0160rad` 由
+  `tracker_20260730_102443` 开始静止段（车体真实 `yaw=0`）的竖直刚体解中位数标定
 - `apriltag_center_to_car_base_offset_m / _mm`
   给出 AprilTag 中心到车底盘中心的固定平移
 - `offset_axis_convention`
-  明确这个偏移是直接按世界坐标系轴方向相加
+  明确水平偏移位于车体系（x 向右、y 向前），使用车体 yaw 旋转到世界系；z 为竖直偏移
 
 ### measurement_target
 

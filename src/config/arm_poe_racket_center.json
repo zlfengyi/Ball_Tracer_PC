@@ -30,8 +30,11 @@
   },
   "vehicle_reference": {
     "car_base_definition": "car chassis center in world coordinates. In this project it is the same physical point as the robotic arm base used by the exported POE model.",
-    "apriltag_center_measurement": "p_apriltag is the multi-camera triangulated world position of the detected AprilTag center.",
-    "p_car_definition": "p_car = p_apriltag + apriltag_center_to_car_base_offset_world",
+    "apriltag_center_measurement": "p_apriltag is estimated by fitting the four detected black-border corners as an upright rigid square at fixed center height.",
+    "p_car_definition": "p_car = p_apriltag + Rz(yaw_car) * apriltag_center_to_car_base_offset_body",
+    "apriltag_black_edge_m": 0.161,
+    "apriltag_center_height_m": 0.61,
+    "apriltag_to_car_yaw_offset_rad": 0.016,
     "apriltag_center_to_car_base_offset_m": [
       0.04,
       0.16,
@@ -42,7 +45,7 @@
       160.0,
       -610.0
     ],
-    "offset_axis_convention": "The offset is applied directly in the world frame axes, exactly as p_car = (x + 0.04, y + 0.16, z - 0.61) when p_apriltag = (x, y, z) in meters."
+    "offset_axis_convention": "The horizontal offset is expressed in the car body frame (x right, y forward) and rotated into the world frame by yaw_car. The z offset is vertical."
   },
   "T_base_in_world": {
     "R": [

@@ -182,6 +182,7 @@ def test_apply_car_result_serializes_frame_fields():
         pixels={"cam1": (10.2, 20.6)},
         reprojection_error=1.234,
         yaw=0.5,
+        yaw_valid=False,
     )
 
     apply_car_result(frame_data, car_loc, elapsed_s=3.21)
@@ -190,6 +191,7 @@ def test_apply_car_result_serializes_frame_fields():
     assert frame_data["car_loc_sampled"] is True
     assert frame_data["car_loc"]["t"] == 123.456
     assert frame_data["car_loc"]["elapsed_s"] == 3.21
+    assert frame_data["car_loc"]["yaw_valid"] is False
     assert frame_data["car_loc"]["pixels"]["cam1"] == [10, 21]
 
 

@@ -237,7 +237,7 @@ def main() -> int:
     print(f"Racket pose provider: {args.racket_pose_provider}")
     print(f"Loop rate:     {args.rate_hz:.2f} Hz")
     print(
-        "AprilTag->car/base offset (world axes): "
+        "AprilTag->car/base offset (car body axes): "
         f"{format_vec(poe_model.apriltag_to_car_base_offset_mm)} mm"
     )
 
@@ -304,26 +304,22 @@ def main() -> int:
                 car_loc = None
                 car_world_mm = None
                 if best_tag is not None:
-                    car_loc = car_localizer.triangulate(best_tag_dets, t=time.perf_counter())
-                    car_world_mm = (
-                        float(car_loc.x + poe_model.apriltag_to_car_base_offset_mm[0]),
-                        float(car_loc.y + poe_model.apriltag_to_car_base_offset_mm[1]),
-                        float(car_loc.z + poe_model.apriltag_to_car_base_offset_mm[2]),
+                    car_loc = car_localizer.estimate_pose(
+                        best_tag_dets, t=time.perf_counter()
                     )
-                    print(
-                        "detail: p_apriltag "
-                        f"tag={car_loc.tag_id}  {format_vec((car_loc.x, car_loc.y, car_loc.z))} mm  "
-                        f"yaw={math.degrees(car_loc.yaw):.1f} deg  "
-                        f"reproj={car_loc.reprojection_error:.2f}px  "
-                        f"cams={'+'.join(sn[-4:] for sn in car_loc.cameras_used)}"
+                    car_world_mm = tuple(
+                        1000.0 * float(value)
+                        for value in (car_loc.x, car_loc.y, car_loc.z)
                     )
                     print(
                         "detail: p_car "
-                        f"{format_vec(car_world_mm)} mm  "
-                        f"(p_apriltag + {format_vec(poe_model.apriltag_to_car_base_offset_mm)} mm)"
+                        f"tag={car_loc.tag_id}  {format_vec(car_world_mm)} mm  "
+                        f"yaw={math.degrees(car_loc.yaw):.1f} deg  "
+                        f"yaw_valid={car_loc.yaw_valid}  "
+                        f"reproj={car_loc.reprojection_error:.2f}px  "
+                        f"cams={'+'.join(sn[-4:] for sn in car_loc.cameras_used)}"
                     )
                 else:
-                    print("detail: p_apriltag unavailable (<2 cameras with the same AprilTag)")
                     print("detail: p_car unavailable")
 
                 racket_dets, racket_loc = racket_localizer.locate(images)

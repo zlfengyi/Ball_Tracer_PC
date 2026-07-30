@@ -531,6 +531,7 @@ def serialize_car_loc(obj3d: CarLoc, *, elapsed_s: float | None) -> dict:
         "y": round(obj3d.y, 4),
         "z": round(obj3d.z, 4),
         "yaw": round(obj3d.yaw, 4),
+        "yaw_valid": obj3d.yaw_valid,
         "t": obj3d.t,
         "elapsed_s": round(elapsed_s, 3) if elapsed_s is not None else None,
         "tag_id": obj3d.tag_id,
@@ -896,7 +897,8 @@ def annotate_frame(
         cams = "+".join(s[-3:] for s in frame_car_loc["cameras_used"])
         lines.append((
             f"car: {_format_xyz_m(frame_car_loc['x'], frame_car_loc['y'], frame_car_loc['z'])}  "
-            f"yaw={math.degrees(frame_car_loc['yaw']):.1f}deg  cams={cams}",
+            f"yaw={math.degrees(frame_car_loc['yaw']):.1f}deg "
+            f"({'valid' if frame_car_loc['yaw_valid'] else 'position only'})  cams={cams}",
             (0, 200, 255),
         ))
 
@@ -949,6 +951,7 @@ def main() -> None:
     )
 
     serials = data["config"]["serials"]
+    calib_config_path = data["config"]["calib_config_path"]
     n_cams = len(serials)
     frames_data = data["frames"]
     racket_enabled = not args.no_racket
@@ -983,7 +986,11 @@ def main() -> None:
     if racket_enabled:
         clear_racket_results(data)
 
-    car_localizer = CarLocalizer() if car_enabled else None
+    car_localizer = (
+        CarLocalizer(calib_config_path=calib_config_path)
+        if car_enabled
+        else None
+    )
 
     writer = None
     if not args.no_output_video:

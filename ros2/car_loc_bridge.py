@@ -4,7 +4,7 @@ UDP → ROS2 桥接节点：接收 run_tracker 通过 UDP 发送的数据，
 按 topic 字段路由到对应的 ROS2 topic。
 
 支持的 topic：
-  - /pc_car_loc       小车位置 + yaw
+  - /pc_car_loc       小车位置 + 带有效标记的 yaw
   - /predict_hit_pos  预测击球位置
 
 run_tracker.py (Python 3.13) 通过 UDP sendto 127.0.0.1:5858 发送 JSON，

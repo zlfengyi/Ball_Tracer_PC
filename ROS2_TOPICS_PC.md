@@ -60,6 +60,7 @@ PC 侧 AprilTag 多目定位成功后发布的小车位置结果。
   "y": 1.2345,
   "z": 0.0000,
   "yaw": 0.4567,
+  "yaw_valid": true,
   "t": 411987136.914000,
   "tag_id": 5
 }
@@ -73,7 +74,8 @@ PC 侧 AprilTag 多目定位成功后发布的小车位置结果。
 | `x` | `number` | 小车 `car_base` 参考点世界坐标 X，单位米 |
 | `y` | `number` | 小车 `car_base` 参考点世界坐标 Y，单位米 |
 | `z` | `number` | 小车 `car_base` 参考点世界坐标 Z，单位米 |
-| `yaw` | `number` | 小车绕 z 轴朝向，单位弧度 |
+| `yaw` | `number` | 本帧估计的小车绕 z 轴朝向，单位弧度 |
+| `yaw_valid` | `boolean` | 最终至少 3 台相机且四角重投影误差合格时为 `true`，RK 才使用 `yaw` 修正航向；否则本帧只修正 `x/y` |
 | `t` | `number` | 定位时间，时间轴是 Windows `perf_counter()` 秒 |
 | `tag_id` | `integer` | 本次定位使用到的 AprilTag ID |
 

@@ -480,7 +480,8 @@ class DirectRos2Sink:
             "/pc_car_loc "
             f"#{self._car_count}: "
             f"x={payload.get('x')} y={payload.get('y')} z={payload.get('z')} "
-            f"yaw={payload.get('yaw')} tag_id={payload.get('tag_id')}",
+            f"yaw={payload.get('yaw')} yaw_valid={payload.get('yaw_valid')} "
+            f"tag_id={payload.get('tag_id')}",
             flush=True,
         )
 
@@ -1426,6 +1427,7 @@ class ArchiveThread:
             "y": round(loc.y, 4),
             "z": round(loc.z, 4),
             "yaw": round(loc.yaw, 4),
+            "yaw_valid": loc.yaw_valid,
             "t": ev.exposure_pc,
             "elapsed_s": (
                 round(ev.elapsed_s, 3)
@@ -1445,6 +1447,7 @@ class ArchiveThread:
             "y": round(loc.y, 4),
             "z": round(loc.z, 4),
             "yaw": round(loc.yaw, 4),
+            "yaw_valid": loc.yaw_valid,
             "t": ev.exposure_pc,
             "elapsed_s": (
                 round(ev.elapsed_s, 3) if ev.elapsed_s is not None else None
@@ -1881,6 +1884,7 @@ def main() -> int:
                             "y": round(loc.y, 4),
                             "z": round(loc.z, 4),
                             "yaw": round(loc.yaw, 4),
+                            "yaw_valid": loc.yaw_valid,
                             "t": round(job.exposure_pc, 6),
                             "tag_id": loc.tag_id,
                         })
@@ -2288,6 +2292,7 @@ def main() -> int:
         "config": {
             "first_frame_exposure_pc": first_frame_exposure_pc,
             "serials": cam_serials,
+            "calib_config_path": str(Path(args.calib_config).resolve()),
             "duration_s": processing_elapsed,
             "end_to_end_duration_s": total_elapsed,
             "fps": capture_fps,
