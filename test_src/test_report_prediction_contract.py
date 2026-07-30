@@ -78,6 +78,25 @@ def test_accepted_is_matched_by_source_ct_only(tmp_path):
     assert result == {"matched": 1, "unmatched": None}
 
 
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_accepted_raw_message_match_rejects_adjacent_prediction(tmp_path):
+    core = _core(
+        "arm-prediction-match-core-begin",
+        "arm-prediction-match-core-end",
+    )
+    harness = (
+        f"{core}\n"
+        "const acceptT=10.0, acceptX=1.0375, acceptZ=1.3362, duration=0.3216;\n"
+        "const actual={rel_x:1.0375,rel_z:1.4892,relSrc:'target',ht:10.3216};\n"
+        "const adjacent={rel_x:1.0376,rel_z:1.5058,relSrc:'target',ht:10.3221};\n"
+        "console.log(JSON.stringify({"
+        "actual:armPredictionMatchesAccepted(actual,acceptT,acceptX,acceptZ,duration),"
+        "adjacent:armPredictionMatchesAccepted(adjacent,acceptT,acceptX,acceptZ,duration)}));\n"
+    )
+    result = _run_node(tmp_path, harness)
+    assert result == {"actual": True, "adjacent": False}
+
+
 def test_pc_truth_uses_each_contracts_own_ht():
     source = SRC.read_text(encoding="utf-8")
     assert "const truth=pcTruthAt(htPc);" in source
@@ -91,14 +110,22 @@ def test_rk300_table_includes_last_accepted_target_and_tcp_at_accepted_ht():
     assert "const accepted=lastAcceptedForThrow(th);" in source
     assert "const accHt=accepted&&isNum(accepted.wht)?accepted.wht-RK.t0:null;" in source
     assert "const tcp=accHt!=null?tcpAt(accHt):null;" in source
+    assert "const tcpWorld=tcp?[tcp[0],tcp[1],tcp[2]-(isNum(armZOff)?armZOff:0)]:null;" in source
+    assert "const tcpCell=tcpWorld?tableXyz(tcpWorld[0],tcpWorld[1],tcpWorld[2]):tableFmt(null,4);" in source
+    assert "const tcpAcceptedDx=accepted&&tcpWorld&&isNum(accepted.wx)?(tcpWorld[0]-accepted.wx)*100:null;" in source
+    assert "const tcpAcceptedDz=accepted&&tcpWorld&&isNum(accepted.wz)?(tcpWorld[2]-accepted.wz)*100:null;" in source
+    assert "armPredictionMatchesAccepted(p,e.t+RK.t0,rec.tx,rec.tz,dur)" in source
     headers = [
         "<th>机械臂最后accepted目标 x/z(m)</th>",
         "<th>PC真值@RK HT x/z(m)</th>",
-        "<th>TCP@accepted HT x/z(m)</th>",
+        "<th>TCP@accepted HT x/y/z(m)</th>",
+        "<th>TCP−accepted dx/dz(cm)</th>",
     ]
     assert [source.index(header) for header in headers] == sorted(
         source.index(header) for header in headers
     )
+    assert "<th>/tennis/status 字符串</th>" not in source
+    assert "<th>/predict_hit_pos 字符串</th>" not in source
 
 
 def test_rk300_table_shows_reject_reasons_only_without_accepted():
