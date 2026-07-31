@@ -807,9 +807,17 @@ const armDispOff = () => armAligned ? rkOffset : 0;
 // start_hit = accept_t + duration − hit_time，finish_hit = accept_t + duration。
 // 同一抛会连续 accept 多条更新：聚类为一组，cmd 取第一条（臂开始动作），
 // start/done/目标取最后一条（最终执行的时序与目标）。
-// 每条 accepted 回配它对应的 /predict_hit_pos 原消息（duration 逐位相等 / rel_x 直通），
-// 拿到世界系目标 (rel_x, rel_z)，并统计臂端 z 偏移 zOff = accepted_z − rel_z
-// （部署版把 rel_z 转臂系用的常数，0712 实测 −0.178，本地 config 的 −0.05 已过期）。
+// 每条 accepted 用 x、机械臂当前 z 补偿和接触 HT 回配实际消费的 /predict_hit_pos，
+// 并统计臂端 z 偏移 zOff = accepted_z − rel_z。
+// [[arm-prediction-match-core-begin]]
+const ARM_HIT_Z_OFFSET=-0.153;
+const armPredictionMatchesAccepted = (p,acceptT,acceptX,acceptZ,acceptDuration) => {
+  const zOffset=p.relSrc==='panel'?0:ARM_HIT_Z_OFFSET;
+  return Math.abs(p.rel_x-acceptX)<5e-4 &&
+    Math.abs(p.rel_z+zOffset-acceptZ)<5e-4 &&
+    Math.abs(p.ht-(acceptT+acceptDuration))<5e-3;
+};
+// [[arm-prediction-match-core-end]]
 const armPreds = (()=>{
   if(!ARM) return [];
   const out=[];
@@ -819,7 +827,7 @@ const armPreds = (()=>{
       const p=JSON.parse(e.text);
       out.push({t:e.t, rel_x:Number(p.rel_x), rel_y:Number(p.rel_y), rel_z:Number(p.rel_z),
                 duration:Number(p.duration), ht:Number(p.ht), ct:Number(p.ct), stage:Number(p.stage),
-                nFit:Number(p.n_bounce_fit)});
+                nFit:Number(p.n_bounce_fit), relSrc:String(p.rel_src||'?')});
     }catch(err){}
   });
   return out;
@@ -834,12 +842,13 @@ const _armHit = (()=>{
     if(m){
       const dur=Number(m[3]), hitT=m[4]!=null?Number(m[4]):0.4;
       rec={cmd:e.t, lastAcceptT:e.t, tx:Number(m[1]), tz:Number(m[2]), start:e.t+dur-hitT, done:e.t+dur,
-           label:'hit', n:1, wx:null, wy:null, wz:null, wct:null, wht:null, wpredT:null, wstage:null, wnFit:null};
+           label:'hit', n:1,
+           wx:null, wy:null, wz:null, wct:null, wht:null, wpredT:null, wstage:null, wnFit:null};
       for(let i=armPreds.length-1;i>=0;i--){
         const p=armPreds[i];
         if(p.t>e.t) continue;
         if(e.t-p.t>0.25) break;
-        if(Math.abs(p.duration-dur)<2e-3 || Math.abs(p.rel_x-rec.tx)<5e-4){
+        if(armPredictionMatchesAccepted(p,e.t+RK.t0,rec.tx,rec.tz,dur)){
           rec.wx=p.rel_x; rec.wy=p.rel_y; rec.wz=p.rel_z; rec.wct=p.ct; rec.wht=p.ht;
           rec.wpredT=p.t; rec.wstage=p.stage; rec.wnFit=p.nFit;
           if(isNum(p.rel_z)) zOffs.push(rec.tz-p.rel_z);
@@ -969,6 +978,8 @@ const reportThrows = rkThrows.filter(t=>(t.msgs||0)>=3).sort((a,b)=>a.ht-b.ht);
 const tableFmt = (v,d) => isNum(v) ? Number(v).toFixed(d) : '—';
 const tableXz = (x,z,d=4) => (isNum(x)&&isNum(z)) ? Number(x).toFixed(d)+'/'+Number(z).toFixed(d) : '—';
 const tableSigned = v => isNum(v) ? (v>=0?'+':'')+Number(v).toFixed(1) : '—';
+const tableXyz = (x,y,z,d=4) => (isNum(x)&&isNum(y)&&isNum(z))
+  ? Number(x).toFixed(d)+'/'+Number(y).toFixed(d)+'/'+Number(z).toFixed(d) : tableFmt(null,d);
 const tableEsc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 const visualRacketCell = fit => {
   if(!fit) return '—';
@@ -1034,13 +1045,17 @@ const rk300TableHtml = () => {
     const accHt=accepted&&isNum(accepted.wht)?accepted.wht-RK.t0:null;
     const tcp=accHt!=null?tcpAt(accHt):null;
     const acceptedTarget=accepted?tableXz(accepted.wx,accepted.wz):'—';
-    const tcpWorld=tcp?[tcp[0],tcp[2]-(isNum(armZOff)?armZOff:0)]:null;
-    const tcpCell=tcpWorld?tableXz(tcpWorld[0],tcpWorld[1]):'—';
+    const tcpWorld=tcp?[tcp[0],tcp[1],tcp[2]-(isNum(armZOff)?armZOff:0)]:null;
+    const tcpCell=tcpWorld?tableXyz(tcpWorld[0],tcpWorld[1],tcpWorld[2]):tableFmt(null,4);
+    const tcpAcceptedDx=accepted&&tcpWorld&&isNum(accepted.wx)?(tcpWorld[0]-accepted.wx)*100:null;
+    const tcpAcceptedDz=accepted&&tcpWorld&&isNum(accepted.wz)?(tcpWorld[2]-accepted.wz)*100:null;
+    const tcpAcceptedError=tableSigned(tcpAcceptedDx)+'/'+tableSigned(tcpAcceptedDz);
     const visualRacket=accHt!=null?visualRacketAt(accHt+rkOffset):null;
     const visualRacketValue=visualRacketCell(visualRacket);
     const rejectNote=accepted?'—':rejectNoteForThrow(th);
     if(!isNum(th.ref300T)||!isNum(th.ref300Ht)||!isNum(th.ref300X)||!isNum(th.ref300Z)){
-      return '<tr><td>'+(idx+1)+'</td><td>—</td><td>—</td><td>—</td><td>—</td><td>'+acceptedTarget+'</td><td>—</td><td>'+tcpCell+'</td><td>'+visualRacketValue+'</td>'+
+      return '<tr><td>'+(idx+1)+'</td><td>—</td><td>—</td><td>—</td><td>—</td><td>'+acceptedTarget+'</td>'+
+        '<td>—</td><td>'+tcpCell+'</td><td>'+tcpAcceptedError+'</td><td>'+visualRacketValue+'</td>'+
         '<td>—</td><td>—</td><td>—</td>'+
         '<td><span style="color:#fbbf24">无S1@300ms</span> / msgs='+(th.msgs||0)+'</td><td>'+rejectNote+'</td></tr>';
     }
@@ -1062,6 +1077,7 @@ const rk300TableHtml = () => {
       '<td>'+acceptedTarget+'</td>'+
       '<td>'+pcTruthCell(truth)+'</td>'+
       '<td>'+tcpCell+'</td>'+
+      '<td>'+tcpAcceptedError+'</td>'+
       '<td>'+visualRacketValue+'</td>'+
       '<td>'+tableSigned(dx)+'/'+tableSigned(dz)+'</td>'+
       '<td>'+(meet?meet.t.toFixed(3)+meet.tag:'—')+'</td>'+
@@ -1080,8 +1096,10 @@ const rk300TableHtml = () => {
   ];
   return '<div class="armTblWrap"><table class="armTbl"><thead><tr>'+
     '<th>#</th><th>RK ct@≈300ms<br>(s,PC轴)</th><th>RK HT@≈300ms<br>(s,PC轴)</th><th>lead(ms)</th>'+
-    '<th>RK@≈300ms x/z(m)</th><th>机械臂最后accepted目标 x/z(m)</th><th>PC真值@RK HT x/z(m)</th>'+
-    '<th>TCP@accepted HT x/z(m)</th><th>视觉球拍@accepted HT x/z(m)<br>(相对小车)</th><th>RK−PC dx/dz(mm)</th>'+
+    '<th>RK@≈300ms x/z(m)</th><th>机械臂最后accepted目标 x/z(m)</th>'+
+    '<th>PC真值@RK HT x/z(m)</th>'+
+    '<th>TCP@accepted HT x/y/z(m)</th><th>TCP−accepted dx/dz(cm)</th>'+
+    '<th>视觉球拍@accepted HT x/z(m)<br>(相对小车)</th><th>RK−PC dx/dz(mm)</th>'+
     '<th>PC相会t(s)</th><th>HT−相会(ms)</th><th>消息</th><th>备注</th></tr></thead>'+
     '<tbody>'+rows.join('')+'</tbody></table>'+
     '<div style="font-size:11px;color:#a0a0c0;margin:2px 0 6px">'+notes.join('；')+'。</div></div>';

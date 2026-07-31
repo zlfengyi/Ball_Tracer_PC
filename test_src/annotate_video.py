@@ -363,6 +363,7 @@ def extract_fullres_panels(
 def init_racket_pipeline(
     first_frame: np.ndarray,
     serials: list[str],
+    calib_config_path: str | Path,
     racket_model_path: str | Path,
     conf_threshold: float,
     pose_model_path: str | Path,
@@ -378,6 +379,7 @@ def init_racket_pipeline(
         raise FileNotFoundError(f"找不到球拍关键点模型: {pose_model_path}")
 
     localizer = RacketLocalizer(
+        calib_config_path=str(calib_config_path),
         racket_model_path=racket_model_path,
         pose_model_path=pose_model_path,
         bbox_conf=conf_threshold,
@@ -1061,6 +1063,7 @@ def main() -> None:
                     racket_pipeline = init_racket_pipeline(
                         first_frame=img,
                         serials=serials,
+                        calib_config_path=calib_config_path,
                         racket_model_path=args.racket_model,
                         conf_threshold=args.racket_conf,
                         pose_model_path=args.racket_pose_model,

@@ -55,6 +55,11 @@ function Get-TcpPortOwnerText {
 }
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+
+if (-not $TrackerOutputDir) {
+    $TrackerOutputDir = Join-Path $scriptDir "tracker_output"
+}
+
 $candidates = @(
     (Join-Path $scriptDir ".venv_ros2\Scripts\python.exe"),
     (Join-Path $scriptDir ".venv_clean\Scripts\python.exe")
