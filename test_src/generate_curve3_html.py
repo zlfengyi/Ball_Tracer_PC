@@ -1798,6 +1798,14 @@ buildPlots[5] = () => {
     hovertemplate:`t=%{x:.3f}s<br>${name}=%{y:.4f}<extra>${name}</extra>`,
     ...extra,
   });
+  const rkWorldTr = (key,name,color,extra={}) => tr(RK.world,key,name,'y',color,'markers',{
+    customdata:ts(RK.world).map((_,i)=>[
+      ys(RK.world,'result_t')[i],
+      ys(RK.world,'latency_ms')[i],
+    ]),
+    hovertemplate:`t=%{x:.3f}s<br>${name}=%{y:.4f}m<br>result_t=%{customdata[0]:.6f}s<br>latency=%{customdata[1]:.1f} ms<extra>${name}</extra>`,
+    ...extra,
+  });
   const rkPredTr = (key,name,color,extra={}) => tr(RK.pred,key,name,'y',color,'markers',{
     customdata:ys(RK.pred,'duration').map((v,i)=>[isNum(v)?v*1000:null, isNum(rkPredNFit[i])?rkPredNFit[i]:'']),
     hovertemplate:`t=%{x:.3f}s<br>${name}=%{y:.4f}m<br>remaining=%{customdata[0]:.1f} ms n_fit=%{customdata[1]}<extra>${name}</extra>`,
@@ -1932,9 +1940,9 @@ buildPlots[5] = () => {
     pcTr('x','PC Ball X','#7f8c8d',{visible:'legendonly'}),
     pcTr('y','PC Ball Y','#95a5a6',{visible:'legendonly'}),
     pcTr('z','PC Ball Z','#bdc3c7'),
-    tr(RK.world,'x','RK World X','y','#3498db','markers',{visible:'legendonly'}),
-    tr(RK.world,'y','RK World Y','y','#2980b9','markers',{visible:'legendonly'}),
-    tr(RK.world,'z','RK World Z','y','#5cd0ff'),
+    rkWorldTr('x','RK World X','#3498db',{visible:'legendonly'}),
+    rkWorldTr('y','RK World Y','#2980b9',{visible:'legendonly'}),
+    rkWorldTr('z','RK World Z','#5cd0ff'),
     rkPredTr('x','RK Predict X','#f97316',{visible:'legendonly',marker:{color:'#f97316',size:6,symbol:'triangle-up'}}),
     rkPredTr('y','RK Predict Y','#fb923c',{visible:'legendonly',marker:{color:'#fb923c',size:6,symbol:'triangle-up'}}),
     rkPredTr('z','RK Predict Z','#e94560',{marker:{color:'#e94560',size:6,symbol:'triangle-up'}}),

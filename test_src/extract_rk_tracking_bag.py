@@ -106,6 +106,19 @@ def main() -> int:
         raise RuntimeError("no RK payload time field t/ct found in bag")
     t0 = min(t0_candidates)
 
+    ball_timing_by_shot_t: dict[float, tuple[float, float]] = {}
+    for topic, _stamp_ns, payload in rows:
+        if topic != "/ball_loc_topic":
+            continue
+        shot_t = _payload_time(topic, payload)
+        result_t = payload.get("result_t")
+        if shot_t is not None and _finite(result_t):
+            result_t = float(result_t)
+            ball_timing_by_shot_t[round(shot_t, 6)] = (
+                result_t,
+                (result_t - shot_t) * 1000.0,
+            )
+
     ball = _new_series()
     world = _new_series()
     pred = _new_series()
@@ -130,9 +143,23 @@ def main() -> int:
         key = _topic_key(topic)
 
         if key == "ball_loc_topic":
-            _add(ball, t, x=payload.get("x"), y=payload.get("y"), z=payload.get("z"))
+            result_t, latency_ms = ball_timing_by_shot_t.get(
+                round(payload_t, 6), (None, None)
+            )
+            _add(
+                ball,
+                t,
+                x=payload.get("x"),
+                y=payload.get("y"),
+                z=payload.get("z"),
+                result_t=result_t,
+                latency_ms=latency_ms,
+            )
             _append_xyz(xy_ball, t, payload)
         elif key == "ball_world_topic":
+            result_t, latency_ms = ball_timing_by_shot_t.get(
+                round(payload_t, 6), (None, None)
+            )
             _add(
                 world,
                 t,
@@ -143,6 +170,8 @@ def main() -> int:
                 bot_x=payload.get("bot_x"),
                 bot_y=payload.get("bot_y"),
                 bot_yaw=payload.get("bot_yaw"),
+                result_t=result_t,
+                latency_ms=latency_ms,
             )
             _append_xyz(xy_world, t, payload)
         elif key == "predict_hit_pos":
