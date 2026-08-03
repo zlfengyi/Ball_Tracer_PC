@@ -975,6 +975,18 @@ const armPredictionMatchesAccepted = (p,acceptT,acceptX,acceptZ,acceptDuration) 
     Math.abs(p.ht-(acceptT+acceptDuration))<3e-2;
 };
 // [[arm-prediction-match-core-end]]
+// arm_controller 常量（config.py）：臂内触球 = 原始 ht − HIT_TIME_ADVANCE_SEC。
+const HIT_TIME_ADVANCE_SEC=0.010;
+// 挥拍中 ht 重定相（arm_controller 2026-08-03）：挥拍窗（触球前 HIT_T）内到达的新预测不再
+// 拒收，只把触球时刻存进 swing.late_ht（status: `late ht saved: contact in Xs`）；到
+// 「老触球 − SWING_HT_UPDATE_LEAD_SEC」那一个 tick 用最后存下的那条一次性重建挥拍段，
+// 并置 ht_replanned=True——之后的消息一律 `reject hit: hit phase in progress`。故
+// **该次挥拍最后一条 late ht saved 就是被消费的那条**（触发 tick 之后不可能再有 saved）。
+// 新触球距触发点不足 SWING_HT_UPDATE_MIN_REMAINING_SEC 则放弃重定相、沿用老时间轴。
+// reswing 结果只写 controller.last_status、没有发上 /tennis/status，所以这里按同款条件离线重建。
+const SWING_HT_UPDATE_LEAD_SEC=0.100;
+const SWING_HT_UPDATE_MIN_REMAINING_SEC=0.060;
+// [[arm-swing-ht-core-begin]] —— test_report_prediction_contract.py 抽取此段在 node 里回归
 const armPreds = (()=>{
   if(!ARM) return [];
   const out=[];
@@ -993,14 +1005,39 @@ const armPreds = (()=>{
 const _armHit = (()=>{
   if(!ARM) return {marks:[], zOff:null};
   const out=[], zOffs=[];
+  // late ht saved 状态只写 duration、不写 ht，必须回配到原 /predict_hit_pos 才拿得到原始 ht。
+  // on_hit_pos 里两者严格一对一（收一条必回一条），且两个 topic 各自的时间序在 bag 里都保序，
+  // 但**跨 topic 的 bag 读出顺序会错位**（同一场实测出现过 S,S,P,P），所以不能按事件流 FIFO 配。
+  // 做法：以 x/z 双 5e-4 精确回配成功的那条 accepted 为锚，按「hit_pos 派生状态的序号差 =
+  // 预测序号差」平移——同一次挥拍里锚点与 late 只隔 ~300ms，中间不会丢消息。
+  // 每条再自校验 now=ht−10ms−duration 必须落在 [状态发布时刻−4ms, +0.6ms]（duration 打印
+  // 只到 1ms，发布开销实测 0.3~1.4ms；错配一格会让 now 跑到发布时刻之后，物理上不可能）。
+  let si=-1;              // hit_pos 派生状态的序号
+  let anchorSi=null, anchorPi=null;
   (ARM.events||[]).forEach(e=>{
     if(e.topic!=='/tennis/status') return;
+    if(!/^(accepted hit |late ht saved|reject hit:|error hit_pos)/.test(e.text)) return;
+    si++;
     let rec=null;
-    let m=/^accepted hit x=([\-0-9.]+) z=([\-0-9.]+) duration=([0-9.]+)(?:\s+hit_time=([0-9.]+))?/.exec(e.text);
+    let m=/^late ht saved: contact in ([0-9.]+)s/.exec(e.text);
+    if(m){
+      const cur=out[out.length-1];
+      if(cur && cur.label==='hit' && e.t<=cur.done+0.05){
+        const dur=Number(m[1]);
+        const p=anchorSi!=null?armPreds[anchorPi+(si-anchorSi)]:null;
+        const gap=p?(e.t+RK.t0-(p.ht-HIT_TIME_ADVANCE_SEC-dur)):null;
+        const ok=!!(p && gap>=-0.0006 && gap<=0.004);
+        const ht=ok?p.ht:null;
+        cur.lates.push({t:e.t, dur, ht, ct:ok?p.ct:null,
+                        hitTime:ht!=null?ht-RK.t0-HIT_TIME_ADVANCE_SEC:e.t+dur});
+      }
+      return;
+    }
+    m=/^accepted hit x=([\-0-9.]+) z=([\-0-9.]+) duration=([0-9.]+)(?:\s+hit_time=([0-9.]+))?/.exec(e.text);
     if(m){
       const dur=Number(m[3]), hitT=m[4]!=null?Number(m[4]):0.4;
       rec={cmd:e.t, lastAcceptT:e.t, tx:Number(m[1]), tz:Number(m[2]), start:e.t+dur-hitT, done:e.t+dur,
-           label:'hit', n:1,
+           label:'hit', n:1, lates:[],
            wx:null, wy:null, wz:null, wxw:null, wcarx:null, wct:null, wht:null, wpredT:null, wstage:null, wnFit:null};
       for(let i=armPreds.length-1;i>=0;i--){
         const p=armPreds[i];
@@ -1010,6 +1047,7 @@ const _armHit = (()=>{
           rec.wx=p.rel_x; rec.wy=p.rel_y; rec.wz=p.rel_z; rec.wct=p.ct; rec.wht=p.ht;
           rec.wxw=isNum(p.xWorld)?p.xWorld:null; rec.wcarx=isNum(p.carPredX)?p.carPredX:null;
           rec.wpredT=p.t; rec.wstage=p.stage; rec.wnFit=p.nFit;
+          anchorSi=si; anchorPi=i;   // late ht saved 的序号平移锚点
           if(isNum(p.rel_z)) zOffs.push(rec.tz-p.rel_z);
           break;
         }
@@ -1022,14 +1060,41 @@ const _armHit = (()=>{
     const cur=out[out.length-1];
     if(cur && cur.label===rec.label && Math.abs(rec.done-cur.done)<0.6){
       rec.cmd=cur.cmd; rec.n=cur.n+1;  // cmd 保留第一条，其余取最后一条
+      if(cur.lates && cur.lates.length) rec.lates=cur.lates;
       out[out.length-1]=rec;
     } else {
       out.push(rec);
     }
   });
+  // 逐拍重建 ht 重定相：lastUpdateT = 臂真正受理的最后一条 /predict_hit_pos 的到达时刻
+  // （挥拍窗内的 late ht saved 也算受理，它就是重定相的养料）；finalHt/finalCt = 那条消息的
+  // **原始 ht/ct**（不减臂内 10ms 提前量），ht−ct 即该拍最终命令的盲区时间（击球点 − 最晚
+  // 那颗球的观测时刻）。重定相未生效（无 late / 剩余不足 / 回配失配）时全部退回最后一条 accepted。
+  out.forEach(h=>{
+    if(h.label!=='hit') return;
+    h.lastUpdateT=h.lastAcceptT;
+    h.finalHt=isNum(h.wht)?h.wht:null;
+    h.finalCt=isNum(h.wct)?h.wct:null;
+    h.finalDone=h.done;
+    h.reswing=null;
+    const lates=h.lates||[];
+    if(!lates.length) return;
+    const last=lates[lates.length-1];   // 触发 tick 后一律 reject，故最后一条即被消费的那条
+    const trig=h.done-SWING_HT_UPDATE_LEAD_SEC;
+    const ok=last.hitTime-trig>=SWING_HT_UPDATE_MIN_REMAINING_SEC;
+    h.lastUpdateT=last.t;
+    h.reswing={trig, ok, n:lates.length, oldDone:h.done, newDone:last.hitTime,
+               delta:(last.hitTime-h.done)*1000, remain:last.hitTime-trig,
+               ht:last.ht, ct:last.ct};
+    if(ok){
+      h.finalDone=last.hitTime;
+      if(last.ht!=null){ h.finalHt=last.ht; h.finalCt=last.ct; }  // ht/ct 必须同源
+    }
+  });
   zOffs.sort((a,b)=>a-b);
   return {marks:out, zOff:zOffs.length?zOffs[zOffs.length>>1]:null};
 })();
+// [[arm-swing-ht-core-end]]
 const armHitMarks = _armHit.marks;
 const armZOff = _armHit.zOff;  // 臂系 z − 世界系 z；FK 还原世界系 = tcp_z − armZOff
 const armTcpRows = ARM ? ARM.states.filter(s=>Array.isArray(s.tcp)) : [];
@@ -1045,10 +1110,6 @@ const pcRacketRows = racket
             rp:isNum(r.reproj_err)?r.reproj_err:(isNum(r.reproj)?r.reproj:null)}))
   .filter(p=>isNum(p.t)&&isNum(p.x)&&(p.rp==null||p.rp<=30))
   .sort((a,b)=>a.t-b.t);
-const pcRacketRelRows = pcRacketRows.map(r=>{
-  const c=carAt(r.t);
-  return c ? {t:r.t, ...relToCar(r,c)} : null;
-}).filter(Boolean);
 // [[racket-fit-core-begin]]
 const RACKET_FIT_WINDOW_SEC=0.55;
 const RACKET_MAX_GAP_SEC=0.18;
@@ -1116,7 +1177,6 @@ const fitVisualRacketRows = (sourceRows,t) => {
           mode:bracketed?'interpolation':'extrapolation',degree};
 };
 // [[racket-fit-core-end]]
-const visualRacketAt = t => fitVisualRacketRows(pcRacketRelRows,t);
 // 命中判定：触球后 0.8s 内球 y 是否由进(−)转出(+)——被拍打回才会反向；
 // 地面反弹只弹 z，y 方向不变。窗口内无观测（遮挡/出视场）判"观测缺失"。
 const strikeAfter = tPc => {
@@ -1267,31 +1327,72 @@ const pcReturnAt = tApprox => {
 // atan2(x,y)（车体 CCW 正旋转使 ψ_world 变小）；纯 FK 值，不含 δ6 球侧偏置。
 const armFyRows = ARM ? ARM.states.filter(s=>isNum(s.fy)) : [];
 const wrapDeg = d => ((d+180)%360+360)%360-180;
-const faceYawWorldAt = accHtRk => {
-  if(accHtRk==null || !armFyRows.length) return null;
+// 冲击前窗 [−80,−6]ms（相对 accepted HT）线性拟合 fy，在 tEval 处取值：
+// tEval=accHt 为 ≤6ms 外推；tEval=accHt−10ms 落在窗内，为纯插值。
+const fitFaceYawTo = (accHtRk,tEval) => {
+  if(accHtRk==null || !isNum(tEval) || !armFyRows.length) return null;
   const seg=armFyRows.filter(s=>s.t>=accHtRk-0.08 && s.t<=accHtRk-0.006);
   if(seg.length<2) return null;
   let st=0,sv=0,stt=0,stv=0;
-  seg.forEach(s=>{const u=s.t-accHtRk; st+=u; sv+=s.fy; stt+=u*u; stv+=u*s.fy;});
+  seg.forEach(s=>{const u=s.t-tEval; st+=u; sv+=s.fy; stt+=u*u; stv+=u*s.fy;});
   const n=seg.length, den=n*stt-st*st;
   if(Math.abs(den)<1e-12) return null;
-  const fy=(sv*stt-st*stv)/den, fyRate=(n*stv-st*sv)/den;   // fy ≈ ψ(accHt)，外推 ≤6ms
+  return {fy:(sv*stt-st*stv)/den, rate:(n*stv-st*sv)/den, n};
+};
+const faceYawWorldAt = accHtRk => {
+  const fit=fitFaceYawTo(accHtRk,accHtRk);
+  if(!fit) return null;
   const tPc=rkToPc(accHtRk);
   let ss=0,sc=0,m=0;
   pcCarRows.forEach(r=>{ if(r.t>=tPc-0.45 && r.t<=tPc-0.15 && isNum(r.yaw)){ ss+=Math.sin(r.yaw); sc+=Math.cos(r.yaw); m++; } });
   if(!m) return null;
   const carYaw=Math.atan2(ss,sc)*180/Math.PI;
-  return {deg:wrapDeg(fy-carYaw), fy, carYaw, n, rate:fyRate, m};
+  return {deg:wrapDeg(fit.fy-carYaw), fy:fit.fy, carYaw, n:fit.n, rate:fit.rate, m};
+};
+// 拍面yaw@accepted HT−10ms（世界系）：fy 同款冲击前窗拟合改在 HT−10ms 取值；车 yaw
+// 不用挥拍前圆均值，直接取该时刻 /bot_state yaw——车控接受 AprilTag 定位后 yaw 由
+// IMU 连续更新，直到 HT 结束后才用 AprilTag 重定位更新 bot_state，因此 HT 前采样点
+// 的 bot yaw 是无重定位台阶的瞬时值（挥拍塌陷伪迹只污染位置，yaw 走 IMU 不受累）。
+const rkBotYawRows = (()=>{
+  if(!RK || !RK.bot) return [];
+  const T=ts(RK.bot), Y=ys(RK.bot,'yaw'), rows=[];
+  for(let i=0;i<T.length;i++){
+    const t=Number(T[i]), yaw=Number(Y[i]);
+    if(isNum(t)&&isNum(yaw)) rows.push({t,yaw});
+  }
+  return rows.sort((a,b)=>a.t-b.t);
+})();
+const botYawDegAt = t => {
+  const s=interpRow(rkBotYawRows,t,0.1);
+  if(s){
+    const dy=Math.atan2(Math.sin(s.b.yaw-s.a.yaw),Math.cos(s.b.yaw-s.a.yaw));
+    return (s.a.yaw+dy*s.f)*180/Math.PI;
+  }
+  const n=nearest(rkBotYawRows,t);
+  return (n && Math.abs(n.t-t)<=0.05) ? n.yaw*180/Math.PI : null;
+};
+const FACE_YAW_PRE_S=0.010;
+const faceYawWorldPreAt = accHtRk => {
+  if(accHtRk==null) return null;
+  const tEval=accHtRk-FACE_YAW_PRE_S;
+  const fit=fitFaceYawTo(accHtRk,tEval);
+  if(!fit) return null;
+  const botYaw=botYawDegAt(tEval);
+  if(botYaw==null) return null;
+  return {deg:wrapDeg(fit.fy-botYaw), fy:fit.fy, botYaw, n:fit.n, rate:fit.rate};
 };
 // RK≈300ms 主表与机械臂最后 accepted 分表：两个合同独立取值、独立对齐 PC 真值。
 const reportThrows = rkThrows.filter(t=>(t.msgs||0)>=3).sort((a,b)=>a.ht-b.ht);
-// HT真实：该抛 S1 期 RK 球世界 y 观测（z≥0.15，[ht−0.45,ht−0.025] 窗）二次拟合+3σ剔污染，
+// HT真实(触球)：该抛 S1 期 RK 球世界 y 观测（z≥0.15，[ht−0.45,ht−0.025] 窗）二次拟合+3σ剔污染，
 // 与车实际 y 轨迹（bot 位姿，挥拍前 [ht−0.16,ht−0.028] 窗线性拟合外推——避开挥拍瞬间
-// bot_y 25~65mm 塌陷伪迹）求相交时刻 =「球拟合 × 车实际」的真实 ht（tmp/rk_ball_car_meet_0801
-// 的 dMeetA 口径；球/ht 同轴，无需生成延迟修正）。
+// bot_y 25~65mm 塌陷伪迹）求球面接触时刻 =「球拟合 × 车实际」的真实触球 ht。
+// 车 y 面≡拍面（RK rel_y 无臂基 y 补偿，非近似），故接触判据是球心−车y=R_BALL 而非 0；
+// 相对 dMeetA（球心穿面）提前 R/|v_rel|——随闭合速度变，092711 场实测 6.7~11.4ms（|v_rel| 仅 2.9~4.9m/s），
+// 快场才落到 ~3ms；球心穿面时刻与该提前量在悬停里备查。球/ht 同轴，无需生成延迟修正。
 // ref300 消息合同不变；HT err@300 = ref300 消息 ht − 真实 ht，正=300ms 前预测偏晚。
 // [[ht-alls1-core-begin]]
 const htAllS1ForThrow = (()=>{
+  const R_BALL=0.033;  // 网球半径：车 y 面≡拍面（RK rel_y 无臂基 y 补偿），故触球=球面够到车 y 面
   const rows=[];
   if(RK && RK.world){
     const T=ts(RK.world), Y=ys(RK.world,'y'), Z=ys(RK.world,'z');
@@ -1378,20 +1479,28 @@ const htAllS1ForThrow = (()=>{
     const car=carLine(ht);
     if(!car) return null;
     if(!((f.co[1]-car.b)<-1.0)) return null;
-    const a2=f.co[2],a1=f.co[1]-car.b,a0=f.co[0]-car.a0;
-    let u=null;
-    if(Math.abs(a2)<1e-6){
-      if(Math.abs(a1)<1e-9) return null;
-      u=-a0/a1;
-    } else {
-      const disc=a1*a1-4*a2*a0;
-      if(disc<0) return null;
-      const r=Math.sqrt(disc);
-      const c1=(-a1+r)/(2*a2), c2=(-a1-r)/(2*a2);
-      u=Math.abs(c1)<Math.abs(c2)?c1:c2;
-    }
-    if(!isNum(u)||Math.abs(u)>0.30) return null;
-    return {tRel:ht+u, n:f.n, nWin:win.length, rms:f.rms, vy:f.co[1]+2*f.co[2]*u,
+    // 间距 g(u)=球心y−车y，由上面的闭合门保证单调下降（球从 +y 侧来）：
+    // g=R_BALL 即球面刚够到车 y 面 = 触球时刻；g=0 是球心穿面，只留作备查。
+    const solveGap=gap=>{
+      const a2=f.co[2],a1=f.co[1]-car.b,a0=f.co[0]-car.a0-gap;
+      let u=null;
+      if(Math.abs(a2)<1e-6){
+        if(Math.abs(a1)<1e-9) return null;
+        u=-a0/a1;
+      } else {
+        const disc=a1*a1-4*a2*a0;
+        if(disc<0) return null;
+        const r=Math.sqrt(disc);
+        const c1=(-a1+r)/(2*a2), c2=(-a1-r)/(2*a2);
+        u=Math.abs(c1)<Math.abs(c2)?c1:c2;
+      }
+      return (isNum(u)&&Math.abs(u)<=0.30)?u:null;
+    };
+    const u=solveGap(R_BALL);
+    if(u===null) return null;
+    const uc=solveGap(0);
+    return {tRel:ht+u, tCenter:uc===null?null:ht+uc, n:f.n, nWin:win.length, rms:f.rms,
+            vy:f.co[1]+2*f.co[2]*u, vRel:f.co[1]+2*f.co[2]*u-car.b,
             carY:car.a0+car.b*u, carVy:car.b, nCar:car.n,
             eA:isNum(th.lastS0Y)?(car.a0-th.lastS0Y)*1000:null};
   };
@@ -1422,16 +1531,6 @@ const botRunEndForThrow = th => {
   return best;
 };
 // [[bot-run-end-core-end]]
-const visualRacketCell = fit => {
-  if(!fit) return '—';
-  const errMm=Math.max(1,Math.round(fit.err*1000));
-  const mode=fit.mode==='interpolation'?'双侧二次拟合':'单侧速度外推';
-  const badge=fit.mode==='interpolation'?'拟合':'外推'+Math.round(fit.dNear*1000)+'ms';
-  const title=mode+'；vx='+fit.vx.toFixed(3)+'m/s，vz='+fit.vz.toFixed(3)+'m/s；样本='+fit.n+
-    '，跨度='+Math.round(fit.span*1000)+'ms，最近观测='+Math.round(fit.dNear*1000)+'ms；误差含拟合残差/95%回归误差'+
-    (fit.mode==='extrapolation'?'及20m/s²未建模加速度上界':'');
-  return tableXz(fit.x,fit.z)+' <span style="color:#fbbf24" title="'+tableEsc(title)+'">±'+errMm+'mm('+badge+')</span>';
-};
 const pcTruthCell = (f,withY=false) => {
   if(!f) return '—';
   return (withY?tableXyz(f.x,f.y,f.z,4):tableXz(f.x,f.z,4))+
@@ -1498,16 +1597,69 @@ const rk300TableHtml = () => {
     const tcpAcceptedDx=accepted&&tcpWorld&&isNum(accepted.wx)?(tcpWorld[0]-accepted.wx)*100:null;
     const tcpAcceptedDz=accepted&&tcpWorld&&isNum(accepted.wz)?(tcpWorld[2]-accepted.wz)*100:null;
     const tcpAcceptedError=tableSigned(tcpAcceptedDx)+'/'+tableSigned(tcpAcceptedDz);
-    const visualRacket=accHt!=null?visualRacketAt(rkToPc(accHt)):null;
-    const visualRacketValue=visualRacketCell(visualRacket);
-    const faceYaw=faceYawWorldAt(accHt);
+    // 最终更新 HT：臂真正受理的最后一条 /predict_hit_pos 的原始 ht——挥拍窗内 ht 重定相
+    // 生效时就是那条 late ht saved 的 ht，否则退回最后一条 accepted 的 ht。两列拍面 yaw
+    // 都锚在它上面（不减臂内 HIT_TIME_ADVANCE_SEC=10ms；右列自己再减 10ms 取值）。
+    const finalHt=accepted&&isNum(accepted.finalHt)?accepted.finalHt-RK.t0:accHt;
+    const rsw=accepted?accepted.reswing:null;
+    const htSrcNote=rsw
+      ? (rsw.ok
+          ? '；HT源=挥拍中重定相后的最后一条late ht saved（老触球'+tableSigned(rsw.delta)+'ms）'
+          : '；重定相因剩余'+(rsw.remain*1000).toFixed(0)+'ms<60ms放弃，HT源退回最后一条accepted')
+      : '；HT源=最后一条accepted（本拍无挥拍窗内更新）';
+    const faceYaw=faceYawWorldAt(finalHt);
     const faceYawCell=faceYaw
       ? '<span title="'+tableEsc('臂系FK face_yaw='+tableSigned(faceYaw.fy)+'°（冲击前窗['
-          +'−80,−6]ms '+faceYaw.n+'帧线性外推@accepted HT，ψ̇='+tableSigned(faceYaw.rate)+'°/s）'
+          +'−80,−6]ms '+faceYaw.n+'帧线性外推@最终更新HT，ψ̇='+tableSigned(faceYaw.rate)+'°/s）'
           +'；车yaw='+tableSigned(faceYaw.carYaw)+'°（挥拍前0.45~0.15s窗圆均值'+faceYaw.m+'帧）'
-          +'；世界ψ=face_yaw−车yaw，口径同PC回球yaw=atan2(x,y)；纯FK不含δ6球侧偏置')+'">'
+          +'；世界ψ=face_yaw−车yaw，口径同PC回球yaw=atan2(x,y)；纯FK不含δ6球侧偏置'
+          +htSrcNote)+'">'
           +tableSigned(faceYaw.deg)+'</span>'
       : '—';
+    const faceYawPre=faceYawWorldPreAt(finalHt);
+    const faceYawPreCell=faceYawPre
+      ? '<span title="'+tableEsc('臂系FK face_yaw='+tableSigned(faceYawPre.fy)+'°（冲击前窗[−80,−6]ms '
+          +faceYawPre.n+'帧线性拟合@最终更新HT−10ms取值，ψ̇='+tableSigned(faceYawPre.rate)+'°/s）'
+          +'；车yaw='+tableSigned(faceYawPre.botYaw)+'°（/bot_state yaw@HT−10ms：AprilTag accept后由IMU连续更新，HT结束后才重定位）'
+          +'；世界ψ=face_yaw−车yaw；HT−10ms=臂内真正瞄准的触球时刻'+htSrcNote)+'">'
+          +tableSigned(faceYawPre.deg)+'</span>'
+      : '—';
+    // 最后更新→挥拍起：臂受理的最后一条预测的到达时刻 − 挥拍段起点(老触球−HIT_T)。
+    // 正=更新落在挥拍开始之后（0803 起挥拍窗内不再拒收，这些就是 ht 重定相的养料）。
+    const updT=accepted&&isNum(accepted.lastUpdateT)?accepted.lastUpdateT:null;
+    const swingStart=accepted&&isNum(accepted.start)?accepted.start:null;
+    const updGapCell=(updT!=null&&swingStart!=null)
+      ? '<span title="'+tableEsc('最后受理更新 t='+rkToPc(updT).toFixed(3)+'s（PC轴）'
+          +'；挥拍起 t='+rkToPc(swingStart).toFixed(3)+'s（=老触球−HIT_T 0.25s）'
+          +'；最后一条 accepted t='+rkToPc(accepted.lastAcceptT).toFixed(3)+'s（其后 '
+          +(rsw?rsw.n:0)+' 条只存触球时刻不换目标）'
+          +(rsw
+            ? '；重定相触发 t='+rkToPc(rsw.trig).toFixed(3)+'s（老触球−100ms）：老触球 '
+              +rkToPc(rsw.oldDone).toFixed(3)+'s → 新触球 '+rkToPc(rsw.newDone).toFixed(3)+'s（'
+              +tableSigned(rsw.delta)+'ms，剩余 '+(rsw.remain*1000).toFixed(0)+'ms）'
+              +(rsw.ok?' ✓生效':' ✗剩余<60ms放弃')
+            : '；本拍挥拍窗内无新预测，未触发重定相'))+'">'
+          +tableSigned((updT-swingStart)*1000)+'</span>'
+      : '—';
+    // 盲区 ht−ct@最终更新：最终那条命令的「击球点时刻 − 它最晚看到的那颗球的观测时刻」。
+    // 这段时间里预测纯外推、没有任何新观测进来，是本拍真正的信息盲区。
+    const finalCt=accepted&&isNum(accepted.finalCt)?accepted.finalCt-RK.t0:null;
+    const blind=(finalHt!=null&&finalCt!=null)?(finalHt-finalCt)*1000:null;
+    const blindCell=blind!=null
+      ? '<span title="'+tableEsc('最终更新消息 ct='+rkToPc(finalCt).toFixed(3)+'s（最晚一颗球的观测时刻）'
+          +'、ht='+rkToPc(finalHt).toFixed(3)+'s（预测击球时刻，原始值未减臂内10ms）'
+          +'；这段是纯外推、无新观测的盲区'+htSrcNote)+'">'+blind.toFixed(1)+'</span>'
+      : '—';
+    // Δht 重定相：挥拍时用的 ht（最后一条 accepted）→ 更新后的 ht。二者都是原始 ht，
+    // 同减臂内 10ms，故与臂内触球时刻之差完全等价。未采纳时显示候选值并置灰。
+    const dHtCell=rsw
+      ? '<span'+(rsw.ok?'':' style="color:#a0a0c0"')
+          +' title="'+tableEsc('挥拍时 ht='+rkToPc(rsw.oldDone+HIT_TIME_ADVANCE_SEC).toFixed(3)
+          +'s → 更新后 ht='+rkToPc(rsw.newDone+HIT_TIME_ADVANCE_SEC).toFixed(3)+'s'
+          +'；正=新预测把击球点推晚。触球拍速是派生量，会随剩余时长一起变'
+          +(rsw.ok?'':'；剩余'+(rsw.remain*1000).toFixed(0)+'ms<60ms，控制器放弃重定相，实际仍走老时间轴'))+'">'
+          +tableSigned(rsw.delta)+(rsw.ok?'':'(未采纳)')+'</span>'
+      : '<span title="本拍挥拍窗内没有新预测到达，ht 自挥拍起未变">—</span>';
     const rejectNote=accepted?'—':rejectNoteForThrow(th);
     const hitAnchorPc=accHt!=null?rkToPc(accHt):(isNum(th.ht)?rkToPc(th.ht):null);
     const ret=pcReturnAt(hitAnchorPc);
@@ -1518,11 +1670,13 @@ const rk300TableHtml = () => {
     const fin=htAllS1ForThrow(th);
     const htFinPc=fin?rkToPc(fin.tRel):null;
     const htFinCell=fin
-      ? '<span title="'+tableEsc('HT真实=球拟合×车实际相交：球世界y '+fin.n+'点（窗[ht−450,−25]ms，z≥0.15'
+      ? '<span title="'+tableEsc('HT真实(触球)=球拟合×车实际、球面够到车y面（车y面≡拍面，判据 球心−车y=R球33mm）：球世界y '+fin.n+'点（窗[ht−450,−25]ms，z≥0.15'
           +(fin.n<fin.nWin?('，3σ剔'+(fin.nWin-fin.n)+'点'):'')+'，rms='+(fin.rms*1000).toFixed(0)
           +'mm，|vy球|='+Math.abs(fin.vy).toFixed(2)+'m/s）× 车bot '+fin.nCar
-          +'点（挥拍前[−160,−28]ms线性外推，vy车='+fin.carVy.toFixed(2)+'m/s）；相交处车y='
-          +fin.carY.toFixed(4)+'m'
+          +'点（挥拍前[−160,−28]ms线性外推，vy车='+fin.carVy.toFixed(2)+'m/s）；闭合速度|v_rel|='
+          +Math.abs(fin.vRel).toFixed(2)+'m/s'
+          +(isNum(fin.tCenter)?('，球心穿面备查='+rkToPc(fin.tCenter).toFixed(3)+'s（触球早'+((fin.tCenter-fin.tRel)*1000).toFixed(1)+'ms）'):'')
+          +'；触球处车y='+fin.carY.toFixed(4)+'m'
           +(isNum(fin.eA)?('，车@ht−冻结面lastS0Y='+fin.eA.toFixed(0)+'mm'):'')
           +(isNum(th.ref300Ht)?('；S1@300消息ht='+rkToPc(th.ref300Ht).toFixed(3)+'s备查'):''))+'">'
           +htFinPc.toFixed(3)+'</span>'
@@ -1530,7 +1684,9 @@ const rk300TableHtml = () => {
     const hE300=(fin&&isNum(th.ref300Ht))?(th.ref300Ht-fin.tRel)*1000:null;
     if(!isNum(th.ref300T)||!isNum(th.ref300Ht)||!isNum(th.ref300X)||!isNum(th.ref300Z)){
       return '<tr><td>'+(idx+1)+'</td><td>—</td><td>'+htFinCell+'</td><td>—</td><td>—</td><td>—</td><td>'+runTargetError+'</td><td>'+rkPredCarError+'</td><td>'+acceptedTarget+'</td>'+
-        '<td>—</td><td>'+tcpCell+'</td><td>'+tcpAcceptedError+'</td><td>'+visualRacketValue+'</td><td>'+faceYawCell+'</td>'+
+        '<td>—</td><td>'+tcpCell+'</td><td>'+tcpAcceptedError+'</td><td>'+updGapCell+'</td>'+
+        '<td>'+blindCell+'</td><td>'+dHtCell+'</td>'+
+        '<td>'+faceYawCell+'</td><td>'+faceYawPreCell+'</td>'+
         '<td>'+returnCell+'</td>'+
         '<td><span style="color:#fbbf24">无S1@300ms</span> / msgs='+(th.msgs||0)+'</td><td class="armTblNote"><div>'+rejectNote+'</div></td></tr>';
     }
@@ -1552,32 +1708,50 @@ const rk300TableHtml = () => {
       '<td>'+pcTruthCell(truth,true)+'</td>'+
       '<td>'+tcpCell+'</td>'+
       '<td>'+tcpAcceptedError+'</td>'+
-      '<td>'+visualRacketValue+'</td>'+
+      '<td>'+updGapCell+'</td>'+
+      '<td>'+blindCell+'</td>'+
+      '<td>'+dHtCell+'</td>'+
       '<td>'+faceYawCell+'</td>'+
+      '<td>'+faceYawPreCell+'</td>'+
       '<td>'+returnCell+'</td>'+
       '<td>'+info+'</td><td class="armTblNote"><div>'+rejectNote+'</div></td></tr>';
   });
   const notes=[
     '每行RK ct、x/z、n_fit、lead 严格来自同一条S1消息：在该抛所有正提前量S1中选择 |(HT−ct)−300ms| 最小者；RK@≈300ms x/z 列为该消息 rel_x/rel_z（臂端合同值，车体系、x含偏置），仅此列与accepted目标/TCP列保留车体系',
-    'HT真实(球×车) 列不再显示@300ms消息的ht：该抛 S1 期 RK 球世界y观测（z≥0.15、[HT−450,−25]ms 窗）二次拟合+3σ剔污染，与车实际y轨迹（bot位姿挥拍前[−160,−28]ms窗线性外推，避开挥拍瞬间bot_y塌陷伪迹）求相交时刻（0801 rk_ball_car_meet 的 dMeetA 口径；球观测与ht同轴，不需生成延迟修正）；HT err@300 = @300ms消息ht − HT真实，正=300ms前预测偏晚，含车未到位造成的相交顺延；悬停HT可见球/车拟合点数、剔点、rms、车速与车−冻结面偏移，@300消息ht备查',
+    'HT真实(触球) 列不再显示@300ms消息的ht：该抛 S1 期 RK 球世界y观测（z≥0.15、[HT−450,−25]ms 窗）二次拟合+3σ剔污染，与车实际y轨迹（bot位姿挥拍前[−160,−28]ms窗线性外推，避开挥拍瞬间bot_y塌陷伪迹）求球面接触时刻；车y面≡拍面（RK rel_y 无臂基y补偿），故判据取 球心−车y=R球33mm 而非球心穿面，比 0801 rk_ball_car_meet 的 dMeetA 早 R/|v_rel|，随闭合速度变（092711 场 |v_rel|=2.9~4.9m/s 时为 6.7~11.4ms，快场才 ~3ms；球心穿面时刻与该提前量悬停里备查）；球观测与ht同轴，不需生成延迟修正；HT err@300 = @300ms消息ht − HT真实，正=300ms前预测偏晚，含车未到位造成的相交顺延与这个半径项；悬停HT可见球/车拟合点数、剔点、rms、闭合速度、车速与车−冻结面偏移，@300消息ht备查',
     '车RUN末帧取与该抛最终HT最近且相差不超过100ms的正常RUN→BRAKE_IN_SWING转换前最后一条/bot_state，并与抛球一对一匹配；差值=(target_x−x)/(target_y−y)，RK世界系，单位cm；未匹配或异常退出显示—',
     'RK@≈300ms预测车取本行同一条S1 /predict_hit_pos的car_pred_x/y，即该消息预测的HT时刻车世界位置；误差=预测车−RUN末帧实际车，单位cm',
     'RK≈300ms字段不回退到最终RK消息；机械臂两列独立回配该抛最后一条accepted原消息',
     '机械臂目标取该accepted消息的原始RK rel_x/rel_z；TCP取该消息自身HT时刻的FK state插值，z按机械臂偏移还原世界系；无accepted或HT无state覆盖时显示—',
-    '视觉球拍取同一accepted HT经rkToPc映射后的PC时刻：每个观测先减小车中心并按yaw转到车体系，z保留世界高度；双侧观测用局部二次位置/速度拟合，遮挡时用单侧速度外推；黄色误差含拟合残差、95%回归误差，外推另含20m/s²未建模加速度上界',
-    '拍面yaw@accepted HT（世界系）= 臂系FK face_yaw − 车yaw：face_yaw为完整FK（extract_arm_bag.fk单源）拍面法向（link6 +X）的atan2(x,y)角，冲击前窗[−80,−6]ms线性外推到accepted HT（避开J5冲击突跳污染）；车yaw取挥拍前0.45~0.15s窗圆均值（避开挥拍位姿伪迹）；口径同PC回球yaw，纯FK不含δ6球侧偏置',
+    '最后更新−挥拍起(ms) = 臂真正受理的最后一条 /predict_hit_pos 到达时刻 − 挥拍段起点(老触球−HIT_T 0.25s)：2026-08-03 arm_controller 上线「挥拍中 ht 重定相」后，挥拍窗内到达的预测不再拒收（status `late ht saved`），只存触球时刻，到老触球−100ms 一次性重建挥拍段（剩余<60ms 放弃）；故本列正值=最后一次更新发生在挥拍开始之后，绝对值即挥拍开始后还吃进了多久的新预测。悬停可见最后更新/挥拍起/最后accepted 三个绝对时刻、重定相触发时刻与新老触球时刻及是否生效',
+    '盲区 ht−ct@最终更新(ms) = 臂最终执行的那条 /predict_hit_pos 的 ht−ct：ct 是喂给预测器的最晚一颗球的观测时刻、ht 是它算出的击球时刻，这段时间里预测纯外推、没有任何新观测进来，故称盲区；与左侧主表的 lead(ms) 不同——那个是该抛 S1@≈300ms 那条参考消息的提前量，这里是最终生效的那条。重定相生效时 ct/ht 同取被消费的那条 late ht saved（必须同源，回配失配则整条退回最后一条 accepted）',
+    'Δht 重定相(ms) = 挥拍时用的 ht（最后一条 accepted 的原消息 ht）→ 挥拍中重定相更新后的 ht，正=新预测把击球点推晚；两者都是原始 ht，各减臂内 10ms 后即新老触球时刻，差值等价。灰字 (未采纳) = 新触球距触发点不足 SWING_HT_UPDATE_MIN_REMAINING_SEC=60ms，控制器放弃重定相、实际仍走老时间轴，显示的是候选值；— = 挥拍窗内没有新预测到达。注意重建挥拍段是「从当前命令帧在剩余时间内重规划」，即使 Δht 只有几 ms，指令加速度与触球拍速也会跟着变（触球拍速是派生量）',
+    '最终更新HT = 臂受理的最后一条 /predict_hit_pos 的**原始 ht**（不减臂内 HIT_TIME_ADVANCE_SEC=10ms）：重定相生效时取被消费的那条 late ht saved 的 ht（挥拍窗内最后一条，触发 tick 之后一律 reject hit phase in progress），否则退回最后一条 accepted 的 ht；late ht saved 状态本身只有 duration，其 ht 由 /predict_hit_pos↔/tennis/status 顺序一对一回配得到，并按 t+duration+10ms≈ht 自校验（失配显示—）',
+    '拍面yaw@最终更新HT（世界系）= 臂系FK face_yaw − 车yaw：face_yaw为完整FK（extract_arm_bag.fk单源）拍面法向（link6 +X）的atan2(x,y)角，冲击前窗[−80,−6]ms线性外推到最终更新HT（避开J5冲击突跳污染）；车yaw取挥拍前0.45~0.15s窗圆均值（避开挥拍位姿伪迹）；口径同PC回球yaw，纯FK不含δ6球侧偏置',
+    '拍面yaw@最终更新HT−10ms（世界系）：face_yaw同款冲击前窗[−80,−6]ms线性拟合改在HT−10ms处取值（落在窗内，纯插值），HT−10ms=臂内真正瞄准的触球时刻；车yaw直接取该时刻/bot_state yaw——车控接受AprilTag定位后yaw由IMU连续更新，HT结束后才用AprilTag重定位更新bot_state，故采样点无重定位台阶；ψ=face_yaw−车yaw，口径同左列',
     '备注仅在该抛没有机械臂accepted时显示回配到该抛时间窗的reject hit原因，并合并同类原因计数',
     'PC回球 yaw/俯仰 纯由PC球观测统计：先以入弧/出弧y(t)二次拟合交点定触球时刻（入弧vy<−1、出弧vy>0.15；锚点=该抛accepted HT，无accepted退RK最终HT并小范围扫描），再取触球后[+20,+400]ms出弧连续段拟合三轴速度取触球时刻导数（z先扣重力）；yaw=atan2(vx,vy)（+为+x侧）、俯仰=atan2(vz,水平速)，灰字为出球速率；脏数据过滤：z<0.12贴地/静止球剔除，观测按断档>150ms或帧间>20m/s跳变（换球；门槛在最快回球之上）切段后按点数优先选首个真出向段（静止球段vy≈0被拒；被拍/臂遮挡断档后用遮挡后真弧，段首距触球≤300ms），vz降转升突增>3m/s判地面反弹截断防污染俯仰；出弧vy≤0.5、水平速<1m/s或点数不足显示—（挥空/脱拍无值）',
     'ct/HT已加同一个RK offset显示在PC报告轴；lead=HT−ct，不受offset影响',
     pcTruthFitNote,
   ];
   return '<div class="armTblWrap"><table class="armTbl"><thead><tr>'+
-    '<th>#</th><th>RK ct@≈300ms<br>(s,PC轴)</th><th>HT真实(球×车)<br>(s,PC轴)</th><th>HT err@300<br>(ms)</th><th>lead(ms)</th>'+
+    '<th>#</th><th>RK ct@≈300ms<br>(s,PC轴)</th><th>HT真实(触球)<br>(s,PC轴)</th>'+
+    '<th title="HT err@300 = 该抛 S1@≈300ms 那条消息预测的 ht − 本行左侧 HT真实(触球)；正=300ms 前预测偏晚(球其实更早触到)，负=偏早">'+
+    'HT err@300<br>(S1@300ht − 触球, ms)</th><th>lead(ms)</th>'+
     '<th>RK@≈300ms x/z(m)</th><th>车RUN末帧 目标−实际 dx/dy(cm)<br>(RK世界系)</th>'+
     '<th>RK@≈300ms预测车@HT−RUN末实际 dx/dy(cm)<br>(RK世界系)</th><th>机械臂最后accepted目标 x/z(m)</th>'+
     '<th>PC真值@HT300 x/y/z(m)</th>'+
     '<th>TCP@accepted HT x/y/z(m)</th><th>TCP−accepted dx/dz(cm)</th>'+
-    '<th>视觉球拍@accepted HT x/z(m)<br>(相对小车)</th><th>拍面yaw@accepted HT(°,世界系)</th>'+
+    '<th title="臂受理的最后一条 /predict_hit_pos 到达时刻 − 挥拍段起点(老触球−HIT_T 0.25s)；'+
+    '正=更新落在挥拍开始之后（0803 起挥拍窗内不再拒收，这些消息就是 ht 重定相的养料）。'+
+    '悬停看两个绝对时刻与重定相是否生效">最后更新−挥拍起<br>(ms)</th>'+
+    '<th title="臂最终执行的那条 /predict_hit_pos 的 ht−ct：击球点时刻 − 它最晚看到的那颗球的'+
+    '观测时刻。这段时间预测纯外推、没有任何新观测进来，即本拍的信息盲区">'+
+    '盲区 ht−ct@最终更新<br>(ms)</th>'+
+    '<th title="挥拍时用的 ht（最后一条 accepted）→ 挥拍中重定相更新后的 ht，正=新预测把击球点推晚；'+
+    '两者同为原始 ht，与臂内触球时刻(各减10ms)之差等价。灰字(未采纳)=剩余不足 60ms 控制器放弃了重定相">'+
+    'Δht 重定相<br>(ms)</th>'+
+    '<th>拍面yaw@最终更新HT(°,世界系)</th><th>拍面yaw@最终更新HT−10ms(°,世界系)</th>'+
     '<th>PC回球 yaw/俯仰(°)</th><th>消息</th><th>备注</th></tr></thead>'+
     '<tbody>'+rows.join('')+'</tbody></table>'+
     '<div style="font-size:11px;color:#a0a0c0;margin:2px 0 6px">'+notes.join('；')+'。</div></div>';

@@ -148,6 +148,127 @@ def test_accepted_raw_message_match_rejects_adjacent_prediction(tmp_path):
     }
 
 
+def _swing_ht_harness(events: str) -> str:
+    """挥拍中 ht 重定相重建段的 node 夹具：喂事件流，吐出 hit marks。"""
+    core = _core("arm-swing-ht-core-begin", "arm-swing-ht-core-end")
+    return (
+        "const isNum=v=>typeof v==='number'&&Number.isFinite(v);\n"
+        "const RK={t0:0};\n"
+        "const HIT_TIME_ADVANCE_SEC=0.010;\n"
+        "const SWING_HT_UPDATE_LEAD_SEC=0.100;\n"
+        "const SWING_HT_UPDATE_MIN_REMAINING_SEC=0.060;\n"
+        "const ARM_HIT_Z_OFFSET=-0.153;\n"
+        "const armPredictionMatchesAccepted=(p,acceptT,acceptX,acceptZ,acceptDuration)=>"
+        "Math.abs(p.rel_x-acceptX)<5e-4 && Math.abs(p.rel_z+ARM_HIT_Z_OFFSET-acceptZ)<5e-4"
+        " && Math.abs(p.ht-(acceptT+acceptDuration))<3e-2;\n"
+        f"const ARM={{events:{events}}};\n"
+        f"{core}\n"
+        "console.log(JSON.stringify(_armHit.marks.filter(h=>h.label==='hit')));\n"
+    )
+
+
+def _pred_event(t, ht, rel_x=1.0, rel_z=1.2):
+    """构造一条 /predict_hit_pos 事件（accepted 回配靠 rel_x/rel_z 双 5e-4）。"""
+    payload = {
+        "x": rel_x, "y": 0.0, "z": rel_z, "stage": 1, "ct": t, "ht": ht,
+        "duration": ht - t, "n_bounce_fit": 4, "rel_x": rel_x, "rel_y": 0.0,
+        "rel_z": rel_z, "car_pred_x": 0.0, "car_pred_y": 0.0, "car_yaw": 0.0,
+        "rel_src": "target",
+    }
+    return {"t": t, "topic": "/predict_hit_pos", "text": json.dumps(payload)}
+
+
+def _status_event(t, text):
+    return {"t": t, "topic": "/tennis/status", "text": text}
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_swing_ht_replan_consumes_last_late_saved(tmp_path):
+    """挥拍中 ht 重定相：被消费的是最后一条 late ht saved，finalHt 取它的原始 ht。
+
+    accepted @10.000 ht=10.510 → 臂内触球 10.500、挥拍起 10.250、重定相触发 10.400。
+    三条 late（10.30/10.35/10.39）依次覆盖，最后一条 ht=10.516 → 新触球 10.506（+6ms），
+    剩余 106ms ≥ 60ms 生效。触发点之后的消息在线上是 reject，这里不进事件流。
+    """
+    events = [
+        _pred_event(9.95, 10.510),
+        _status_event(10.000, "accepted hit x=1.0000 z=1.0470 duration=0.5000 hit_time=0.2500"),
+        _pred_event(10.26, 10.512), _status_event(10.300, "late ht saved: contact in 0.202s"),
+        _pred_event(10.31, 10.514), _status_event(10.350, "late ht saved: contact in 0.154s"),
+        _pred_event(10.35, 10.516), _status_event(10.390, "late ht saved: contact in 0.116s"),
+    ]
+    marks = _run_node(tmp_path, _swing_ht_harness(json.dumps(events)))
+
+    assert len(marks) == 1
+    h = marks[0]
+    assert h["done"] == pytest.approx(10.500)          # 老触球不被改写
+    assert h["start"] == pytest.approx(10.250)
+    assert h["lastAcceptT"] == pytest.approx(10.000)   # 最后一条 accepted
+    assert h["lastUpdateT"] == pytest.approx(10.390)   # 最后一条被受理的更新
+    assert h["reswing"]["ok"] is True
+    assert h["reswing"]["n"] == 3
+    assert h["reswing"]["trig"] == pytest.approx(10.400)
+    assert h["reswing"]["newDone"] == pytest.approx(10.506)
+    assert h["reswing"]["delta"] == pytest.approx(6.0)
+    assert h["finalDone"] == pytest.approx(10.506)
+    assert h["finalHt"] == pytest.approx(10.516)       # 原始 ht，不减 10ms
+    assert h["finalCt"] == pytest.approx(10.35)        # 与 finalHt 同源那条的 ct
+    assert h["wht"] == pytest.approx(10.510)           # accepted 那条保持不变
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_swing_ht_replan_skipped_when_remaining_too_short(tmp_path):
+    """新触球距触发点 <60ms 时控制器放弃重定相：finalHt/finalDone 退回最后一条 accepted。"""
+    events = [
+        _pred_event(9.95, 10.510),
+        _status_event(10.000, "accepted hit x=1.0000 z=1.0470 duration=0.5000 hit_time=0.2500"),
+        # 新触球 10.450（比老触球早 50ms）→ 距触发点 10.400 只剩 50ms
+        _pred_event(10.35, 10.460), _status_event(10.390, "late ht saved: contact in 0.060s"),
+    ]
+    h = _run_node(tmp_path, _swing_ht_harness(json.dumps(events)))[0]
+
+    assert h["reswing"]["ok"] is False
+    assert h["reswing"]["remain"] == pytest.approx(0.050)
+    assert h["finalDone"] == pytest.approx(10.500)
+    assert h["finalHt"] == pytest.approx(10.510)
+    assert h["lastUpdateT"] == pytest.approx(10.390)   # 受理了，只是没用上
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_swing_without_late_update_reports_no_replan(tmp_path):
+    """挥拍窗内没有新预测：reswing 为 null，最后更新时刻即最后一条 accepted。"""
+    events = [
+        _pred_event(9.95, 10.510),
+        _status_event(10.000, "accepted hit x=1.0000 z=1.0470 duration=0.5000 hit_time=0.2500"),
+    ]
+    h = _run_node(tmp_path, _swing_ht_harness(json.dumps(events)))[0]
+
+    assert h["reswing"] is None
+    assert h["lastUpdateT"] == pytest.approx(10.000)
+    assert h["finalHt"] == pytest.approx(10.510)
+    assert h["finalDone"] == pytest.approx(10.500)
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_late_ht_pairing_self_check_rejects_wrong_source(tmp_path):
+    """顺序配对必须自校验：t+duration+10ms 与原消息 ht 差 >8ms 就不认，ht 置 null。
+
+    此时 hitTime 退回 status 时刻重建值（仍可判重定相），但 finalHt 不被污染。
+    """
+    events = [
+        _pred_event(9.95, 10.510),
+        _status_event(10.000, "accepted hit x=1.0000 z=1.0470 duration=0.5000 hit_time=0.2500"),
+        # 这条预测的 ht 与状态自述的触球时刻差 100ms（模拟队列错位）
+        _pred_event(10.35, 10.616), _status_event(10.390, "late ht saved: contact in 0.116s"),
+    ]
+    h = _run_node(tmp_path, _swing_ht_harness(json.dumps(events)))[0]
+
+    assert h["reswing"]["ht"] is None
+    assert h["reswing"]["newDone"] == pytest.approx(10.506)   # 退回 status t+duration
+    assert h["finalHt"] == pytest.approx(10.510)              # 不采信失配的 ht
+    assert h["finalCt"] == pytest.approx(9.95)                # ct 与 ht 同源一起退回
+
+
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
 def test_bot_run_end_is_normal_one_to_one_and_uses_target_minus_actual(tmp_path):
     core = _core("bot-run-end-core-begin", "bot-run-end-core-end")
@@ -178,12 +299,13 @@ def test_bot_run_end_is_normal_one_to_one_and_uses_target_minus_actual(tmp_path)
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
 def test_ht_true_intersects_ball_fit_with_actual_car_and_rejects_pollution(tmp_path):
-    """HT真实：S1 期球世界y拟合（3σ 剔跳变、z 门槛）× 车实际y挥拍前外推线 求交。"""
+    """HT真实(触球)：S1 期球世界y拟合（3σ 剔跳变、z 门槛）× 车实际y挥拍前外推线，球面接触。"""
     core = _core("ht-alls1-core-begin", "ht-alls1-core-end")
     # 球：y(t)=1.0−3.5·(t−2.0)，t∈[1.56,1.95] 共 14 点；混入 1 个 +0.5m 跳变污染点
     # （t=1.80）与 1 个 z=0.05 贴地点（都必须被剔除/过滤）。
     # 车：y(t)=0.9+0.5·(t−2.0)（向球移动），挥拍塌陷伪迹点在 t≥1.973（窗外，必须无影响）。
-    # 交点：1.0−3.5u = 0.9+0.5u → u=+0.025 → tRel=2.025。
+    # 间距 g(u)=0.1−4.0u：触球 g=R球0.033 → u=+0.01675 → tRel=2.01675；
+    # 球心穿面 g=0 → u=+0.025 → tCenter=2.025（备查，比触球晚 R/|v_rel|=8.25ms）。
     ts_list, ys_list, zs_list = [], [], []
     for i in range(14):
         t = 1.56 + 0.03 * i
@@ -220,8 +342,11 @@ def test_ht_true_intersects_ball_fit_with_actual_car_and_rejects_pollution(tmp_p
     assert fin is not None
     assert fin["nWin"] == 14            # 贴地点被 z 门槛挡在窗外
     assert fin["n"] == 13               # 污染点被 3σ 剔除
-    assert fin["tRel"] == pytest.approx(2.025, abs=2e-3)
+    assert fin["tRel"] == pytest.approx(2.01675, abs=2e-3)     # 球面接触，非球心穿面
+    assert fin["tCenter"] == pytest.approx(2.025, abs=2e-3)     # 球心穿面仅备查
+    assert (fin["tCenter"] - fin["tRel"]) == pytest.approx(0.00825, abs=5e-4)
     assert fin["vy"] == pytest.approx(-3.5, abs=0.05)
+    assert fin["vRel"] == pytest.approx(-4.0, abs=0.06)
     assert fin["carVy"] == pytest.approx(0.5, abs=0.03)   # 塌陷伪迹在窗外，不进车拟合
     assert fin["eA"] == pytest.approx(-100.0, abs=3)      # 车@ht − 冻结面 = −100mm
     assert result["miss"] is None       # 窗内无球观测不产出
@@ -232,7 +357,9 @@ def test_main_pc_truth_uses_rk_ht_and_accepted_uses_own_ht():
     assert "const truth=pcTruthAt(htPc);" in source
     # HT err@300 锚在全S1重估 HT 上；@300 消息 ht 只留在 hE300/备查里
     assert "const hE300=(fin&&isNum(th.ref300Ht))?(th.ref300Ht-fin.tRel)*1000:null;" in source
-    assert "<th>HT真实(球×车)<br>(s,PC轴)</th><th>HT err@300<br>(ms)</th>" in source
+    assert "<th>HT真实(触球)<br>(s,PC轴)</th>" in source
+    # err 列头写明谁减谁，与 hE300=ref300Ht−fin.tRel 的实现同向
+    assert "HT err@300<br>(S1@300ht − 触球, ms)</th>" in source
     assert "'<td>'+htPc.toFixed(3)+'</td>'" not in source
     assert "const truth=pcTruthAt(accHtPc);" in source
     assert "<td>'+pcTruthCell(truth,true)+'</td>" in source
@@ -269,11 +396,33 @@ def test_rk300_table_includes_last_accepted_target_and_tcp_at_accepted_ht():
         "<th>PC真值@HT300 x/y/z(m)</th>",
         "<th>TCP@accepted HT x/y/z(m)</th>",
         "<th>TCP−accepted dx/dz(cm)</th>",
-        "<th>拍面yaw@accepted HT(°,世界系)</th>",
+        "最后更新−挥拍起<br>(ms)</th>",
+        "盲区 ht−ct@最终更新<br>(ms)</th>",
+        "Δht 重定相<br>(ms)</th>",
+        "<th>拍面yaw@最终更新HT(°,世界系)</th>",
+        "<th>拍面yaw@最终更新HT−10ms(°,世界系)</th>",
     ]
     assert [source.index(header) for header in headers] == sorted(
         source.index(header) for header in headers
     )
+    # 两列拍面 yaw 锚在「最终更新 HT」（含挥拍中 ht 重定相消费的那条），不是最后一条 accepted
+    assert "const finalHt=accepted&&isNum(accepted.finalHt)?accepted.finalHt-RK.t0:accHt;" in source
+    assert "faceYawWorldAt(finalHt)" in source
+    assert "faceYawWorldPreAt(finalHt)" in source
+    assert "faceYawWorldAt(accHt)" not in source
+    assert "faceYawWorldPreAt(accHt)" not in source
+    # 盲区列的 ct/ht 必须同源，且与主表 lead(ms)（@300ms 参考消息）不是一回事
+    assert "const finalCt=accepted&&isNum(accepted.finalCt)?accepted.finalCt-RK.t0:null;" in source
+    assert "const blind=(finalHt!=null&&finalCt!=null)?(finalHt-finalCt)*1000:null;" in source
+    # 0803 已删列：视觉球拍@accepted HT（相对小车），其专用取值/单元格实现不应残留
+    assert "视觉球拍" not in source
+    assert "visualRacketAt" not in source
+    assert "visualRacketCell" not in source
+    # HT−10ms 列：fy 同窗拟合在 HT−10ms 取值；车 yaw 用 /bot_state 瞬时值（IMU 连续更新）
+    assert "const FACE_YAW_PRE_S=0.010;" in source
+    assert "fitFaceYawTo(accHtRk,tEval)" in source
+    assert "botYawDegAt(tEval)" in source
+    assert "ys(RK.bot,'yaw')" in source
     assert "<th>/tennis/status 字符串</th>" not in source
     assert "<th>/predict_hit_pos 字符串</th>" not in source
     assert "const tcpWorld=tcp?[tcp[0],tcp[1],tcp[2]-(isNum(armZOff)?armZOff:0)]:null;" in source
