@@ -46,16 +46,11 @@ class ArmPoePositionModel:
 
         poe_cfg = cfg["poe_model_position_only"]
         t_cfg = cfg["T_base_in_world"]
-        vehicle_cfg = cfg.get("vehicle_reference", {})
         self._joint_count = int(poe_cfg["joint_count"])
         self._joint_offsets = np.array(poe_cfg["joint_angle_offsets_rad"], dtype=np.float64)
         self._home_point_base = np.array(poe_cfg["home_point_base_mm"], dtype=np.float64)
         self._R_base_in_world = np.array(t_cfg["R"], dtype=np.float64).reshape(3, 3)
         self._t_base_in_world = np.array(t_cfg["t_mm"], dtype=np.float64).reshape(3)
-        self._apriltag_to_car_base_offset_mm = np.array(
-            vehicle_cfg.get("apriltag_center_to_car_base_offset_mm", [0.0, 0.0, 0.0]),
-            dtype=np.float64,
-        ).reshape(3)
         z_correction_cfg = cfg.get("z_axis_correction")
         self._z_offset_base_mm = 0.0
         if isinstance(z_correction_cfg, dict) and z_correction_cfg.get("enabled", True):
@@ -115,10 +110,6 @@ class ArmPoePositionModel:
     @property
     def R_base_in_world(self) -> np.ndarray:
         return self._R_base_in_world.copy()
-
-    @property
-    def apriltag_to_car_base_offset_mm(self) -> np.ndarray:
-        return self._apriltag_to_car_base_offset_mm.copy()
 
     @property
     def z_offset_base_mm(self) -> float:

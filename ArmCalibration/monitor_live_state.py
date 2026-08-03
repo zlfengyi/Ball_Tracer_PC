@@ -236,10 +236,11 @@ def main() -> int:
     print(f"Racket bbox provider: {args.racket_bbox_provider}")
     print(f"Racket pose provider: {args.racket_pose_provider}")
     print(f"Loop rate:     {args.rate_hz:.2f} Hz")
-    print(
-        "AprilTag->car/base offset (car body axes): "
-        f"{format_vec(poe_model.apriltag_to_car_base_offset_mm)} mm"
-    )
+    for tag_id, center_m in sorted(car_localizer.tag_layout_m.items()):
+        print(
+            f"On-car AprilTag id{tag_id} center (car body axes): "
+            f"{format_vec(center_m * 1000.0)} mm"
+        )
 
     rclpy.init()
     collector = JointStateCollector(args.joint_topic)
@@ -299,21 +300,28 @@ def main() -> int:
                         print(f"detail: joint_state failed to evaluate POE ({exc})")
 
                 detections_by_camera = {serial: car_localizer.detect(image) for serial, image in images.items()}
-                best_tag, best_tag_dets = choose_best_tag(detections_by_camera)
+                best_tag, _ = choose_best_tag(detections_by_camera)
                 print(f"detail: car_obs {summarize_car_observations(serials, detections_by_camera, best_tag)}")
+                configured_ids = set(car_localizer.tag_ids)
+                tag_cameras: dict[int, dict[str, CarDetection]] = {}
+                for serial, detections in detections_by_camera.items():
+                    for det in detections:
+                        if det.tag_id in configured_ids:
+                            tag_cameras.setdefault(det.tag_id, {})[serial] = det
                 car_loc = None
                 car_world_mm = None
-                if best_tag is not None:
-                    car_loc = car_localizer.estimate_pose(
-                        best_tag_dets, t=time.perf_counter()
+                if any(len(dets) >= 2 for dets in tag_cameras.values()):
+                    car_loc = car_localizer.estimate_car_pose(
+                        tag_cameras, t=time.perf_counter()
                     )
+                if car_loc is not None:
                     car_world_mm = tuple(
                         1000.0 * float(value)
                         for value in (car_loc.x, car_loc.y, car_loc.z)
                     )
                     print(
                         "detail: p_car "
-                        f"tag={car_loc.tag_id}  {format_vec(car_world_mm)} mm  "
+                        f"tags={car_loc.tag_ids}  {format_vec(car_world_mm)} mm  "
                         f"yaw={math.degrees(car_loc.yaw):.1f} deg  "
                         f"yaw_valid={car_loc.yaw_valid}  "
                         f"reproj={car_loc.reprojection_error:.2f}px  "

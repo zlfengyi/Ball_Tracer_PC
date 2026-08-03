@@ -24,8 +24,18 @@ from ArmCalibration.common import ARM_DATA_ROOT, load_json, rel_or_abs, save_jso
 
 DEFAULT_CAMERA_CALIB_PATH = PROJECT_ROOT / "src" / "config" / "four_camera_calib.json"
 DEFAULT_EXPORT_CONFIG_PATH = PROJECT_ROOT / "src" / "config" / "arm_poe_racket_center.json"
-APRILTAG_TO_CAR_BASE_OFFSET_M = [0.04, 0.16, -0.61]
-APRILTAG_TO_CAR_BASE_OFFSET_MM = [value * 1000.0 for value in APRILTAG_TO_CAR_BASE_OFFSET_M]
+
+# vehicle_reference（车载 AprilTag 布局）由 test_src/measure_car_tag_layout.py
+# 维护；POE 重标定时原样保留现有配置块，找不到时写入该占位提示。
+FALLBACK_VEHICLE_REFERENCE = {
+    "car_base_definition": (
+        "car chassis center in world coordinates. In this project it is the same physical point "
+        "as the robotic arm base used by the exported POE model."
+    ),
+    "apriltag_black_edge_m": 0.161,
+    "apriltags": {},
+    "note": "empty layout placeholder — run test_src/measure_car_tag_layout.py to fill in.",
+}
 
 
 @dataclass(frozen=True)
@@ -988,10 +998,23 @@ def run_fit_pipeline(
     }
 
 
+def load_existing_vehicle_reference(config_path: Path) -> dict:
+    """读取现有导出配置中的 vehicle_reference（车载 tag 布局），原样保留。"""
+    try:
+        existing = load_json(config_path)
+        block = existing.get("vehicle_reference")
+        if isinstance(block, dict) and block.get("apriltags"):
+            return block
+    except (OSError, ValueError):
+        pass
+    return dict(FALLBACK_VEHICLE_REFERENCE)
+
+
 def build_export_config(
     result: dict,
     export_path: Path,
     camera_calib_path: Path,
+    vehicle_reference: dict,
 ) -> dict:
     base = result["derived_base_in_world"]
     model = result["model"]
@@ -1055,22 +1078,7 @@ def build_export_config(
             "z_axis_note": "The z-axis accuracy is at the centimeter level.",
             "source_note": "These notes are the final manual validation notes recorded in DEV.md.",
         },
-        "vehicle_reference": {
-            "car_base_definition": (
-                "car chassis center in world coordinates. In this project it is the same physical point "
-                "as the robotic arm base used by the exported POE model."
-            ),
-            "apriltag_center_measurement": (
-                "p_apriltag is the multi-camera triangulated world position of the detected AprilTag center."
-            ),
-            "p_car_definition": "p_car = p_apriltag + apriltag_center_to_car_base_offset_world",
-            "apriltag_center_to_car_base_offset_m": APRILTAG_TO_CAR_BASE_OFFSET_M,
-            "apriltag_center_to_car_base_offset_mm": APRILTAG_TO_CAR_BASE_OFFSET_MM,
-            "offset_axis_convention": (
-                "The offset is applied directly in the world frame axes, exactly as "
-                "p_car = (x + 0.04, y + 0.16, z - 0.61) when p_apriltag = (x, y, z) in meters."
-            ),
-        },
+        "vehicle_reference": vehicle_reference,
         "T_base_in_world": {
             "R": base["R_base_in_world"],
             "t_mm": base["t_base_in_world"],
@@ -1220,7 +1228,12 @@ def main() -> None:
     result_path = session_dir / args.result_name
     save_json(result_path, result)
     export_config_path = Path(args.export_config).resolve()
-    export_config = build_export_config(result, result_path, camera_calib_path)
+    export_config = build_export_config(
+        result,
+        result_path,
+        camera_calib_path,
+        load_existing_vehicle_reference(export_config_path),
+    )
     save_json(export_config_path, export_config)
 
     final_reprojection = result_fit["reprojection_fit"]

@@ -49,7 +49,8 @@ PC 侧 AprilTag 多目定位成功后发布的小车位置结果。
 
 ### 发布时机
 
-- 小车定位成功时发布
+- **两块车载 tag（id0、id1）都参与联合拟合成功时才发布**
+- 只识别到一块 tag 时不发布（单 tag 短基线 yaw + 安装杠杆位置误差，精度不足）
 - 没有定位结果时不发
 
 ### JSON 格式
@@ -63,7 +64,8 @@ PC 侧 AprilTag 多目定位成功后发布的小车位置结果。
   "yaw": 0.4567,
   "yaw_valid": true,
   "t": 411987136.914000,
-  "tag_id": 5
+  "tag_id": 0,
+  "tag_ids": [0, 1]
 }
 ```
 
@@ -74,16 +76,19 @@ PC 侧 AprilTag 多目定位成功后发布的小车位置结果。
 | `topic` | `string` | 历史桥接链路保留下来的路由字段，当前直连模式也仍然保留，固定为 `car_loc` |
 | `x` | `number` | 小车 `car_base` 参考点世界坐标 X，单位米 |
 | `y` | `number` | 小车 `car_base` 参考点世界坐标 Y，单位米 |
-| `z` | `number` | 小车 `car_base` 参考点世界坐标 Z，单位米 |
+| `z` | `number` | 小车 `car_base` 参考点世界坐标 Z，单位米（车心定义在地面，恒为 0） |
 | `yaw` | `number` | 本帧估计的小车绕 z 轴朝向，单位弧度 |
-| `yaw_valid` | `boolean` | 最终至少 3 台相机且四角重投影误差合格时为 `true`，RK 才使用 `yaw` 修正航向；否则本帧只修正 `x/y` |
+| `yaw_valid` | `boolean` | 双 tag 参与拟合（~0.9m 中心基线）或单 tag 但至少 3 台相机、且四角重投影误差合格时为 `true`，RK 才使用 `yaw` 修正航向；否则本帧只修正 `x/y` |
 | `t` | `number` | 定位时间，时间轴是 Windows `perf_counter()` 秒 |
-| `tag_id` | `integer` | 本次定位使用到的 AprilTag ID |
+| `tag_id` | `integer` | 主 tag（拟合中相机数最多的车载 tag；并列取小 id），兼容保留 |
+| `tag_ids` | `integer[]` | 参与本次联合拟合的全部车载 tag ID；因单 tag 不发布，实际恒为 `[0, 1]` |
 
 ### 备注
 
-- 坐标参考点不是 tag 中心，而是 `car_base`
-- `car_base` 相对 AprilTag 中心的偏移来自车辆参考配置
+- 坐标参考点不是 tag 中心，而是 `car_base`（车位姿为直接优化变量）
+- 车上现装两块 tag（id0 右后、id1 左前），车体系布局见
+  `src/config/arm_poe_racket_center.json` 的 `vehicle_reference.apriltags`，
+  由 `test_src/measure_car_tag_layout.py` 实测生成；单块可见时退化为单 tag 拟合
 
 ## PC 侧的消费（订阅）
 

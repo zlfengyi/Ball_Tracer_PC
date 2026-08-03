@@ -1434,6 +1434,7 @@ class ArchiveThread:
                 if ev.elapsed_s is not None else None
             ),
             "tag_id": loc.tag_id,
+            "tag_ids": loc.tag_ids,
             "reference": "car_base",
             "cameras_used": loc.cameras_used,
             "pixels": {
@@ -1453,6 +1454,7 @@ class ArchiveThread:
                 round(ev.elapsed_s, 3) if ev.elapsed_s is not None else None
             ),
             "tag_id": loc.tag_id,
+            "tag_ids": loc.tag_ids,
             "reference": "car_base",
             "cameras_used": loc.cameras_used,
             "reprojection_error": round(loc.reprojection_error, 2),
@@ -1635,10 +1637,8 @@ def main() -> int:
     )
     if car_localizer is not None:
         print(f"  相机: {car_localizer.serials}")
-        print(
-            "  car_base offset: "
-            f"{_format_xyz_m(*car_localizer.apriltag_to_car_base_offset_m)}"
-        )
+        for tag_id, center in sorted(car_localizer.tag_layout_m.items()):
+            print(f"  车载 tag id{tag_id} 车体系中心: {_format_xyz_m(*center)}")
         print(
             "  小车定位采样: "
             f"every {car_loc_sample_every_frames} frame(s)"
@@ -1887,6 +1887,7 @@ def main() -> int:
                             "yaw_valid": loc.yaw_valid,
                             "t": round(job.exposure_pc, 6),
                             "tag_id": loc.tag_id,
+                            "tag_ids": loc.tag_ids,
                         })
                     archive_thread.submit(CarLocEvent(
                         frame_idx=job.frame_idx,
@@ -2329,8 +2330,13 @@ def main() -> int:
                 "enabled": car_loc_enabled,
                 "sample_every_frames": car_loc_sample_every_frames,
                 "position_reference": "car_base",
-                "apriltag_center_to_car_base_offset_m": (
-                    [round(v, 4) for v in car_localizer.apriltag_to_car_base_offset_m]
+                "apriltag_layout_car_m": (
+                    {
+                        str(tag_id): [round(float(v), 4) for v in center]
+                        for tag_id, center in sorted(
+                            car_localizer.tag_layout_m.items()
+                        )
+                    }
                     if car_localizer is not None
                     else None
                 ),

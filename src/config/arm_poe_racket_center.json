@@ -30,22 +30,32 @@
   },
   "vehicle_reference": {
     "car_base_definition": "car chassis center in world coordinates. In this project it is the same physical point as the robotic arm base used by the exported POE model.",
-    "apriltag_center_measurement": "p_apriltag is estimated by fitting the four detected black-border corners as an upright rigid square at fixed center height.",
-    "p_car_definition": "p_car = p_apriltag + Rz(yaw_car) * apriltag_center_to_car_base_offset_body",
+    "p_car_definition": "car pose (x, y, yaw) is fitted jointly from the corners of all visible on-car AprilTags using the rigid layout below; car z = 0 (ground).",
+    "layout_axis_convention": "apriltags centers/rotations are expressed in the car body frame (x right, y forward, z up from ground, origin = joint_1 axis at ground = arm base).",
+    "layout_measurement": "measured 2026-08-03 by test_src/measure_car_tag_layout.py (multi-camera 6-DoF rigid fit, edge length anchors scale); re-run it after any tag remount.",
     "apriltag_black_edge_m": 0.161,
-    "apriltag_center_height_m": 0.61,
-    "apriltag_to_car_yaw_offset_rad": 0.016,
-    "apriltag_center_to_car_base_offset_m": [
-      0.04,
-      0.16,
-      -0.61
-    ],
-    "apriltag_center_to_car_base_offset_mm": [
-      40.0,
-      160.0,
-      -610.0
-    ],
-    "offset_axis_convention": "The horizontal offset is expressed in the car body frame (x right, y forward) and rotated into the world frame by yaw_car. The z offset is vertical."
+    "apriltags": {
+      "0": {
+        "center_car_m": [0.2835, -0.42, 0.1915],
+        "R_tag_car": [
+          [-0.998762, 0.012607, -0.04812],
+          [0.048589, 0.039959, -0.998019],
+          [-0.010659, -0.999122, -0.040522]
+        ],
+        "orientation_note": "法线方位 -92.76° 仰角 -2.32° 面内旋转 +179.39°（倒贴）",
+        "position_note": "右后。中心为用户实测锚定值，视觉复核 z 差仅 +6mm"
+      },
+      "1": {
+        "center_car_m": [-0.2445, 0.274, 0.39],
+        "R_tag_car": [
+          [0.999378, -0.023618, -0.026169],
+          [-0.027276, -0.047834, -0.998483],
+          [0.02233, 0.998576, -0.048448]
+        ],
+        "orientation_note": "法线方位 -91.50° 仰角 -2.78° 面内旋转 -1.28°（正贴）",
+        "position_note": "左前。中心为用户卷尺实测（2026-08-03 现场复核；z 最初报 0.302 是量到纸下缘）。视觉值 (-0.2613, 0.2961, 0.4026) 经由外参漂移的 414 相机，仅作参考"
+      }
+    }
   },
   "T_base_in_world": {
     "R": [

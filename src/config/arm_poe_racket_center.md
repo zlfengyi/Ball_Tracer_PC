@@ -33,26 +33,15 @@
 
 ### AprilTag 与 p_car
 
-- 多目视觉按 tag 平面竖直、上边水平，用固定中心高度和真实边长拟合得到 `p_apriltag`，它表示 **AprilTag 中心** 在世界坐标系下的位置
-- 然后再按固定偏移换算为 `p_car`
-- 水平偏移定义在 **车体坐标轴** 下，并按当前 `yaw_car` 旋转到世界坐标系
+2026-08-03 起改为 **车载双 tag 联合拟合**（旧单 tag + 固定偏移换算方案废除）：
 
-公式是：
-
-```text
-p_apriltag = (x, y, z)
-d_body     = (0.04, 0.16, -0.61)
-p_car.xy   = p_apriltag.xy + Rz(yaw_car) * d_body.xy
-p_car.z    = z + d_body.z                                      [m]
-```
-
-也就是：
-
-```text
-apriltag_center_to_car_base_offset = (40, 160, -610)   [mm]
-```
-
-物理含义（2026-07-05 重新测量）：tag 中心相对小车原点在车体系 x −40mm（左方）、y −160mm（后方）、z +610mm（地面上方），反号即得上面的偏移。
+- 车上刚性安装两块竖直 AprilTag：`id0` 右后（倒贴，面内旋转 180°）、`id1` 左前（正贴），均朝车尾方向
+- 每块 tag 的车体系布局（中心 `center_car_m` + 完整安装旋转 `R_tag_car`）写在
+  `vehicle_reference.apriltags`，由 `test_src/measure_car_tag_layout.py` 实测生成
+- 定位时把所有相机 × 所有可见 tag 的四角放进同一刚体模型，直接优化车位姿
+  `(x, y, yaw)`（车心即变量，不再有 tag→车心的后处理换算）；`p_car.z = 0`（地面）
+- 双 tag 同时可见时 ~0.9m 中心基线决定 yaw；单 tag 可见时退化为单块拟合
+- 换场地无关（布局绑定在车上）；每次重新粘贴/移动 tag 后重跑测量脚本
 
 ## 2. 配置字段含义
 
@@ -84,19 +73,23 @@ apriltag_center_to_car_base_offset = (40, 160, -610)   [mm]
 
 - `car_base_definition`
   说明 `p_car` 表示车底盘中心，并且这个点与机械臂 `base` 是同一个物理点
-- `apriltag_center_measurement`
-  说明 `p_apriltag` 由平面竖直、上边水平、固定中心高度和固定黑边边长的 AprilTag 四角刚体拟合得到
-- `p_car_definition`
-  说明 `p_car` 不是 tag 中心，而是按车体 yaw 旋转安装偏移后得到的底盘中心
-- `apriltag_black_edge_m / apriltag_center_height_m`
-  分别给出实测黑色方形边长 `0.161m` 和竖直安装的 tag 中心高度 `0.61m`
-- `apriltag_to_car_yaw_offset_rad`
-  给出 tag 的 `0→1` 方向到车体 yaw 的固定偏移；当前 `0.0160rad` 由
-  `tracker_20260730_102443` 开始静止段（车体真实 `yaw=0`）的竖直刚体解中位数标定
-- `apriltag_center_to_car_base_offset_m / _mm`
-  给出 AprilTag 中心到车底盘中心的固定平移
-- `offset_axis_convention`
-  明确水平偏移位于车体系（x 向右、y 向前），使用车体 yaw 旋转到世界系；z 为竖直偏移
+- `p_car_definition / layout_axis_convention`
+  车位姿由所有可见车载 tag 的四角联合刚体拟合直接得到；布局定义在车体系
+  （x 向右、y 向前、z 离地，原点 = joint_1 轴与地面交点）
+- `apriltag_black_edge_m`
+  实测黑色方形边长 `0.161m`（两块相同）
+- `apriltags.{id}.center_car_m`
+  该 tag 中心的车体系坐标，**以手工卷尺实测为准**（不依赖相机外参；
+  2026-08-03 实测替换视觉值后同位重投影 2.21→1.18px）。量 z 注意量到
+  黑方块中心：id1 最初报 0.302 是量到纸下缘（中心 0.39 − 半边长 0.0805 −
+  白边 ~0.02）
+- `apriltags.{id}.R_tag_car`
+  3x3 安装旋转，列 = [印面右 e1, 印面上 e2, 朝外法线 n]，含实测微倾角；
+  手工兜底可改用 `face_azimuth_deg` + `inplane_rotation_deg`（竖直假设）
+- `layout_measurement`
+  `test_src/measure_car_tag_layout.py` 用于测安装旋转 `R_tag_car` 与
+  交叉验证中心值；其输出的中心坐标继承相机外参误差（尤其 414 有漂移），
+  **不要用它覆盖手工实测的 center_car_m**
 
 ### measurement_target
 
@@ -318,7 +311,8 @@ min_theta  Σ rho( || pi_c( p_world(q_k; theta) ) - u_obs(k, c) ||^2 )
 - `p_racket_rel_base_in_world(by vision)`
   由视觉三角化得到的世界系相对位移，即 `p_racket_world(by vision) - p_car`
 
-其中 `p_car = p_apriltag + (40, 160, -610) mm`。
+其中 `p_car` 为车载双 tag 联合拟合直接输出的车位姿（2026-08-03 前的旧方案为
+`p_car = p_apriltag + (40, 160, -610) mm`）。
 
 如果 RK 端要做的是完整末端姿态或拍面法向控制，则还需要补：
 
