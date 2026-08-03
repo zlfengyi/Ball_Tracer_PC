@@ -3,7 +3,7 @@
 
 曾经的 pc_logger 臂报告页（/run/，POE FK + time_sync 表）随 newarm2 线一起
 废弃删除（2026-07-16）——臂数据现走 rosbag → extract_arm_bag.py → generate_curve3_html
-的 Arm tab（RK 单调钟 + 单 rkOffset）。本服务器只负责浏览与分发产物。
+的 Arm tab（RK 单调钟 + RK→PC 仿射时间映射）。本服务器只负责浏览与分发产物。
 """
 from __future__ import annotations
 

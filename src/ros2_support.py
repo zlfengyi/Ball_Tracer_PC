@@ -4,9 +4,9 @@ import os
 import sys
 from pathlib import Path
 
-TRACKER_PC_IP = "192.168.31.78"
-ARM_RK_IP = "192.168.31.23"
-CHASSIS_RK_IP = "192.168.50.143"
+TRACKER_PC_IP = os.environ.get("BALL_TRACER_PC_IP", "192.168.50.230")
+ARM_RK_IP = os.environ.get("BALL_TRACER_ARM_RK_IP", "192.168.50.17")
+CHASSIS_RK_IP = os.environ.get("BALL_TRACER_CHASSIS_RK_IP", "192.168.50.143")
 DEFAULT_ROS_DOMAIN_ID = "2"
 
 ROS2_ROOT = Path(
@@ -94,7 +94,7 @@ def ensure_ros2_environment() -> None:
         os.environ.get("BALL_TRACER_ROS_DOMAIN_ID", DEFAULT_ROS_DOMAIN_ID),
     )
     os.environ["RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"
-    os.environ["CYCLONEDDS_URI"] = cyclonedds_file_uri(CYCLONEDDS_XML_PATH)
+    os.environ.setdefault("CYCLONEDDS_URI", cyclonedds_file_uri(CYCLONEDDS_XML_PATH))
 
     for env_name in (
         "FASTRTPS_DEFAULT_PROFILES_FILE",

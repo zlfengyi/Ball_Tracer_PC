@@ -12,6 +12,8 @@ param(
     [string]$CalibrationConfig = '',
     [ValidateRange(0, 1)]
     [int]$CameraReverse180 = 1,
+    [ValidateSet(16, 18)]
+    [int]$Floor = 16,
     [switch]$ProbeOnly
 )
 
@@ -50,8 +52,15 @@ $ros2Setup = 'C:\dev\ros2_jazzy\local_setup.ps1'
 $ros2SitePackages = 'C:\dev\ros2_jazzy\Lib\site-packages'
 $ros2PixiRoot = 'C:\dev\ros2_jazzy\.pixi\envs\default'
 $ros2PixiLibraryBin = Join-Path $ros2PixiRoot 'Library\bin'
-$cycloneXml = Join-Path $PSScriptRoot "ros2\cyclonedds.xml"
+$trackerPcIp = if ($Floor -eq 18) { '192.168.31.78' } else { '192.168.50.230' }
+$armRkIp = if ($Floor -eq 18) { '192.168.31.23' } else { '192.168.50.17' }
+$cycloneConfigName = if ($Floor -eq 18) { 'cyclonedds_18.xml' } else { 'cyclonedds.xml' }
+$cycloneXml = Join-Path $PSScriptRoot "ros2\$cycloneConfigName"
 $mvsMvImport = 'C:\Program Files (x86)\MVS\Development\Samples\Python\MvImport'
+
+$env:BALL_TRACER_PC_IP = $trackerPcIp
+$env:BALL_TRACER_ARM_RK_IP = $armRkIp
+$env:BALL_TRACER_CHASSIS_RK_IP = '192.168.50.143'
 
 if (-not (Test-Path Env:MVS_MVIMPORT_DIR)) {
     $env:MVS_MVIMPORT_DIR = $mvsMvImport
@@ -227,6 +236,9 @@ if ($selection.Name -eq 'ros2') {
 
 Write-Host "Camera config: $CameraConfig"
 Write-Host "Calibration config: $CalibrationConfig"
+Write-Host "Tracker floor: ${Floor}F"
+Write-Host "Tracker PC IP: $trackerPcIp"
+Write-Host "CycloneDDS config: $cycloneXml"
 
 if ($ProbeOnly) {
     exit 0

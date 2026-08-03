@@ -2,7 +2,6 @@
 setlocal
 
 set "ROS2_ROOT=C:\dev\ros2_jazzy"
-set "CYCLONEDDS_XML=%~dp0cyclonedds.xml"
 
 cd /d %ROS2_ROOT%
 call "%ROS2_ROOT%\local_setup.bat"
@@ -16,8 +15,11 @@ if not defined BALL_TRACER_ROS_DOMAIN_ID (
     set "ROS_DOMAIN_ID=%BALL_TRACER_ROS_DOMAIN_ID%"
 )
 set "RMW_IMPLEMENTATION=rmw_cyclonedds_cpp"
-set "CYCLONEDDS_URI=file://%CYCLONEDDS_XML:\=/%"
-if not exist "%ROS_LOG_DIR%" mkdir "%ROS_LOG_DIR%"
+if not defined CYCLONEDDS_URI (
+    set "CYCLONEDDS_XML=%~dp0cyclonedds.xml"
+    set "CYCLONEDDS_URI=file://%CYCLONEDDS_XML:\=/%"
+)
+if defined ROS_LOG_DIR if not exist "%ROS_LOG_DIR%" mkdir "%ROS_LOG_DIR%"
 set FASTRTPS_DEFAULT_PROFILES_FILE=
 set FASTDDS_DEFAULT_PROFILES_FILE=
 set "PATH=%ROS2_ROOT%\.pixi\envs\default;%ROS2_ROOT%\.pixi\envs\default\Library\bin;%PATH%"

@@ -11,8 +11,8 @@ TCP 正解使用本文件内置的 FK，不依赖 tennis-man/arm_controller 源�
 
 时间轴（全项目只有两个时间轴）：
   所有 t 一律为 RK 单调钟（CLOCK_MONOTONIC）绝对秒 —— 与 /predict_hit_pos
-  的 ct/ht、rk_tracking 的 payload t 同一个钟。报告端只需一个 rkOffset
-  （每抛球轨迹拟合）即可把整个 RK 轴对到 PC 轴，臂数据没有任何独立的桥。
+  的 ct/ht、rk_tracking 的 payload t 同一个钟。报告端复用同一个 RK→PC
+  仿射时间映射，臂数据没有任何独立的桥。
 
   新固件（damiao 驱动 + arm_controller 单调钟版）：
     /joint_states、/tennis/motor_command 的 header.stamp 就是 RK 单调钟，
@@ -534,7 +534,7 @@ def main() -> int:
                 else "同 states 换算（用 motor_command 自己的 stamp−recv 中位）"
             ),
             "events": "status 尾缀 t= / predict 的 ct（原生）；无时间的旧事件 = recv + median(bot_state.t−recv)",
-            "note": "与 /predict_hit_pos ct/ht、rk_tracking payload t 同钟；报告端仅需一个 rkOffset",
+            "note": "与 /predict_hit_pos ct/ht、rk_tracking payload t 同钟；报告端复用 RK→PC 仿射时间映射",
         },
         "clock_sync": clock_sync,
         "bag_dir": str(args.bag.resolve()),

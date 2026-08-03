@@ -22,7 +22,8 @@
   QoS 约定仅供桥接脚本/工具使用。
 - 旧主线的 `/arm_logger/control`（pc_event_logger 控制）与 `/time_sync/pong`
   （WinRKTimeSync 应答）随 newarm2 线于 2026-07-16 废弃删除。两轴对时不再有
-  运行时组件：RK 全站自带 CLOCK_MONOTONIC 时间，报告端每场一个 rkOffset 对齐。
+  运行时组件：RK 全站自带 CLOCK_MONOTONIC 时间，报告端每场拟合
+  `PC t = scale × RK t + bias`。
 
 ## 通用约定
 
@@ -119,5 +120,6 @@ tracker 启动时自动拉起）全量录制到 `tracker_output/{run_id}_rosbag/
   `t`、bot_center 的 `ct/ht`、`/joint_states` 与 `/tennis/motor_command` 的
   header.stamp、`/tennis/status` 文本尾缀 `t=`），不用系统钟/epoch。
 
-两轴仅在报告端对齐：每份报告用抛球轨迹拟合一个 rkOffset（`generate_curve3_html.py`
-的 Auto align）。运行时没有任何跨钟换算或对时组件。
+两轴仅在报告端对齐：`generate_curve3_html.py` 先用 PC 发布且 RK 原样回带的小车
+位姿鲁棒估计时钟 `scale`，再用逐抛球 z 形状细化 `bias`。运行时没有任何跨钟
+换算或对时组件。

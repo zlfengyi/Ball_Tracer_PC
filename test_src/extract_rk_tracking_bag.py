@@ -190,6 +190,8 @@ def main() -> int:
                 rel_x=payload.get("rel_x"),
                 rel_y=payload.get("rel_y"),
                 rel_z=payload.get("rel_z"),
+                car_pred_x=payload.get("car_pred_x"),
+                car_pred_y=payload.get("car_pred_y"),
                 n_bounce_fit=payload.get("n_bounce_fit"),
             )
             _append_xyz(xy_pred, t, payload, stage=stage)

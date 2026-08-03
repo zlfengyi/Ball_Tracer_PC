@@ -51,13 +51,23 @@ def _pc_truth_core_js() -> str:
     return match.group(1)
 
 
-def _run_truth(tmp_path: Path, rows: list[dict]) -> dict | None:
+def _run_truth(
+    tmp_path: Path,
+    rows: list[dict],
+    car: dict | None = None,
+    cfg: dict | None = None,
+    contact: float = CONTACT_T,
+) -> dict | None:
+    car = car or {"x": 0, "y": 0, "yaw": 0}
     harness = (
+        f"const cfg={json.dumps(cfg or {})};\n"
         f"const pcRows={json.dumps(rows)};\n"
-        "const carAt=t=>({x:0,y:0,yaw:0});\n"
-        "const relToCar=(b,c)=>b;\n"
+        f"const carAt=t=>({json.dumps(car)});\n"
+        "const relToCar=(b,c)=>{const dx=b.x-c.x,dy=b.y-c.y,"
+        "cy=Math.cos(c.yaw),sy=Math.sin(c.yaw);"
+        "return {x:cy*dx+sy*dy,y:-sy*dx+cy*dy,z:b.z};};\n"
         f"{_pc_truth_core_js()}\n"
-        f"console.log(JSON.stringify(pcTruthAt({CONTACT_T})));\n"
+        f"console.log(JSON.stringify(pcTruthAt({contact})));\n"
     )
     script = tmp_path / "pc_truth_harness.js"
     script.write_text(harness, encoding="utf-8")
@@ -72,15 +82,97 @@ def _run_truth(tmp_path: Path, rows: list[dict]) -> dict | None:
 def test_pc_truth_ignores_outgoing_frame_across_contact_gap(tmp_path):
     fitted = _run_truth(tmp_path, INCOMING + [OUTGOING])
     assert fitted is not None
-    assert fitted["z"] == pytest.approx(1.6159227, abs=0.001)
+    assert fitted["z"] == pytest.approx(1.6064886, abs=0.001)
 
     before = INCOMING[-1]
     fraction = (CONTACT_T - before["t"]) / (OUTGOING["t"] - before["t"])
     chord_z = before["z"] + fraction * (OUTGOING["z"] - before["z"])
     assert chord_z == pytest.approx(1.58649, abs=0.001)
-    assert fitted["z"] - chord_z > 0.025
+    assert fitted["z"] - chord_z > 0.015
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
 def test_pc_truth_does_not_fall_back_with_too_few_incoming_points(tmp_path):
     assert _run_truth(tmp_path, INCOMING[-4:] + [OUTGOING]) is None
+
+
+def _drag_rows(
+    contact: float, k_drag: float, extra_accel: float = 0.0
+) -> tuple[list[dict], float]:
+    """常数 λ 阻力闭式轨迹（x/y/z 同 λ），z 可叠加 extra_accel·u²/2（旋转 Magnus）。
+    返回 (观测行, 真值 z0@contact)。"""
+    import math
+
+    g = 9.81
+    x0, vx0 = 0.65, 0.3
+    y0, vy0 = 4.2, -5.5
+    z0, vz0 = 1.30, -2.0
+    lam = k_drag * math.hypot(vx0, vy0)
+    rows = []
+    n, span, gap = 21, 0.70, 0.03
+    for i in range(n):
+        u = -(gap + span * (n - 1 - i) / (n - 1))
+        phi = -math.expm1(-lam * u) / lam
+        rows.append(
+            {
+                "t": contact + u,
+                "x": x0 + vx0 * phi,
+                "y": y0 + vy0 * phi,
+                "z": z0 + (vz0 + g / lam) * phi - (g / lam) * u
+                + 0.5 * extra_accel * u * u,
+            }
+        )
+    return rows, z0
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_pc_truth_z_uses_drag_model_when_k_drag_present(tmp_path):
+    contact = 100.0
+    rows, z0 = _drag_rows(contact, k_drag=0.024)
+
+    with_drag = _run_truth(tmp_path, rows, cfg={"k_drag": 0.024}, contact=contact)
+    assert with_drag is not None
+    assert with_drag["z"] == pytest.approx(z0, abs=0.001)
+    assert with_drag["resMax"] < 0.003
+    assert abs(with_drag["delta"]) < 0.1
+
+    # 无 k_drag 时阻力曲率只能靠 δ 项吸收（单侧窗口会把高阶项也投影进 δ，符号不定）；
+    # |δ| 明显非零、而 k_drag 在位时 |δ|≈0，即证阻力分支真实生效
+    pure = _run_truth(tmp_path, rows, cfg={}, contact=contact)
+    assert pure is not None
+    assert abs(pure["delta"]) > 0.15
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_pc_truth_z_bounded_spin_term(tmp_path):
+    contact = 100.0
+    cfg = {"k_drag": 0.024}
+
+    # 界内旋转（+1.3 m/s² 下压，0731 #4 实测量级）：δ 吸收，z0 精确恢复
+    rows, z0 = _drag_rows(contact, k_drag=0.024, extra_accel=1.3)
+    fitted = _run_truth(tmp_path, rows, cfg=cfg, contact=contact)
+    assert fitted is not None
+    assert fitted["z"] == pytest.approx(z0, abs=0.002)
+    assert fitted["delta"] == pytest.approx(1.3, abs=0.15)
+    assert fitted["resMax"] < 0.003
+
+    # 越界曲率（+3.5 m/s²，非物理/污染级）：δ 夹到 ±2 后残差撑爆 35mm 门 → 拒绝
+    rows_bad, _ = _drag_rows(contact, k_drag=0.024, extra_accel=3.5)
+    assert _run_truth(tmp_path, rows_bad, cfg=cfg, contact=contact) is None
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_pc_truth_y_is_ball_world_y_minus_car_world_y(tmp_path):
+    car = {"x": 0.5, "y": 7.0, "yaw": 0.4}
+    fitted = _run_truth(tmp_path, INCOMING, car)
+    assert fitted is not None
+
+    times = [row["t"] - CONTACT_T for row in INCOMING]
+    values = [row["y"] for row in INCOMING]
+    n = len(times)
+    st, sv = sum(times), sum(values)
+    stt = sum(value * value for value in times)
+    stv = sum(t * value for t, value in zip(times, values))
+    expected_ball_y = (sv * stt - st * stv) / (n * stt - st * st)
+
+    assert fitted["y"] == pytest.approx(expected_ball_y - car["y"], abs=1e-9)

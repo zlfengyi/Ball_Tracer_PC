@@ -3,7 +3,7 @@
   <Domain id="any">
     <General>
       <Interfaces>
-        <NetworkInterface address="192.168.50.230" multicast="false" />
+        <NetworkInterface address="192.168.31.78" multicast="false" />
       </Interfaces>
       <AllowMulticast>false</AllowMulticast>
     </General>
@@ -11,7 +11,7 @@
       <ParticipantIndex>auto</ParticipantIndex>
       <MaxAutoParticipantIndex>8</MaxAutoParticipantIndex>
       <Peers>
-        <Peer Address="192.168.50.17" />
+        <Peer Address="192.168.31.23" />
         <Peer Address="192.168.50.143" />
       </Peers>
     </Discovery>

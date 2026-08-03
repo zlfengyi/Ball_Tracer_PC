@@ -6,6 +6,14 @@
 `yolo_model/racket.onnx + yolo_model/racket_pose.onnx`，只使用关键点 0-3 的几何中心
 做球拍 2D/3D 定位，并将结果补充回 JSON；视频画面只绘制球拍关键点与几何中心。
 
+另外从 PC 球观测离线检测"击球回球"事件（与报告 All-in-One 表 PC回球列同口径，
+含贴地球/断档/跳变/地面反弹脏数据过滤），在触球后 400ms 帧区间叠加回球速度矢量
+（RETURN 文字行 + 各相机按标定投影的青色箭头），事件同时写回 JSON pc_return_events。
+
+若同目录存在 <stem>_rk_tracking.json，还会在每次抛球（bot_state target_active）期间
+叠加小车要去的目标点（红圈 TGT）与当前位置（绿点 CAR，PC AprilTag 地面投影）及连线；
+RK 时轴用共享小车位姿锚对齐（同报告 clockAnchor 思路），锚不足时自动跳过。
+
 用法：
   python test_src/annotate_video.py --input tracker_output/tracker_20260311_193455.json
   python test_src/annotate_video.py --input tracker_output/tracker_20260311_193455.json ^
@@ -15,6 +23,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import math
 import sys
@@ -48,6 +57,10 @@ STATIONARY_BOX_COLOR = (180, 180, 180)
 TEXT_COLOR = (255, 255, 255)
 TEXT_3D_COLOR = (0, 255, 255)
 TEXT_RACKET_3D_COLOR = (255, 0, 255)
+RETURN_COLOR = (255, 255, 0)  # 青色 - 回球速度矢量
+TARGET_COLOR = (0, 0, 255)  # 红色 - 小车要去的目标点（RK bot_state target）
+CAR_MARK_COLOR = (0, 255, 0)  # 绿色 - 小车当前位置（PC AprilTag 地面投影）
+CAR_TGT_LINE_COLOR = (200, 200, 200)
 STATE_COLORS = {
     "idle":         (128, 128, 128),
     "tracking_s0":  (255, 200, 0),
@@ -329,6 +342,575 @@ def describe_car_loc_status(
     if status == "pending":
         return ("AprilTag: pending", (180, 180, 180))
     return None
+
+
+# ---------------- PC 回球检测与速度矢量叠加 ----------------
+# 与 generate_curve3_html 的 [[pc-return-core]]（All-in-One "PC回球" 列）同口径：
+# 触球时刻 = 入弧/出弧 y(t) 二次拟合交点（来回交点法），回球速度 = 触球后 [+20,+400]ms
+# 出弧连续段三轴拟合在触球时刻的导数（z 先扣 ½g·u²）。脏数据过滤：z<0.12 贴地/静止球
+# 剔除；观测按断档>150ms 或帧间位移速>20m/s（检测器跳到别的球；门槛在最快回球 ~15m/s
+# 之上，073646 实测 12.2~12.4m/s 回球会被 12 门误切）切成连续段，按点数优先选首个
+# "真出向"段——静止球段 vy≈0 被拒，被拍/臂遮挡断档后仍能用遮挡后的真弧；
+# vz 由降转升突增判地面反弹截断；出弧 vy≤0.5、水平速<1m/s 或点数不足不认定回球。
+RETURN_MIN_Z = 0.12
+RETURN_MAX_STEP_MPS = 20.0
+RETURN_OUT_WINDOW = (0.02, 0.40)
+RETURN_MAX_SEG_START = 0.30  # 出弧段首距触球上限（限制回推外推量）
+RETURN_HALF_G = 4.905
+RETURN_ARROW_SECONDS = 0.15  # 箭头长度 = 速度矢量 × 该时长的位移
+
+
+def _quad_fit_u(pts: list[tuple[float, float]], tc: float) -> dict | None:
+    """v ≈ a + b·u + c·u²，u = t − tc；<6 点退线性。返回 {a,b,c,n}。"""
+    n = len(pts)
+    if n < 3:
+        return None
+    ts = np.array([p[0] - tc for p in pts], dtype=np.float64)
+    vs = np.array([p[1] for p in pts], dtype=np.float64)
+    deg = 2 if n >= 6 else 1
+    try:
+        coef = np.polyfit(ts, vs, deg)
+    except (np.linalg.LinAlgError, ValueError):
+        return None
+    if not np.all(np.isfinite(coef)):
+        return None
+    if deg == 1:
+        return {"a": float(coef[1]), "b": float(coef[0]), "c": 0.0, "n": n}
+    return {"a": float(coef[2]), "b": float(coef[1]), "c": float(coef[0]), "n": n}
+
+
+def _runs_in_window(
+    rows: list[tuple[float, float, float, float]], lo: float, hi: float
+) -> list[list[tuple[float, float, float, float]]]:
+    """[lo,hi] 内 z≥0.12 观测按 断档>150ms 或帧间>20m/s 跳变 切成连续段。"""
+    runs: list[list[tuple[float, float, float, float]]] = []
+    run: list[tuple[float, float, float, float]] = []
+    for row in rows:
+        t, x, y, z = row
+        if t < lo:
+            continue
+        if t > hi:
+            break
+        if z < RETURN_MIN_Z:
+            continue
+        if run:
+            lt, lx, ly, lz = run[-1]
+            dt = t - lt
+            jump = math.hypot(x - lx, y - ly, z - lz) / max(1e-9, dt)
+            if dt > 0.15 or jump > RETURN_MAX_STEP_MPS:
+                runs.append(run)
+                run = []
+        run.append(row)
+    if run:
+        runs.append(run)
+    return runs
+
+
+def _pc_hit_time_at(rows: list[tuple[float, float, float, float]], t_approx: float) -> float | None:
+    """入弧 [−380,−25]ms / 出弧 [+30,+330]ms y(t) 拟合交点；无有效交点返回 None。"""
+    yin_run = next(
+        (r for r in reversed(_runs_in_window(rows, t_approx - 0.38, t_approx - 0.025))
+         if len(r) >= 5),
+        None,
+    )
+    if yin_run is None:
+        return None
+    fin = _quad_fit_u([(t, y) for t, x, y, z in yin_run], t_approx)
+    if fin is None or fin["b"] > -1.0:
+        return None
+    out_runs = [r for r in _runs_in_window(rows, t_approx + 0.03, t_approx + 0.33) if len(r) >= 4]
+    out_runs.sort(key=len, reverse=True)
+    for run in out_runs:
+        fout = _quad_fit_u([(t, y) for t, x, y, z in run], t_approx)
+        if fout is None or fout["b"] < 0.15:
+            continue
+        a = fin["c"] - fout["c"]
+        b = fin["b"] - fout["b"]
+        c = fin["a"] - fout["a"]
+        roots: list[float] = []
+        if abs(a) < 1e-9:
+            if abs(b) > 1e-9:
+                roots = [-c / b]
+        else:
+            disc = b * b - 4 * a * c
+            if disc >= 0:
+                r = math.sqrt(disc)
+                roots = [(-b + r) / (2 * a), (-b - r) / (2 * a)]
+        roots = [u for u in roots if -0.10 <= u <= 0.14]
+        if roots:
+            return t_approx + min(roots, key=abs)
+    return None
+
+
+def _bounce_cut_run(
+    run: list[tuple[float, float, float, float]]
+) -> tuple[list[tuple[float, float, float, float]], bool]:
+    """段内地面反弹截断：vz 由降(<−0.5)转升突增>3m/s 处截断。"""
+    for i in range(2, len(run)):
+        vz_a = (run[i - 1][3] - run[i - 2][3]) / max(1e-9, run[i - 1][0] - run[i - 2][0])
+        vz_b = (run[i][3] - run[i - 1][3]) / max(1e-9, run[i][0] - run[i - 1][0])
+        if vz_a < -0.5 and vz_b - vz_a > 3.0:
+            return run[:i], True
+    return run, False
+
+
+def detect_return_events(observations: list[dict]) -> list[dict]:
+    """从 PC 球观测检测击球回球事件（y 向由进转出），返回按时间排序的事件列表。"""
+    rows: list[tuple[float, float, float, float]] = []
+    for o in observations:
+        if not isinstance(o, dict):
+            continue
+        vals = [o.get(k) for k in ("t", "x", "y", "z")]
+        if all(isinstance(v, (int, float)) and math.isfinite(v) for v in vals):
+            rows.append((float(vals[0]), float(vals[1]), float(vals[2]), float(vals[3])))
+    rows.sort(key=lambda r: r[0])
+    frows = [r for r in rows if r[3] >= RETURN_MIN_Z]
+
+    # 候选锚点：帧间 vy 由强负（真来球）转正且连续两帧为正（防单帧噪声）。
+    # 配对窗放宽到 0.65s：触球前后都可能被拍/臂遮挡，入弧尾与出弧头相距可达数百 ms，
+    # 候选只管"疑似"，真伪由来回交点拟合与出弧门槛裁决。
+    cands: list[float] = []
+    last_in_t: float | None = None
+    posrun = 0
+    first_pos_tm: float | None = None
+    for i in range(1, len(frows)):
+        dt = frows[i][0] - frows[i - 1][0]
+        if dt <= 0 or dt > 0.15:
+            posrun = 0
+            first_pos_tm = None
+            if dt > 0.7:
+                last_in_t = None
+            continue
+        jump = math.hypot(
+            frows[i][1] - frows[i - 1][1],
+            frows[i][2] - frows[i - 1][2],
+            frows[i][3] - frows[i - 1][3],
+        ) / dt
+        if jump > RETURN_MAX_STEP_MPS:
+            last_in_t = None
+            posrun = 0
+            first_pos_tm = None
+            continue
+        vy = (frows[i][2] - frows[i - 1][2]) / dt
+        tm = 0.5 * (frows[i][0] + frows[i - 1][0])
+        if vy < -1.0:
+            last_in_t = tm
+            posrun = 0
+            first_pos_tm = None
+        elif vy > 0.3:
+            posrun += 1
+            if first_pos_tm is None:
+                first_pos_tm = tm
+            if posrun >= 2 and last_in_t is not None and first_pos_tm - last_in_t <= 0.65:
+                cands.append(0.5 * (last_in_t + first_pos_tm))
+                last_in_t = None
+                posrun = 0
+                first_pos_tm = None
+
+    events: list[dict] = []
+    for tc in cands:
+        if events and tc < events[-1]["t_hit"] + 0.5:
+            continue
+        t_hit = None
+        # 候选锚点扫描：无 RK 锚，锚点=遮挡中点，可偏真触球 ±0.2s，扫描范围更宽
+        for d in (0.0, -0.06, 0.06, -0.12, 0.12, -0.18, 0.18):
+            t_hit = _pc_hit_time_at(rows, tc + d)
+            if t_hit is not None:
+                break
+        if t_hit is None:
+            continue
+        refined = _pc_hit_time_at(rows, t_hit)  # 锚点偏差大时窗口混入对侧弧，再定一次
+        if refined is not None:
+            t_hit = refined
+        if events and t_hit < events[-1]["t_hit"] + 0.5:
+            continue
+        cand_runs = [
+            r for r in _runs_in_window(
+                rows, t_hit + RETURN_OUT_WINDOW[0], t_hit + RETURN_OUT_WINDOW[1]
+            )
+            if len(r) >= 5 and r[0][0] - t_hit <= RETURN_MAX_SEG_START
+        ]
+        cand_runs.sort(key=len, reverse=True)
+        for run in cand_runs:
+            seg, bounce_cut = _bounce_cut_run(run)
+            if len(seg) < 5 or seg[-1][0] - seg[0][0] < 0.06:
+                continue
+            fx = _quad_fit_u([(p[0], p[1]) for p in seg], t_hit)
+            fy = _quad_fit_u([(p[0], p[2]) for p in seg], t_hit)
+            # z 先扣重力 ½g·u² 再拟合：fit_z 为无重力部分，还原位置时要减回去
+            fz = _quad_fit_u(
+                [(p[0], p[3] + RETURN_HALF_G * (p[0] - t_hit) ** 2) for p in seg], t_hit
+            )
+            if fx is None or fy is None or fz is None:
+                continue
+            vx, vy, vz = fx["b"], fy["b"], fz["b"]
+            if vy <= 0.5:
+                continue
+            vh = math.hypot(vx, vy)
+            if vh < 1.0:
+                continue
+            events.append({
+                "t_hit": t_hit,
+                "t_end": t_hit + RETURN_OUT_WINDOW[1],
+                "seg_t_end": seg[-1][0],
+                "vx": vx,
+                "vy": vy,
+                "vz": vz,
+                "speed": math.hypot(vx, vy, vz),
+                "yaw_deg": math.degrees(math.atan2(vx, vy)),
+                "pitch_deg": math.degrees(math.atan2(vz, vh)),
+                "n_points": len(seg),
+                "span_s": seg[-1][0] - seg[0][0],
+                "seg_start_s": seg[0][0] - t_hit,
+                "bounce_cut": bounce_cut,
+                "fit_x": (fx["a"], fx["b"], fx["c"]),
+                "fit_y": (fy["a"], fy["b"], fy["c"]),
+                "fit_z": (fz["a"], fz["b"], fz["c"]),
+            })
+            break
+    return events
+
+
+def serialize_return_events(events: list[dict], time_reference: float | None) -> list[dict]:
+    """写回 JSON 的回球事件（去掉拟合系数，补相对时间）。"""
+    out = []
+    for ev in events:
+        item = {k: v for k, v in ev.items() if not k.startswith("fit_")}
+        item["elapsed_s"] = (
+            round(ev["t_hit"] - time_reference, 3) if time_reference is not None else None
+        )
+        out.append(item)
+    return out
+
+
+def load_camera_projections(calib_config_path: str | Path) -> dict[str, dict]:
+    """加载各相机 K/D/R_world/t_world（标定世界系为 mm），用于 3D→像素投影。"""
+    with open(calib_config_path, encoding="utf-8") as f:
+        cfg = json.load(f)
+    cams: dict[str, dict] = {}
+    for sn, cd in cfg.get("cameras", {}).items():
+        cams[sn] = {
+            "K": np.array(cd["K"], dtype=np.float64).reshape(3, 3),
+            "D": np.array(cd["D"], dtype=np.float64).ravel(),
+            "R": np.array(cd["R_world"], dtype=np.float64).reshape(3, 3),
+            "t": np.array(cd["t_world"], dtype=np.float64).reshape(3),
+        }
+    return cams
+
+
+def project_world_point_m(cam: dict, pt_m) -> tuple[float, float] | None:
+    """世界系 3D 点（米）投影到该相机全分辨率像素；位于相机后方或数值异常返回 None。"""
+    pt_mm = np.asarray(pt_m, dtype=np.float64) * 1000.0
+    depth = cam["R"] @ pt_mm + cam["t"]
+    if depth[2] <= 1e-6:
+        return None
+    rvec, _ = cv2.Rodrigues(cam["R"])
+    px, _ = cv2.projectPoints(
+        pt_mm.reshape(1, 1, 3), rvec, cam["t"].reshape(3, 1), cam["K"], cam["D"]
+    )
+    u, v = float(px[0, 0, 0]), float(px[0, 0, 1])
+    if not (math.isfinite(u) and math.isfinite(v)):
+        return None
+    return u, v
+
+
+def _eval_fit(fit: tuple[float, float, float], u: float) -> float:
+    a, b, c = fit
+    return a + b * u + c * u * u
+
+
+def draw_return_vector(
+    out: np.ndarray,
+    event: dict,
+    frame_time: float,
+    ball3d: dict | None,
+    serials: list[str],
+    panel_w: int,
+    panel_h: int,
+    cols: int,
+    cam_projections: dict[str, dict] | None,
+) -> None:
+    """在各相机 panel 上绘制回球速度矢量箭头（锚点=当前帧球 3D，缺则用出弧拟合位置）。"""
+    if cam_projections is None:
+        return
+    u = frame_time - event["t_hit"]
+    if ball3d is not None:
+        pos = np.array([ball3d["x"], ball3d["y"], ball3d["z"]], dtype=np.float64)
+    elif 0.0 <= u <= event["seg_t_end"] - event["t_hit"] + 0.05:
+        pos = np.array([
+            _eval_fit(event["fit_x"], u),
+            _eval_fit(event["fit_y"], u),
+            # fit_z 是扣过重力的序列，还原位置要减回 ½g·u²
+            _eval_fit(event["fit_z"], u) - RETURN_HALF_G * u * u,
+        ])
+    else:
+        return
+    vel = np.array([event["vx"], event["vy"], event["vz"]], dtype=np.float64)
+    tip = pos + vel * RETURN_ARROW_SECONDS
+    scale = 0.5  # 拼接视频 panel 为半分辨率
+    for cam_idx, sn in enumerate(serials):
+        cam = cam_projections.get(sn)
+        if cam is None:
+            continue
+        p0 = project_world_point_m(cam, pos)
+        p1 = project_world_point_m(cam, tip)
+        if p0 is None or p1 is None:
+            continue
+        x_offset, y_offset = grid_slot(cam_idx, panel_w, panel_h, cols=cols)
+        x0 = p0[0] * scale
+        y0 = p0[1] * scale
+        if not (-40 <= x0 <= panel_w + 40 and -40 <= y0 <= panel_h + 40):
+            continue
+        dx = (p1[0] - p0[0]) * scale
+        dy = (p1[1] - p0[1]) * scale
+        length = math.hypot(dx, dy)
+        max_len = 0.45 * panel_w
+        if length > max_len > 0:
+            dx *= max_len / length
+            dy *= max_len / length
+        pt0 = (int(round(x0 + x_offset)), int(round(y0 + y_offset)))
+        pt1 = (int(round(x0 + dx + x_offset)), int(round(y0 + dy + y_offset)))
+        ok, cpt0, cpt1 = cv2.clipLine((x_offset, y_offset, panel_w, panel_h), pt0, pt1)
+        if not ok:
+            continue
+        cv2.arrowedLine(out, cpt0, cpt1, RETURN_COLOR, 3, cv2.LINE_AA, tipLength=0.22)
+
+
+# ---------------- RK bot 目标点叠加（每次抛球：小车当前位置 → 要去的目标点） ----------------
+# 目标点来自 <stem>_rk_tracking.json 的 bot_state（RK 相对时轴、与 PC 同名世界系）。
+# 时间对齐用共享小车位姿锚（RK world 的 bot_x/bot_y/bot_yaw 是 PC 发布位姿的回显，
+# 与报告 clockAnchor 同思路）：bias = median(pc_elapsed − rk_t)，scale 视为 1
+# （钟漂实测 ~1ms/min，整场 <0.5ms，对叠加可忽略）。锚不足或残差过大则跳过叠加。
+# 注意：锚匹配必须用 tracker 原始发布的 car_locs（RK 回显的就是它），
+# 要在 clear_car_results() 全帧重标之前完成。
+
+_FINITE = lambda v: isinstance(v, (int, float)) and math.isfinite(v)  # noqa: E731
+
+
+def guess_rk_tracking_path(json_path: Path) -> Path | None:
+    candidate = json_path.with_name(json_path.stem + "_rk_tracking.json")
+    return candidate if candidate.exists() else None
+
+
+def load_rk_bot_data(rk_path: Path) -> dict | None:
+    """读取 bot_state 样本与 world 位姿回显行；结构异常返回 None。"""
+    try:
+        with open(rk_path, encoding="utf-8") as f:
+            rk = json.load(f)
+    except (OSError, ValueError):
+        return None
+
+    def cols(series: dict, keys: list[str]) -> list[list]:
+        t = series.get("t") or []
+        out = [t]
+        for key in keys:
+            v = (series.get("y") or {}).get(key) or []
+            out.append(v + [None] * (len(t) - len(v)))
+        return out
+
+    bot = rk.get("bot") or {}
+    t_arr, x_arr, y_arr, tx_arr, ty_arr, act_arr, phase_arr = cols(
+        bot, ["x", "y", "target_x", "target_y", "target_active", "phase"]
+    )
+    samples = []
+    for i, t in enumerate(t_arr):
+        if not _FINITE(t):
+            continue
+        samples.append({
+            "t": float(t),
+            "x": x_arr[i] if _FINITE(x_arr[i]) else None,
+            "y": y_arr[i] if _FINITE(y_arr[i]) else None,
+            "tx": tx_arr[i] if _FINITE(tx_arr[i]) else None,
+            "ty": ty_arr[i] if _FINITE(ty_arr[i]) else None,
+            "active": bool(act_arr[i]),
+            "phase": phase_arr[i] if isinstance(phase_arr[i], str) else "",
+        })
+    samples.sort(key=lambda s: s["t"])
+
+    world = rk.get("world") or {}
+    wt, wx, wy, wyaw = cols(world, ["bot_x", "bot_y", "bot_yaw"])
+    pose_rows = [
+        (float(t), float(x), float(y), float(yaw))
+        for t, x, y, yaw in zip(wt, wx, wy, wyaw)
+        if _FINITE(t) and _FINITE(x) and _FINITE(y) and _FINITE(yaw)
+    ]
+
+    # 各抛最终 ht（RK 相对轴）：与报告 rkThrows 同款聚类，供触球事件对齐兜底
+    pred = rk.get("pred") or {}
+    pt_arr, pht_arr = cols(pred, ["ht_rel"])
+    throws: list[list[float]] = []
+    for t, ht in zip(pt_arr, pht_arr):
+        if not (_FINITE(t) and _FINITE(ht)):
+            continue
+        if throws and abs(ht - throws[-1][1]) < 0.8 and t - throws[-1][0] < 2.0:
+            throws[-1] = [float(t), float(ht), throws[-1][2] + 1]
+        else:
+            throws.append([float(t), float(ht), 1])
+    throw_hts = [ht for _t, ht, n in throws if n >= 3]
+
+    if not samples:
+        return None
+    return {
+        "samples": samples,
+        "sample_ts": [s["t"] for s in samples],
+        "pose_rows": pose_rows,
+        "throw_hts": throw_hts,
+    }
+
+
+def estimate_rk_time_bias(
+    rk_pose_rows: list[tuple[float, float, float, float]],
+    pc_car_rows: list[tuple[float, float, float, float]],
+) -> tuple[float, int, float] | None:
+    """共享位姿锚估计 bias（pc = rk + bias）；返回 (bias, 锚数, MAD)，不可靠返回 None。"""
+    key = lambda x, y, yaw: f"{x:.4f},{y:.4f},{yaw:.4f}"  # noqa: E731
+    pc_unique: dict[str, float | None] = {}
+    for t, x, y, yaw in pc_car_rows:
+        k = key(x, y, yaw)
+        pc_unique[k] = None if k in pc_unique else t
+    rk_first: dict[str, float] = {}
+    for t, x, y, yaw in rk_pose_rows:
+        rk_first.setdefault(key(x, y, yaw), t)
+    diffs = sorted(
+        pc_unique[k] - rt
+        for k, rt in rk_first.items()
+        if pc_unique.get(k) is not None
+    )
+    if len(diffs) < 10:
+        return None
+    bias = diffs[len(diffs) // 2]
+    mad = sorted(abs(d - bias) for d in diffs)[len(diffs) // 2]
+    if mad > 0.08:
+        return None
+    return bias, len(diffs), mad
+
+
+def estimate_rk_bias_from_hits(
+    throw_hts: list[float], hit_elapsed: list[float]
+) -> tuple[float, int, float] | None:
+    """触球事件对齐兜底：PC 检出的回球触球时刻 ↔ RK 各抛最终 ht 的差值模式聚类。
+
+    base json 的 car_locs 被 annotate 离线重标覆盖后不再是 RK 回显的原始位姿，
+    位姿锚会失效；触球是两侧共同对准的物理事件（RK ht 预测误差 ±几十 ms），
+    取所有 (事件−ht) 差值里 ±120ms 内最大簇的中位数为 bias。"""
+    diffs = sorted(e - h for e in hit_elapsed for h in throw_hts)
+    if len(diffs) < 3:
+        return None
+    best_i, best_j = 0, -1
+    for i in range(len(diffs)):
+        j = i
+        while j + 1 < len(diffs) and diffs[j + 1] - diffs[i] <= 0.24:
+            j += 1
+        if j - i > best_j - best_i:
+            best_i, best_j = i, j
+    cluster = diffs[best_i:best_j + 1]
+    if len(cluster) < 3:
+        return None
+    bias = cluster[len(cluster) // 2]
+    mad = sorted(abs(d - bias) for d in cluster)[len(cluster) // 2]
+    if mad > 0.12:
+        return None
+    return bias, len(cluster), mad
+
+
+def bot_sample_near(rk_bot: dict, rk_t: float, max_dt: float = 0.2) -> dict | None:
+    ts = rk_bot["sample_ts"]
+    if not ts:
+        return None
+    i = bisect.bisect_left(ts, rk_t)
+    best = None
+    for j in (i - 1, i):
+        if 0 <= j < len(ts):
+            cand = rk_bot["samples"][j]
+            if best is None or abs(cand["t"] - rk_t) < abs(best["t"] - rk_t):
+                best = cand
+    if best is None or abs(best["t"] - rk_t) > max_dt:
+        return None
+    return best
+
+
+def target_episodes(rk_bot: dict, bias: float) -> list[tuple[float, float]]:
+    """target_active 连续段（PC 报告轴），间隔 >1s 分段——每次抛球一段。"""
+    episodes: list[tuple[float, float]] = []
+    for s in rk_bot["samples"]:
+        if not (s["active"] and s["tx"] is not None and s["ty"] is not None):
+            continue
+        t = s["t"] + bias
+        if episodes and t - episodes[-1][1] <= 1.0:
+            episodes[-1] = (episodes[-1][0], t)
+        else:
+            episodes.append((t, t))
+    return episodes
+
+
+def _draw_floor_marker(
+    out: np.ndarray,
+    cam: dict,
+    xy: tuple[float, float],
+    x_offset: int,
+    y_offset: int,
+    panel_w: int,
+    panel_h: int,
+    *,
+    color: tuple[int, int, int],
+    label: str,
+    filled: bool,
+) -> tuple[int, int] | None:
+    """把世界系地面点 (x,y,0) 投到 panel 画标记；越界/在相机后返回 None。"""
+    p = project_world_point_m(cam, (xy[0], xy[1], 0.0))
+    if p is None:
+        return None
+    scale = 0.5
+    px = p[0] * scale
+    py = p[1] * scale
+    if not (-40 <= px <= panel_w + 40 and -40 <= py <= panel_h + 40):
+        return None
+    pt = (int(round(px + x_offset)), int(round(py + y_offset)))
+    if filled:
+        cv2.circle(out, pt, 7, color, -1, cv2.LINE_AA)
+    else:
+        cv2.circle(out, pt, 13, color, 3, cv2.LINE_AA)
+        cv2.drawMarker(out, pt, color, cv2.MARKER_CROSS, 16, 2)
+    cv2.putText(
+        out, label, (pt[0] + 14, pt[1] - 8), FONT, 0.8, color, 2, cv2.LINE_AA
+    )
+    return pt
+
+
+def draw_car_target_overlay(
+    out: np.ndarray,
+    sample: dict,
+    car_xy: tuple[float, float] | None,
+    serials: list[str],
+    panel_w: int,
+    panel_h: int,
+    cols: int,
+    cam_projections: dict[str, dict] | None,
+) -> None:
+    """各 panel 绘制 目标点(红圈十字) / 小车当前位置(绿点) / 连线。"""
+    if cam_projections is None:
+        return
+    for cam_idx, sn in enumerate(serials):
+        cam = cam_projections.get(sn)
+        if cam is None:
+            continue
+        x_offset, y_offset = grid_slot(cam_idx, panel_w, panel_h, cols=cols)
+        pt_tgt = _draw_floor_marker(
+            out, cam, (sample["tx"], sample["ty"]), x_offset, y_offset,
+            panel_w, panel_h, color=TARGET_COLOR, label="TGT", filled=False,
+        )
+        pt_car = None
+        if car_xy is not None:
+            pt_car = _draw_floor_marker(
+                out, cam, car_xy, x_offset, y_offset,
+                panel_w, panel_h, color=CAR_MARK_COLOR, label="CAR", filled=True,
+            )
+        if pt_tgt is not None and pt_car is not None:
+            ok, p0, p1 = cv2.clipLine(
+                (x_offset, y_offset, panel_w, panel_h), pt_car, pt_tgt
+            )
+            if ok:
+                cv2.line(out, p0, p1, CAR_TGT_LINE_COLOR, 2, cv2.LINE_AA)
 
 
 def convert_racket_loc_mm_to_m(loc: RacketLoc) -> RacketLoc:
@@ -766,6 +1348,11 @@ def annotate_frame(
     show_racket: bool = False,
     car_sample_every_frames: int | None = None,
     relative_time_s: float | None = None,
+    return_event: dict | None = None,
+    cam_projections: dict[str, dict] | None = None,
+    frame_time: float | None = None,
+    bot_target: dict | None = None,
+    car_floor_xy: tuple[float, float] | None = None,
 ) -> np.ndarray:
     """在拼接画面上绘制球/球拍/3D/状态等离线标注。"""
     h, w = img.shape[:2]
@@ -871,6 +1458,32 @@ def annotate_frame(
             TEXT_3D_COLOR,
         ))
 
+    if return_event is not None:
+        lines.append((
+            f"RETURN yaw={return_event['yaw_deg']:+.1f}deg "
+            f"pitch={return_event['pitch_deg']:+.1f}deg  "
+            f"v=({return_event['vx']:+.2f},{return_event['vy']:+.2f},{return_event['vz']:+.2f})m/s  "
+            f"|v|={return_event['speed']:.2f}",
+            RETURN_COLOR,
+        ))
+
+    if bot_target is not None:
+        car_txt = (
+            f"({car_floor_xy[0]:+.2f},{car_floor_xy[1]:+.2f})m"
+            if car_floor_xy is not None
+            else "--"
+        )
+        dist_txt = (
+            f"{math.hypot(bot_target['tx'] - car_floor_xy[0], bot_target['ty'] - car_floor_xy[1]):.2f}m"
+            if car_floor_xy is not None
+            else "--"
+        )
+        lines.append((
+            f"CAR {car_txt}  ->  TGT ({bot_target['tx']:+.2f},{bot_target['ty']:+.2f})m  "
+            f"d={dist_txt}  {bot_target['phase']}",
+            (0, 80, 255),
+        ))
+
     racket3d = frame_data.get("racket3d")
     if show_racket and racket3d:
         cams = "+".join(s[-3:] for s in racket3d["cameras"])
@@ -903,6 +1516,31 @@ def annotate_frame(
             f"({'valid' if frame_car_loc['yaw_valid'] else 'position only'})  cams={cams}",
             (0, 200, 255),
         ))
+
+    if return_event is not None and frame_time is not None:
+        draw_return_vector(
+            out,
+            return_event,
+            frame_time,
+            ball3d,
+            serials,
+            panel_w,
+            panel_h,
+            cols,
+            cam_projections,
+        )
+
+    if bot_target is not None:
+        draw_car_target_overlay(
+            out,
+            bot_target,
+            car_floor_xy,
+            serials,
+            panel_w,
+            panel_h,
+            cols,
+            cam_projections,
+        )
 
     y = h - 15
     for text, color in reversed(lines):
@@ -983,6 +1621,51 @@ def main() -> None:
     time_reference = extract_time_reference(data)
     sync_video_frame_metadata(data, frame_mapping, has_exact_mapping)
 
+    return_events = detect_return_events(data.get("observations", []))
+
+    # RK bot 目标点：必须在 clear_car_results() 之前用 tracker 原始 car_locs 做共享位姿锚
+    rk_bot = None
+    rk_bias = None
+    rk_anchor_info: tuple[float, int, float] | None = None
+    rk_path = guess_rk_tracking_path(json_path)
+    if rk_path is not None:
+        rk_bot = load_rk_bot_data(rk_path)
+    if rk_bot is not None:
+        pc_pose_rows = []
+        for c in data.get("car_locs") or []:
+            if not isinstance(c, dict):
+                continue
+            vals = [c.get(k) for k in ("t", "x", "y", "yaw")]
+            if all(_FINITE(v) for v in vals):
+                elapsed = (
+                    float(vals[0]) - time_reference
+                    if time_reference is not None
+                    else float(vals[0])
+                )
+                pc_pose_rows.append((elapsed, float(vals[1]), float(vals[2]), float(vals[3])))
+        rk_anchor_method = "共享位姿锚"
+        rk_anchor_info = estimate_rk_time_bias(rk_bot["pose_rows"], pc_pose_rows)
+        if rk_anchor_info is None:
+            rk_anchor_method = "触球事件锚"
+            rk_anchor_info = estimate_rk_bias_from_hits(
+                rk_bot.get("throw_hts") or [],
+                [
+                    ev["t_hit"] - time_reference if time_reference is not None else ev["t_hit"]
+                    for ev in return_events
+                ],
+            )
+        if rk_anchor_info is None:
+            rk_bot = None
+        else:
+            rk_bias = rk_anchor_info[0]
+
+    cam_projections = None
+    if (return_events or rk_bot is not None) and not args.no_output_video:
+        try:
+            cam_projections = load_camera_projections(calib_config_path)
+        except (OSError, KeyError, ValueError) as e:
+            print(f"警告：标定加载失败，回球矢量/目标点只画文字行: {e}")
+
     if car_enabled:
         clear_car_results(data)
     if racket_enabled:
@@ -1022,9 +1705,34 @@ def main() -> None:
         print(f"JSON 输出: {json_output_path}")
         if racket_json_output_path is not None:
             print(f"球拍 JSON 输出: {racket_json_output_path}")
+    if return_events:
+        print(f"PC 回球检测: {len(return_events)} 次（对应帧区间将叠加速度矢量）")
+        for ev in return_events:
+            rel = ev["t_hit"] - time_reference if time_reference is not None else ev["t_hit"]
+            print(
+                f"  t={rel:.3f}s yaw={ev['yaw_deg']:+.1f}deg "
+                f"pitch={ev['pitch_deg']:+.1f}deg |v|={ev['speed']:.2f}m/s "
+                f"n={ev['n_points']}" + ("（地面反弹前截断）" if ev["bounce_cut"] else "")
+            )
+    else:
+        print("PC 回球检测: 未检出")
+    if rk_bot is not None and rk_bias is not None:
+        episodes = target_episodes(rk_bot, rk_bias)
+        print(
+            f"RK 目标点叠加: 时轴对齐 bias={rk_bias:+.4f}s"
+            f"（{rk_anchor_method} ×{rk_anchor_info[1]}, MAD {rk_anchor_info[2] * 1000:.0f}ms），"
+            f"target_active 段 {len(episodes)} 个:"
+        )
+        for lo, hi in episodes:
+            print(f"  t={lo:.3f}s..{hi:.3f}s")
+    elif rk_path is None:
+        print("RK 目标点叠加: 未找到 *_rk_tracking.json，跳过")
+    else:
+        print("RK 目标点叠加: 共享位姿锚与触球事件锚均不可用，无法对齐 RK 时轴，跳过")
 
     frame_idx = 0
     n_annotated = 0
+    last_car_xy: tuple[float, tuple[float, float]] | None = None
     car_observations: list[dict] = []
     car_frames_processed = 0
     racket_pipeline: Optional[RacketPipeline] = None
@@ -1103,6 +1811,37 @@ def main() -> None:
                         "cameras_used": racket3d.cameras_used,
                     })
 
+            active_return = None
+            for ev in return_events:
+                if ev["t_hit"] <= frame_time <= ev["t_end"]:
+                    active_return = ev
+                    break
+
+            frame_car_loc = fd.get("car_loc")
+            if (
+                isinstance(frame_car_loc, dict)
+                and _FINITE(frame_car_loc.get("x"))
+                and _FINITE(frame_car_loc.get("y"))
+            ):
+                last_car_xy = (
+                    frame_time,
+                    (float(frame_car_loc["x"]), float(frame_car_loc["y"])),
+                )
+
+            bot_target = None
+            car_floor_xy = None
+            if rk_bot is not None and rk_bias is not None:
+                sample = bot_sample_near(rk_bot, relative_time_s - rk_bias)
+                if (
+                    sample is not None
+                    and sample["active"]
+                    and sample["tx"] is not None
+                    and sample["ty"] is not None
+                ):
+                    bot_target = sample
+                    if last_car_xy is not None and frame_time - last_car_xy[0] <= 0.5:
+                        car_floor_xy = last_car_xy[1]
+
             annotated = annotate_frame(
                 img,
                 fd,
@@ -1114,6 +1853,11 @@ def main() -> None:
                 show_racket=racket_enabled,
                 car_sample_every_frames=car_sample_every_frames,
                 relative_time_s=relative_time_s,
+                return_event=active_return,
+                cam_projections=cam_projections,
+                frame_time=frame_time,
+                bot_target=bot_target,
+                car_floor_xy=car_floor_xy,
             )
             n_annotated += 1
         else:
@@ -1189,7 +1933,8 @@ def main() -> None:
                 json.dump(racket_payload, f, ensure_ascii=False, indent=2)
             print(f"球拍 JSON 已输出: {racket_json_output_path}")
 
-    if car_enabled or racket_enabled:
+    data["pc_return_events"] = serialize_return_events(return_events, time_reference)
+    if car_enabled or racket_enabled or return_events:
         with open(json_output_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         print(f"JSON 已更新: {json_output_path}")
