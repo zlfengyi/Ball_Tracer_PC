@@ -127,10 +127,12 @@ def test_accepted_raw_message_match_rejects_adjacent_prediction(tmp_path):
     )
     harness = (
         f"{core}\n"
+        "// z 偏移是逐场自标定量（armConstCal）：本例复刻 0803 及以前的 −0.153\n"
+        "ARM_HIT_Z_OFFSET=-0.153;\n"
         "const acceptT=10.0, acceptX=1.0375, acceptZ=1.3362, duration=0.3216;\n"
         "const actual={rel_x:1.0375,rel_z:1.4892,relSrc:'target',ht:10.3216};\n"
         "const adjacent={rel_x:1.0376,rel_z:1.5058,relSrc:'target',ht:10.3221};\n"
-        "// 0802 起臂控在 duration 内补偿舵机滞后 τ1≈9.2ms：ht 差 ~9ms 仍必须回配成功\n"
+        "// ht−(acc_t+dur) 的系统差 = 臂内提前量 − 发布开销（0802/0803晨 ~+9ms）：必须仍回配成功\n"
         "const servoLag={rel_x:1.0375,rel_z:1.4892,relSrc:'target',ht:10.3216+0.0092};\n"
         "const crossThrow={rel_x:1.0375,rel_z:1.4892,relSrc:'target',ht:10.3216+0.5};\n"
         "console.log(JSON.stringify({"
@@ -146,6 +148,73 @@ def test_accepted_raw_message_match_rejects_adjacent_prediction(tmp_path):
         "servoLag": True,
         "crossThrow": False,
     }
+
+
+def _const_cal_harness(events: list) -> str:
+    """臂端常量自标定夹具：喂事件流，吐出标定结果与被改写的两个常量。"""
+    core = _core("arm-const-cal-core-begin", "arm-const-cal-core-end")
+    return (
+        "const isNum=v=>typeof v==='number'&&Number.isFinite(v);\n"
+        "const RK={t0:0};\n"
+        "let ARM_HIT_Z_OFFSET=-0.164;\n"
+        "let HIT_TIME_ADVANCE_SEC=0.0;\n"
+        f"const ARM={{events:{json.dumps(events)}}};\n"
+        "const armPreds=ARM.events.filter(e=>e.topic==='/predict_hit_pos').map(e=>{"
+        "const p=JSON.parse(e.text);"
+        "return {t:e.t,rel_x:p.rel_x,rel_z:p.rel_z,ht:p.ht,relSrc:p.rel_src};});\n"
+        f"{core}\n"
+        "console.log(JSON.stringify({cal:armConstCal,z:ARM_HIT_Z_OFFSET,adv:HIT_TIME_ADVANCE_SEC}));\n"
+    )
+
+
+def _cal_session(z_offset: float, advance: float, overhead: float = 0.001) -> list:
+    """造 4 拍：每拍 3 条预测（同 rel_x，rel_z 各异）+ 命中最后一条的 accepted。
+
+    臂内：duration = ht − advance − now，accepted 打印 z = rel_z + z_offset，
+    状态发布比消息到达晚 overhead。
+    """
+    events = []
+    for k in range(4):
+        base = 10.0 * (k + 1)
+        for j in range(3):
+            t = base + 0.03 * j
+            ht = base + 0.40 + 0.001 * j
+            rel_z = 1.30 + 0.01 * j
+            events.append(_pred_event(t, ht, rel_x=1.0375, rel_z=rel_z))
+            dur = round(ht - advance - t, 3)
+            text = (f"accepted hit x=1.0375 z={rel_z + z_offset:.4f} "
+                    f"duration={dur:.4f} hit_time=0.2500")
+            events.append(_status_event(t + overhead, text))
+    return events
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+@pytest.mark.parametrize("z_offset,advance", [(-0.164, 0.0), (-0.153, 0.010), (-0.153, 0.015)])
+def test_arm_constants_are_calibrated_per_session(tmp_path, z_offset, advance):
+    """z 偏移与臂内提前量随 arm_controller config.py 改版跳变，必须逐场标定回来。
+
+    写死时 0804 场（−0.164/0ms）用老常数（−0.153/10ms）回配命中 0/80，
+    整张北极星表的 accepted 系列列全变 —。同一抛内相邻消息会投错票，靠众数压掉。
+    """
+    result = _run_node(tmp_path, _const_cal_harness(_cal_session(z_offset, advance)))
+
+    assert result["cal"]["zOff"] == pytest.approx(z_offset, abs=1e-9)
+    assert result["cal"]["n"] == 12          # 正确 z 的票数
+    assert result["cal"]["total"] == 24      # 含同抛相邻消息的错票
+    assert result["z"] == pytest.approx(z_offset, abs=1e-9)
+    assert result["adv"] == pytest.approx(advance, abs=1e-9)
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_arm_constants_keep_defaults_when_votes_too_few(tmp_path):
+    """票数 <3 时不拿噪声改合同：两个常量保持缺省（页面注记提示去查这里）。"""
+    events = _cal_session(-0.153, 0.010)[:2]   # 只留 1 条预测 + 1 条 accepted
+    result = _run_node(tmp_path, _const_cal_harness(events))
+
+    assert result["cal"]["zOff"] is None
+    assert result["cal"]["n"] == 1
+    assert result["z"] == pytest.approx(-0.164)
+    assert result["adv"] == pytest.approx(0.0)
 
 
 def _swing_ht_harness(events: str) -> str:
@@ -298,72 +367,110 @@ def test_bot_run_end_is_normal_one_to_one_and_uses_target_minus_actual(tmp_path)
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
-def test_ht_true_intersects_ball_fit_with_actual_car_and_rejects_pollution(tmp_path):
-    """HT真实(触球)：S1 期球世界y拟合（3σ 剔跳变、z 门槛）× 车实际y挥拍前外推线，球面接触。"""
-    core = _core("ht-alls1-core-begin", "ht-alls1-core-end")
-    # 球：y(t)=1.0−3.5·(t−2.0)，t∈[1.56,1.95] 共 14 点；混入 1 个 +0.5m 跳变污染点
-    # （t=1.80）与 1 个 z=0.05 贴地点（都必须被剔除/过滤）。
-    # 车：y(t)=0.9+0.5·(t−2.0)（向球移动），挥拍塌陷伪迹点在 t≥1.973（窗外，必须无影响）。
-    # 间距 g(u)=0.1−4.0u：触球 g=R球0.033 → u=+0.01675 → tRel=2.01675；
-    # 球心穿面 g=0 → u=+0.025 → tCenter=2.025（备查，比触球晚 R/|v_rel|=8.25ms）。
-    ts_list, ys_list, zs_list = [], [], []
+def test_ball_car_gap_measured_at_given_time_and_rejects_pollution(tmp_path):
+    """球面−车 dx/dy/dz(t)：S1 期球世界三轴拟合（3σ 剔跳变、z 门槛）× 车实际 x/y 挥拍前外推线。"""
+    core = _core("ball-car-gap-core-begin", "ball-car-gap-core-end")
+    # 球：y(t)=1.0−3.5·(t−2.0)、x(t)=0.2+1.0·(t−2.0)、z(t)=1.2−1.0·(t−2.0)−4.905·(t−2.0)²，
+    # t∈[1.56,1.95] 共 14 点；t=1.80 一点同时污染 y(+0.5m) 与 x(+0.3m)——按 y 轴 3σ 剔掉后
+    # x 拟合必须跟着干净（三轴同进同出，rmsX≈0）；另加 1 个 z=0.05 贴地点（z 门槛过滤）。
+    # 车：y(t)=0.9+0.5·(t−2.0)（向球移动）、x(t)=−0.7+0.3·(t−2.0)，挥拍塌陷伪迹点在
+    # t≥1.973（窗外，必须无影响）。
+    # dy(u)=球心y−R球−车y=0.067−4.0u：u=0 时 +67mm（该时刻球还没够到，评估点偏早
+    # 16.75ms）、真实触球在 u=+0.01675（dy=0）、u=+0.03 时 −53mm（偏晚 13.25ms）。
+    # u=0 时 dx=0.2−(−0.7)=+900mm、dz=球心z=+1200mm（车中心 z≡地面 0，不扣球半径）。
+    ts_list, xs_list, ys_list, zs_list = [], [], [], []
     for i in range(14):
         t = 1.56 + 0.03 * i
-        y = 1.0 - 3.5 * (t - 2.0)
+        u = t - 2.0
+        x, y = 0.2 + 1.0 * u, 1.0 - 3.5 * u
         if abs(t - 1.80) < 1e-9:
+            x += 0.3
             y += 0.5
         ts_list.append(round(t, 5))
+        xs_list.append(round(x, 6))
         ys_list.append(round(y, 6))
-        zs_list.append(0.4)
+        zs_list.append(round(1.2 - 1.0 * u - 4.905 * u * u, 6))
     ts_list.append(1.70)
+    xs_list.append(99.0)
     ys_list.append(99.0)
     zs_list.append(0.05)
-    bt_list, by_list = [], []
+    bt_list, bx_list, by_list = [], [], []
     for i in range(20):
         t = 1.80 + 0.01 * i
-        y = 0.9 + 0.5 * (t - 2.0)
+        u = t - 2.0
+        y = 0.9 + 0.5 * u
         if t >= 1.973:
             y -= 0.05  # 挥拍塌陷伪迹
         bt_list.append(round(t, 5))
+        bx_list.append(round(-0.7 + 0.3 * u, 6))
         by_list.append(round(y, 6))
     harness = (
         "const isNum=v=>typeof v==='number'&&Number.isFinite(v);\n"
         "const ts=s=>s.t; const ys=(s,k)=>s.y[k];\n"
-        f"const RK={{world:{{t:{json.dumps(ts_list)},y:{{y:{json.dumps(ys_list)},z:{json.dumps(zs_list)}}}}},"
-        f"bot:{{t:{json.dumps(bt_list)},y:{{y:{json.dumps(by_list)}}}}}}};\n"
+        f"const RK={{world:{{t:{json.dumps(ts_list)},y:{{x:{json.dumps(xs_list)},"
+        f"y:{json.dumps(ys_list)},z:{json.dumps(zs_list)}}}}},"
+        f"bot:{{t:{json.dumps(bt_list)},y:{{x:{json.dumps(bx_list)},y:{json.dumps(by_list)}}}}}}};\n"
         f"{core}\n"
-        "const fin=htAllS1ForThrow({ht:2.0,lastS0Y:1.0});\n"
-        "const miss=htAllS1ForThrow({ht:99.0,lastS0Y:1.0});\n"
-        "console.log(JSON.stringify({fin,miss}));\n"
+        "const th={ht:2.0,lastS0Y:1.0};\n"
+        "console.log(JSON.stringify({at:ballCarGapForThrow(th,2.0),"
+        "contact:ballCarGapForThrow(th,2.01675),late:ballCarGapForThrow(th,2.03),"
+        "far:ballCarGapForThrow(th,2.4),miss:ballCarGapForThrow({ht:99.0,lastS0Y:1.0},99.0)}));\n"
     )
     result = _run_node(tmp_path, harness)
 
-    fin = result["fin"]
-    assert fin is not None
-    assert fin["nWin"] == 14            # 贴地点被 z 门槛挡在窗外
-    assert fin["n"] == 13               # 污染点被 3σ 剔除
-    assert fin["tRel"] == pytest.approx(2.01675, abs=2e-3)     # 球面接触，非球心穿面
-    assert fin["tCenter"] == pytest.approx(2.025, abs=2e-3)     # 球心穿面仅备查
-    assert (fin["tCenter"] - fin["tRel"]) == pytest.approx(0.00825, abs=5e-4)
-    assert fin["vy"] == pytest.approx(-3.5, abs=0.05)
-    assert fin["vRel"] == pytest.approx(-4.0, abs=0.06)
-    assert fin["carVy"] == pytest.approx(0.5, abs=0.03)   # 塌陷伪迹在窗外，不进车拟合
-    assert fin["eA"] == pytest.approx(-100.0, abs=3)      # 车@ht − 冻结面 = −100mm
+    at = result["at"]
+    assert at is not None
+    assert at["nWin"] == 14            # 贴地点被 z 门槛挡在窗外
+    assert at["n"] == 13               # 污染点被 3σ 剔除
+    assert at["dy"] * 1000 == pytest.approx(67.0, abs=2)    # 球面还差 67mm 够到车 y 面
+    assert at["dx"] * 1000 == pytest.approx(900.0, abs=3)   # 球心x−车x，不扣球半径
+    assert at["dz"] * 1000 == pytest.approx(1200.0, abs=3)  # 球心z（车中心z≡地面0）
+    assert at["ballX"] == pytest.approx(0.2, abs=3e-3)
+    assert at["ballY"] == pytest.approx(1.0, abs=2e-3)
+    assert at["ballZ"] == pytest.approx(1.2, abs=3e-3)
+    assert at["carX"] == pytest.approx(-0.7, abs=2e-3)
+    assert at["carY"] == pytest.approx(0.9, abs=2e-3)
+    assert at["rmsX"] * 1000 == pytest.approx(0.0, abs=1)   # y轴剔掉的点也退出x拟合
+    assert at["rmsZ"] * 1000 == pytest.approx(0.0, abs=1)
+    assert at["dtMs"] == pytest.approx(-16.75, abs=0.5)     # 负=该时刻偏早
+    assert at["vy"] == pytest.approx(-3.5, abs=0.05)
+    assert at["vRel"] == pytest.approx(-4.0, abs=0.06)
+    assert at["carVy"] == pytest.approx(0.5, abs=0.03)   # 塌陷伪迹在窗外，不进车拟合
+    assert at["carVx"] == pytest.approx(0.3, abs=0.03)
+    assert at["eA"] == pytest.approx(-100.0, abs=3)      # 车@ht − 冻结面 = −100mm
+    # 真实触球处 dy 归零；再晚 13.25ms 球已穿过拍面，dy 转负（口径与旧 HT err 同向）
+    assert result["contact"]["dy"] * 1000 == pytest.approx(0.0, abs=2)
+    assert result["contact"]["dtMs"] == pytest.approx(0.0, abs=0.5)
+    assert result["late"]["dy"] * 1000 == pytest.approx(-53.0, abs=2)
+    assert result["late"]["dtMs"] == pytest.approx(13.25, abs=0.5)
+    assert result["far"] is None        # 评估点离拟合窗 >300ms 不外推
     assert result["miss"] is None       # 窗内无球观测不产出
 
 
 def test_main_pc_truth_uses_rk_ht_and_accepted_uses_own_ht():
     source = SRC.read_text(encoding="utf-8")
     assert "const truth=pcTruthAt(htPc);" in source
-    # HT err@300 锚在全S1重估 HT 上；@300 消息 ht 只留在 hE300/备查里
-    assert "const hE300=(fin&&isNum(th.ref300Ht))?(th.ref300Ht-fin.tRel)*1000:null;" in source
-    assert "<th>HT真实(触球)<br>(s,PC轴)</th>" in source
-    # err 列头写明谁减谁，与 hE300=ref300Ht−fin.tRel 的实现同向
-    assert "HT err@300<br>(S1@300ht − 触球, ms)</th>" in source
+    # 0805 起：全量RK重估的第三个 ht 不再单列，击球误差改成 accepted HT 上的两列空间量——
+    # dy 是时序误差的空间形态，dx/dz 是 @300 预测击球点与真值的落点差（两侧同轴同基准）
+    # 两列都锚在「臂最后更新HT」= 臂真正执行的击球时刻（重定相生效时是那条 late ht saved），
+    # 不是 PC真值/TCP/车yaw 三列用的 accepted HT——两个锚之差就是 Δht 重定相列
+    assert "const gapFin=finalHt!=null?ballCarGapForThrow(th,finalHt):null;" in source
+    assert "球面y−车y @臂最后更新HT<br>(mm, RK全量真值)</th>" in source
+    assert "击球点@300预测 − RK全量真值@臂最后更新HT<br>dx/dz(mm, 世界轴)</th>" in source
+    assert "((th.ref300Xw-th.ref300CarX)-gapFin.dx)*1000" in source
+    assert "const aimDz=(gapFin&&isNum(th.ref300Z))?(th.ref300Z-gapFin.dz)*1000:null;" in source
+    assert "htAllS1ForThrow" not in source
+    assert "hE300" not in source
+    assert "<th>HT真实(触球)<br>(s,PC轴)</th>" not in source
+    assert "HT err@300<br>" not in source
     assert "'<td>'+htPc.toFixed(3)+'</td>'" not in source
     assert "const truth=pcTruthAt(accHtPc);" in source
     assert "<td>'+pcTruthCell(truth,true)+'</td>" in source
     assert "<td>'+pcTruthCell(truth)+'</td>" in source
+    # 主表第二列 PC 真值：同一套拟合，评估时刻换成臂最后 accepted 的原消息 ht（与 TCP 同锚）
+    assert "const truthAcc=accHt!=null?pcTruthAt(rkToPc(accHt)):null;" in source
+    # 有/无 S1@300 两条渲染路径都要出这一列（该列只依赖 accepted，不依赖 @300 参考消息）
+    assert source.count("pcTruthCell(truthAcc,true)") == 2
     # 0803 起已删列：开始触球t/PC球×车相交t/HT−开始触球/HT−PC相交/RK−PC dx/dz/
     # PC真值@开始触球，相关实现与辅助函数不应残留
     assert "touchT" not in source
@@ -394,18 +501,20 @@ def test_rk300_table_includes_last_accepted_target_and_tcp_at_accepted_ht():
         "<th>RK@≈300ms预测车@HT−RUN末实际 dx/dy(cm)<br>(RK世界系)</th>",
         "<th>机械臂最后accepted目标 x/z(m)</th>",
         "<th>PC真值@HT300 x/y/z(m)</th>",
+        "PC真值@accepted HT x/y/z(m)</th>",
         "<th>TCP@accepted HT x/y/z(m)</th>",
         "<th>TCP−accepted dx/dz(cm)</th>",
         "最后更新−挥拍起<br>(ms)</th>",
-        "盲区 ht−ct@最终更新<br>(ms)</th>",
+        "盲区 ht−ct@臂最后更新<br>(ms)</th>",
         "Δht 重定相<br>(ms)</th>",
-        "<th>拍面yaw@最终更新HT(°,世界系)</th>",
-        "<th>拍面yaw@最终更新HT−10ms(°,世界系)</th>",
+        "车yaw@accepted HT(°)</th>",
+        "<th>拍面yaw@臂最后更新HT(°,世界系)</th>",
+        "<th>拍面yaw@臂最后更新HT−10ms(°,世界系)</th>",
     ]
     assert [source.index(header) for header in headers] == sorted(
         source.index(header) for header in headers
     )
-    # 两列拍面 yaw 锚在「最终更新 HT」（含挥拍中 ht 重定相消费的那条），不是最后一条 accepted
+    # 两列拍面 yaw 锚在「臂最后更新 HT」（含挥拍中 ht 重定相消费的那条），不是最后一条 accepted
     assert "const finalHt=accepted&&isNum(accepted.finalHt)?accepted.finalHt-RK.t0:accHt;" in source
     assert "faceYawWorldAt(finalHt)" in source
     assert "faceYawWorldPreAt(finalHt)" in source
@@ -418,6 +527,12 @@ def test_rk300_table_includes_last_accepted_target_and_tcp_at_accepted_ht():
     assert "视觉球拍" not in source
     assert "visualRacketAt" not in source
     assert "visualRacketCell" not in source
+    # 车yaw@accepted HT 列：/bot_state 瞬时值，锚在最后 accepted 的原消息 ht（同 PC真值/TCP 列）
+    assert "const carYawAcc=accHt!=null?botYawDegAt(accHt):null;" in source
+    assert "const carYawRate=accHt!=null?imuYawRateDegAt(accHt):null;" in source
+    assert source.count("<td>'+carYawCell+'</td>") == 2
+    # 角速度只能取 IMU 零滞后原值，禁止对有 0.3~0.5s 滞后的 bot_state yaw 数值求导
+    assert "ys(RK.imu,'yaw_speed')" in source
     # HT−10ms 列：fy 同窗拟合在 HT−10ms 取值；车 yaw 用 /bot_state 瞬时值（IMU 连续更新）
     assert "const FACE_YAW_PRE_S=0.010;" in source
     assert "fitFaceYawTo(accHtRk,tEval)" in source

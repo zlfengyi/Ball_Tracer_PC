@@ -4,7 +4,7 @@
   "slave_serials": ["DB0260373", "DB0260405", "DB0260378"],
   "fps": 29.0,
   "acquisition_frame_rate": 30.0,
-  "exposure_us": 9000.0,
+  "exposure_us": 4000.0,
   "gain_db": 12.7,
   "action_trigger_source": "Action1",
   "action_device_key": 1,
