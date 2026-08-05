@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import os
 import queue
 from pathlib import Path
 
+from src.ros2_support import ROS2_ROOT
 from src.run_tracker import (
     CarLocJob,
     _car_submit_latest,
     _infer_engine_batch_from_model_path,
     _infer_model_input_size_from_model_path,
+    _report_tool_env,
     _resolve_engine_batch,
     _select_detector_model_for_active_cams,
 )
@@ -104,6 +107,32 @@ def test_resolve_engine_batch_prefers_fixed_engine_batch_over_runtime_chunking()
 
     assert engine_batch == 3
     assert detector.calls == [3]
+
+
+def test_report_tool_env_drops_ros2_pythonpath(monkeypatch):
+    """post-run 报告工具必须拿到不含 ROS2 site-packages 的 PYTHONPATH：
+    否则 venv 解释器 import numpy 会命中 conda 版、C 扩展加载失败，
+    generate_curve3_html 的拍面yaw两列静默变「—」、annotate_video 直接挂。"""
+    ros2_sp = str(ROS2_ROOT / "Lib" / "site-packages")
+    keep = str(Path("D:/Ball_Tracer_PC"))
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join([ros2_sp, keep]))
+
+    env = _report_tool_env()
+
+    assert env["PYTHONPATH"] == keep
+    assert os.environ["PYTHONPATH"].startswith(ros2_sp)  # 父进程自己的不动
+
+
+def test_report_tool_env_drops_pythonpath_key_when_only_ros2(monkeypatch):
+    monkeypatch.setenv("PYTHONPATH", str(ROS2_ROOT / "Lib" / "site-packages"))
+
+    assert "PYTHONPATH" not in _report_tool_env()
+
+
+def test_report_tool_env_keeps_env_without_pythonpath(monkeypatch):
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+
+    assert "PYTHONPATH" not in _report_tool_env()
 
 
 def test_car_submit_latest_returns_stale_on_full_queue():

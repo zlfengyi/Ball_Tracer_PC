@@ -13,6 +13,7 @@ import argparse
 import copy
 import json
 import os
+import sys
 from pathlib import Path
 
 
@@ -92,10 +93,21 @@ def _add_face_yaw(arm) -> None:
     """给 arm.states 逐帧附加 fy：FK 拍面法向（link6 +X，前向规范化）在臂系的
     yaw（°，atan2(x,y) 口径，与 PC回球 yaw 同式）。单源复用 extract_arm_bag.fk
     （0801 dz/yawrate 分析脚本同一公式），不在 JS 里抄第二份 FK 链。
-    依赖缺失/关节残缺（None 或非 6 关节）时静默跳过，报告列显示 —。"""
+    关节残缺（None 或非 6 关节）时跳过该帧，报告列显示 —。
+    导入失败不让整份报告挂掉，但必须打到 stderr：2026-08-05 前 run_tracker 的
+    post-run 把 ROS2 pixi 的 site-packages 留在 PYTHONPATH 里，子进程 import numpy
+    命中 conda 版 C 扩展加载失败，这里静默 return 让两列拍面 yaw 整场空白，只有手工
+    重跑才有（已由 run_tracker._report_tool_env 根治）。"""
     try:
+        _here = str(Path(__file__).resolve().parent)
+        if _here not in sys.path:
+            sys.path.insert(0, _here)   # 作为模块被别处 import 时 sys.path[0] 不是本目录
         from extract_arm_bag import fk, JOINTS
-    except Exception:
+    except Exception as exc:
+        print(
+            f"[report] 拍面yaw 两列不可用：import extract_arm_bag 失败（{exc!r}）",
+            file=sys.stderr,
+        )
         return
     import math as _m
     states = arm.get("states") if isinstance(arm, dict) else None

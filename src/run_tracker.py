@@ -86,6 +86,7 @@ from src.ros2_support import (
     CYCLONEDDS_XML_PATH,
     DEFAULT_ROS_DOMAIN_ID,
     ROS2_RELIABLE_TOPICS,
+    ROS2_ROOT,
     ROS2_TRACKER_PEERS,
     TRACKER_PC_IP,
     cyclonedds_file_uri,
@@ -505,13 +506,42 @@ def _create_ros2_sink(mode: str):
     return DirectRos2Sink()
 
 
+def _report_tool_env() -> dict[str, str]:
+    """报告工具子进程的环境：把 ROS2 pixi 环境从 PYTHONPATH 里摘掉。
+
+    本进程为了 import rclpy 已经把 ROS2 site-packages 前插进 PYTHONPATH
+    （ros2_support.ensure_ros2_environment）。generate_curve3_html / annotate_video
+    用 tracker venv 的解释器跑，继承这份 PYTHONPATH 后 `import numpy` 会先命中
+    conda-forge 那一份、在 venv 解释器里 C 扩展加载失败——2026-08-05 之前的报告
+    因此整场缺「拍面yaw@最终更新HT」两列（_add_face_yaw 吞掉 ImportError 静默显示
+    —），手工重跑（无此 PYTHONPATH）才有。这两个工具不碰 ROS2，按 ROS2 根前缀剔除。
+    """
+    env = os.environ.copy()
+    raw = env.get("PYTHONPATH", "")
+    if not raw:
+        return env
+    ros2_root = os.path.normcase(str(ROS2_ROOT))
+    kept = [
+        entry
+        for entry in raw.split(os.pathsep)
+        if entry
+        and not os.path.normcase(os.path.abspath(entry)).startswith(ros2_root)
+    ]
+    if kept:
+        env["PYTHONPATH"] = os.pathsep.join(kept)
+    else:
+        env.pop("PYTHONPATH", None)
+    return env
+
+
 def _run_postprocess_command(
     description: str,
     command: list[str],
+    env: dict[str, str] | None = None,
 ) -> bool:
     print(f"\n[post] {description}...")
     try:
-        subprocess.run(command, cwd=str(_ROOT), check=True)
+        subprocess.run(command, cwd=str(_ROOT), check=True, env=env)
     except Exception as e:
         print(f"[post] {description} failed: {e}")
         return False
@@ -529,6 +559,8 @@ def _generate_post_run_artifacts(
 ) -> dict[str, Path]:
     generated: dict[str, Path] = {}
     python_exe = sys.executable
+    # 纯 Python 报告工具（非 ROS2）用干净 PYTHONPATH，见 _report_tool_env
+    report_env = _report_tool_env()
     json_path = json_path.resolve()
     video_path = video_path.resolve() if video_path is not None else None
 
@@ -581,7 +613,7 @@ def _generate_post_run_artifacts(
             html_command.extend(["--arm-json", str(arm_json_path)])
         if rk_tracking_json_path is not None:
             html_command.extend(["--rk-tracking-json", str(rk_tracking_json_path)])
-        if _run_postprocess_command("Generate HTML", html_command):
+        if _run_postprocess_command("Generate HTML", html_command, env=report_env):
             generated["html"] = html_path
 
     if generate_annotated_video:
@@ -601,7 +633,9 @@ def _generate_post_run_artifacts(
             ]
             if annotated_video_no_racket:
                 command.append("--no-racket")
-            if _run_postprocess_command("Generate annotated video", command):
+            if _run_postprocess_command(
+                "Generate annotated video", command, env=report_env
+            ):
                 generated["annotated_video"] = annotated_path
 
     return generated
