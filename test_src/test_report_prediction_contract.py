@@ -507,7 +507,7 @@ def test_rk300_table_includes_last_accepted_target_and_tcp_at_accepted_ht():
         "最后更新−挥拍起<br>(ms)</th>",
         "盲区 ht−ct@臂最后更新<br>(ms)</th>",
         "Δht 重定相<br>(ms)</th>",
-        "车yaw@accepted HT(°)</th>",
+        "车yaw@臂最后更新HT(°)</th>",
         "<th>拍面yaw@臂最后更新HT(°,世界系)</th>",
         "<th>拍面yaw@臂最后更新HT−10ms(°,世界系)</th>",
     ]
@@ -527,9 +527,9 @@ def test_rk300_table_includes_last_accepted_target_and_tcp_at_accepted_ht():
     assert "视觉球拍" not in source
     assert "visualRacketAt" not in source
     assert "visualRacketCell" not in source
-    # 车yaw@accepted HT 列：/bot_state 瞬时值，锚在最后 accepted 的原消息 ht（同 PC真值/TCP 列）
-    assert "const carYawAcc=accHt!=null?botYawDegAt(accHt):null;" in source
-    assert "const carYawRate=accHt!=null?imuYawRateDegAt(accHt):null;" in source
+    # 车yaw@臂最后更新HT 列：/bot_state 瞬时值，锚同两列击球真值与两列拍面yaw（不是 accepted HT）
+    assert "const carYawAcc=finalHt!=null?botYawDegAt(finalHt):null;" in source
+    assert "const carYawRate=finalHt!=null?imuYawRateDegAt(finalHt):null;" in source
     assert source.count("<td>'+carYawCell+'</td>") == 2
     # 角速度只能取 IMU 零滞后原值，禁止对有 0.3~0.5s 滞后的 bot_state yaw 数值求导
     assert "ys(RK.imu,'yaw_speed')" in source

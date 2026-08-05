@@ -1716,24 +1716,24 @@ const rk300TableHtml = () => {
           +'（与左列之差 = ψ̇×10ms）'+htSrcNote)+'">'
           +tableSigned(faceYawPre.deg)+'</span>'
       : '—';
-    // 车yaw@accepted HT：锚点同 PC真值@accepted HT / TCP@accepted HT 三列（最后一条 accepted
-    // 的原消息 ht）。取 /bot_state yaw 瞬时值——车控 accept AprilTag 定位后 yaw 由 IMU 连续更新、
+    // 车yaw@臂最后更新HT：与右侧两列拍面yaw、左侧两列击球真值同锚（臂真正执行的击球时刻）。
+    // 取 /bot_state yaw 瞬时值——车控 accept AprilTag 定位后 yaw 由 IMU 连续更新、
     // HT 结束后才用 AprilTag 重定位，故 HT 前采样点无重定位台阶；挥拍位姿伪迹只塌陷位置不动 yaw。
     // 悬停给 IMU yaw_speed（零滞后）换算的 10ms 时序灵敏度，以及 PC AprilTag 挥拍前窗圆均值对照
-    // ——那正是左侧「拍面yaw@臂最后更新HT」列里减掉的车 yaw，两者之差即两列口径差的车侧来源。
-    const carYawAcc=accHt!=null?botYawDegAt(accHt):null;
-    const carYawRate=accHt!=null?imuYawRateDegAt(accHt):null;
+    // ——那正是右侧「拍面yaw@臂最后更新HT」列里减掉的车 yaw，两者之差即两列口径差的车侧来源。
+    const carYawAcc=finalHt!=null?botYawDegAt(finalHt):null;
+    const carYawRate=finalHt!=null?imuYawRateDegAt(finalHt):null;
     const carYawCell=carYawAcc!=null
-      ? '<span title="'+tableEsc('/bot_state yaw@accepted HT '+rkToPc(accHt).toFixed(3)+'s（PC轴，'
-          +'最后一条accepted原消息的ht，未减臂内提前量）：AprilTag accept 后由 IMU 连续更新，'
+      ? '<span title="'+tableEsc('/bot_state yaw@臂最后更新HT '+rkToPc(finalHt).toFixed(3)+'s（PC轴，'
+          +'臂受理的最后一条预测的原始 ht，未减臂内提前量）：AprilTag accept 后由 IMU 连续更新，'
           +'HT 结束后才重定位，采样点无台阶'
           +(carYawRate!=null?('；IMU yaw_speed='+tableSigned(carYawRate)+'°/s（零滞后陀螺，'
             +'10ms 时序误差≈'+(carYawRate>=0?'+':'')+(carYawRate*0.01).toFixed(2)+'°车yaw）'):'；本场无 IMU yaw_speed')
           +(faceYaw?('；对照 PC AprilTag 挥拍前[−450,−150]ms 圆均值='+tableSigned(faceYaw.carYaw)
-            +'°（左侧拍面yaw@臂最后更新HT 列减掉的车yaw），差 '
+            +'°（右侧拍面yaw@臂最后更新HT 列减掉的车yaw），差 '
             +tableSigned(wrapDeg(carYawAcc-faceYaw.carYaw))+'°'):''))+'">'
           +tableSigned(carYawAcc)+'</span>'
-      : '<span title="无 accepted，或该时刻 50ms 内无 /bot_state">—</span>';
+      : '<span title="无 accepted/臂最后更新HT，或该时刻 50ms 内无 /bot_state">—</span>';
     // 最后更新→挥拍起：臂受理的最后一条预测的到达时刻 − 挥拍段起点(老触球−HIT_T)。
     // 正=更新落在挥拍开始之后（0803 起挥拍窗内不再拒收，这些就是 ht 重定相的养料）。
     const updT=accepted&&isNum(accepted.lastUpdateT)?accepted.lastUpdateT:null;
@@ -1880,7 +1880,7 @@ const rk300TableHtml = () => {
     'Δht 重定相(ms) = 挥拍时用的 ht（最后一条 accepted 的原消息 ht）→ 挥拍中重定相更新后的 ht，正=新预测把击球点推晚；两者都是原始 ht，各减臂内 10ms 后即新老触球时刻，差值等价。灰字 (未采纳) = 新触球距触发点不足 SWING_HT_UPDATE_MIN_REMAINING_SEC=60ms，控制器放弃重定相、实际仍走老时间轴，显示的是候选值；— = 挥拍窗内没有新预测到达。注意重建挥拍段是「从当前命令帧在剩余时间内重规划」，即使 Δht 只有几 ms，指令加速度与触球拍速也会跟着变（触球拍速是派生量）',
     '臂最后更新HT = 臂受理的最后一条 /predict_hit_pos 的**原始 ht**（不减臂内 HIT_TIME_ADVANCE_SEC）：重定相生效时取被消费的那条 late ht saved 的 ht（挥拍窗内最后一条，触发 tick 之后一律 reject hit phase in progress），否则退回最后一条 accepted 的 ht；late ht saved 状态本身只有 duration，其 ht 由 /predict_hit_pos↔/tennis/status 顺序一对一回配得到，并按 t+duration+提前量≈ht 自校验（失配显示—）',
     armConstNote,
-    '车yaw@accepted HT(°) = 该时刻 /bot_state yaw 瞬时值（线性插值，容差50ms），锚点同 PC真值@accepted HT / TCP@accepted HT（最后一条 accepted 的原消息 ht，未减臂内提前量）：车控 accept AprilTag 定位后 yaw 由 IMU 连续更新、HT 结束后才用 AprilTag 重定位，故 HT 前采样点无重定位台阶；挥拍瞬间的位姿伪迹只塌陷 bot 位置、不动 yaw。悬停给该时刻 IMU yaw_speed（/chassis_can/imu 原值，零滞后）及其 10ms 时序等效 yaw 偏差，并对照右侧「拍面yaw@臂最后更新HT」列减掉的 PC AprilTag 挥拍前窗圆均值——两者之差就是那一列与 HT−10ms 列口径差的车侧来源（注意 bot_state yaw 本身有 0.3~0.5s 滤波滞后，只可读瞬时角，切勿对它数值求导当角速度）',
+    '车yaw@臂最后更新HT(°) = 该时刻 /bot_state yaw 瞬时值（线性插值，容差50ms），锚点同左侧两列击球真值与右侧两列拍面yaw（臂受理的最后一条预测的原始 ht，未减臂内提前量；不是 PC真值/TCP 两列用的 accepted HT，两锚之差见 Δht 重定相列）：车控 accept AprilTag 定位后 yaw 由 IMU 连续更新、HT 结束后才用 AprilTag 重定位，故 HT 前采样点无重定位台阶；挥拍瞬间的位姿伪迹只塌陷 bot 位置、不动 yaw。悬停给该时刻 IMU yaw_speed（/chassis_can/imu 原值，零滞后）及其 10ms 时序等效 yaw 偏差，并对照右侧「拍面yaw@臂最后更新HT」列减掉的 PC AprilTag 挥拍前窗圆均值——两者之差就是那一列与 HT−10ms 列口径差的车侧来源（注意 bot_state yaw 本身有 0.3~0.5s 滤波滞后，只可读瞬时角，切勿对它数值求导当角速度）',
     '拍面yaw@臂最后更新HT（世界系）= 臂系FK face_yaw − 车yaw：face_yaw为完整FK（extract_arm_bag.fk单源）拍面法向（link6 +X）的atan2(x,y)角，冲击前窗[−80,−6]ms线性外推到臂最后更新HT（避开J5冲击突跳污染）；车yaw取挥拍前0.45~0.15s窗圆均值（避开挥拍位姿伪迹）；口径同PC回球yaw，纯FK不含δ6球侧偏置',
     '拍面yaw@臂最后更新HT−10ms（世界系）：face_yaw同款冲击前窗[−80,−6]ms线性拟合改在HT−10ms处取值（落在窗内，纯插值）。HT−10ms 是**固定探针**不随臂内提前量走：0803及以前臂内瞄准的正是 ht−10ms（提前量10/15ms），2026-08-04 起提前量归零、臂瞄准原始 ht，本列改读「接触起始附近」（roundtrip 实测触始=ht−5.3ms）并兼作时序敏感度探针——与左列之差 = 拍面 yaw 角速度×10ms，即 10ms 时序误差能造成多大拍面 yaw 偏差；车yaw直接取该时刻/bot_state yaw——车控接受AprilTag定位后yaw由IMU连续更新，HT结束后才用AprilTag重定位更新bot_state，故采样点无重定位台阶；ψ=face_yaw−车yaw，口径同左列',
     '备注仅在该抛没有机械臂accepted时显示回配到该抛时间窗的reject hit原因，并合并同类原因计数',
@@ -1919,11 +1919,12 @@ const rk300TableHtml = () => {
     '真值侧=球心x−车实际x、球心z。故不含车体系↔世界轴的 yaw 旋转项，也不含 rel_x 里的手写+0.04。'+
     '正=预测点落在真实球位的 +x 侧/上方，即臂被瞄偏的方向">'+
     '击球点@300预测 − RK全量真值@臂最后更新HT<br>dx/dz(mm, 世界轴)</th>'+
-    '<th title="车体 yaw@最后accepted原消息ht（与 PC真值@accepted HT / TCP 两列同锚，未减臂内提前量）：'+
-    '取 /bot_state 瞬时值——车控 accept AprilTag 定位后 yaw 由 IMU 连续更新、HT 结束后才重定位，'+
-    '故采样点无重定位台阶，挥拍位姿伪迹只塌陷位置不动 yaw。悬停看 IMU yaw_speed 换算的 10ms 时序'+
-    '灵敏度，以及右侧拍面yaw@臂最后更新HT 列所减的 PC AprilTag 挥拍前窗圆均值对照">'+
-    '车yaw@accepted HT(°)</th>'+
+    '<th title="车体 yaw@臂最后更新HT（臂受理的最后一条预测的原始 ht，未减臂内提前量；与左侧两列'+
+    '击球真值、右侧两列拍面yaw 同锚）：取 /bot_state 瞬时值——车控 accept AprilTag 定位后 yaw 由 '+
+    'IMU 连续更新、HT 结束后才重定位，故采样点无重定位台阶，挥拍位姿伪迹只塌陷位置不动 yaw。'+
+    '悬停看 IMU yaw_speed 换算的 10ms 时序灵敏度，以及右侧拍面yaw@臂最后更新HT 列所减的 '+
+    'PC AprilTag 挥拍前窗圆均值对照">'+
+    '车yaw@臂最后更新HT(°)</th>'+
     '<th>拍面yaw@臂最后更新HT(°,世界系)</th><th>拍面yaw@臂最后更新HT−10ms(°,世界系)</th>'+
     '<th>PC回球 yaw/俯仰(°)</th><th>消息</th><th>备注</th></tr></thead>'+
     '<tbody>'+rows.join('')+'</tbody></table>'+
