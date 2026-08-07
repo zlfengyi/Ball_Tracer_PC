@@ -508,18 +508,21 @@ def test_rk300_table_includes_last_accepted_target_and_tcp_at_accepted_ht():
         "盲区 ht−ct@臂最后更新<br>(ms)</th>",
         "Δht 重定相<br>(ms)</th>",
         "车yaw@臂最后更新HT(°)</th>",
-        "<th>拍面yaw@臂最后更新HT(°,世界系)</th>",
-        "<th>拍面yaw@臂最后更新HT−10ms(°,世界系)</th>",
+        "拍面yaw,pitch@臂最后更新HT(°,世界系)</th>",
+        "拍面yaw,pitch@臂最后更新HT−10ms(°,世界系)</th>",
     ]
     assert [source.index(header) for header in headers] == sorted(
         source.index(header) for header in headers
     )
-    # 两列拍面 yaw 锚在「臂最后更新 HT」（含挥拍中 ht 重定相消费的那条），不是最后一条 accepted
+    # 两列拍面角锚在「臂最后更新 HT」（含挥拍中 ht 重定相消费的那条），不是最后一条 accepted
     assert "const finalHt=accepted&&isNum(accepted.finalHt)?accepted.finalHt-RK.t0:accHt;" in source
-    assert "faceYawWorldAt(finalHt)" in source
-    assert "faceYawWorldPreAt(finalHt)" in source
-    assert "faceYawWorldAt(accHt)" not in source
-    assert "faceYawWorldPreAt(accHt)" not in source
+    assert "faceAnglesWorldAt(finalHt)" in source
+    assert "faceAnglesWorldPreAt(finalHt)" in source
+    assert "faceAnglesWorldAt(accHt)" not in source
+    assert "faceAnglesWorldPreAt(accHt)" not in source
+    # 两列各自同时给 yaw 与 pitch（同一份窗内拟合），单元格文本为 yaw/pitch
+    assert "tableSigned(faceYaw.deg)+'/'+tableSigned(faceYaw.pitch)" in source
+    assert "tableSigned(faceYawPre.deg)+'/'+tableSigned(faceYawPre.pitch)" in source
     # 盲区列的 ct/ht 必须同源，且与主表 lead(ms)（@300ms 参考消息）不是一回事
     assert "const finalCt=accepted&&isNum(accepted.finalCt)?accepted.finalCt-RK.t0:null;" in source
     assert "const blind=(finalHt!=null&&finalCt!=null)?(finalHt-finalCt)*1000:null;" in source
@@ -533,9 +536,9 @@ def test_rk300_table_includes_last_accepted_target_and_tcp_at_accepted_ht():
     assert source.count("<td>'+carYawCell+'</td>") == 2
     # 角速度只能取 IMU 零滞后原值，禁止对有 0.3~0.5s 滞后的 bot_state yaw 数值求导
     assert "ys(RK.imu,'yaw_speed')" in source
-    # HT−10ms 列：fy 同窗拟合在 HT−10ms 取值；车 yaw 用 /bot_state 瞬时值（IMU 连续更新）
+    # HT−10ms 列：fy/fp 同窗拟合在 HT−10ms 取值；车 yaw 用 /bot_state 瞬时值（IMU 连续更新）
     assert "const FACE_YAW_PRE_S=0.010;" in source
-    assert "fitFaceYawTo(accHtRk,tEval)" in source
+    assert "fitFaceAnglesTo(accHtRk,tEval)" in source
     assert "botYawDegAt(tEval)" in source
     assert "ys(RK.bot,'yaw')" in source
     assert "<th>/tennis/status 字符串</th>" not in source
@@ -550,16 +553,17 @@ def test_rk300_table_includes_last_accepted_target_and_tcp_at_accepted_ht():
     assert source.count("<td>'+rkPredCarError+'</td>") == 2
 
 
-def test_add_face_yaw_wiring_and_fk_properties():
-    """拍面yaw列的 Python 侧：_add_face_yaw 正确附加 fy、跳过残缺关节；
-    FK 性质：零位 fy=0（拍面朝正前）、J1 为垂直轴（Δfy=−Δq1 精确）。"""
+def test_add_face_angles_wiring_and_fk_properties():
+    """拍面yaw,pitch 两列的 Python 侧：_add_face_angles 正确附加 fy/fp、跳过残缺关节；
+    FK 性质：零位 fy=fp=0（拍面朝正前且不上仰）、J1 为垂直轴（Δfy=−Δq1 精确、fp 分毫不动
+    ——这正是 pitch 列不需要减车 yaw 的依据）。"""
     pytest.importorskip("numpy")
     import math
     import sys
 
     sys.path.insert(0, str(SRC.parent))
     try:
-        from generate_curve3_html import _add_face_yaw
+        from generate_curve3_html import _add_face_angles
     finally:
         sys.path.pop(0)
 
@@ -573,14 +577,18 @@ def test_add_face_yaw_wiring_and_fk_properties():
         {"t": 1.4, "position": [0.0] * 6},
         {"t": 1.5, "position": q1p},
     ]}
-    _add_face_yaw(arm)
+    _add_face_angles(arm)
     s = arm["states"]
     assert isinstance(s[0].get("fy"), float)
-    assert all("fy" not in r for r in s[1:4])
+    assert isinstance(s[0].get("fp"), float)
+    assert all("fy" not in r and "fp" not in r for r in s[1:4])
     assert s[4]["fy"] == pytest.approx(0.0, abs=1e-6)          # 零位拍面朝正前
+    assert s[4]["fp"] == pytest.approx(0.0, abs=1e-6)          # 零位拍面不上仰
     assert s[5]["fy"] - s[0]["fy"] == pytest.approx(           # J1 垂直轴：Δfy = −Δq1
         -math.degrees(0.2), abs=0.02
     )
+    assert s[5]["fp"] == s[0]["fp"]                            # 纯 z 转不动 n_z ⇒ pitch 不变
+    assert s[0]["fp"] == pytest.approx(15.42, abs=0.01)        # 该位形的拍面上仰角（回归锚）
 
 
 def test_rk300_table_shows_reject_reasons_only_without_accepted():

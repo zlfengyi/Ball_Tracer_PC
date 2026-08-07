@@ -513,7 +513,7 @@ def _report_tool_env() -> dict[str, str]:
     （ros2_support.ensure_ros2_environment）。generate_curve3_html / annotate_video
     用 tracker venv 的解释器跑，继承这份 PYTHONPATH 后 `import numpy` 会先命中
     conda-forge 那一份、在 venv 解释器里 C 扩展加载失败——2026-08-05 之前的报告
-    因此整场缺「拍面yaw@最终更新HT」两列（_add_face_yaw 吞掉 ImportError 静默显示
+    因此整场缺「拍面yaw,pitch@臂最后更新HT」两列（_add_face_angles 吞掉 ImportError 静默显示
     —），手工重跑（无此 PYTHONPATH）才有。这两个工具不碰 ROS2，按 ROS2 根前缀剔除。
     """
     env = os.environ.copy()

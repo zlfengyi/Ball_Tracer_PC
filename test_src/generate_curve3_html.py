@@ -89,14 +89,16 @@ def _merge_racket_json(base_data: dict, racket_data: dict, racket_json_path: str
     return merged
 
 
-def _add_face_yaw(arm) -> None:
-    """给 arm.states 逐帧附加 fy：FK 拍面法向（link6 +X，前向规范化）在臂系的
-    yaw（°，atan2(x,y) 口径，与 PC回球 yaw 同式）。单源复用 extract_arm_bag.fk
-    （0801 dz/yawrate 分析脚本同一公式），不在 JS 里抄第二份 FK 链。
+def _add_face_angles(arm) -> None:
+    """给 arm.states 逐帧附加 fy/fp：FK 拍面法向（link6 +X，前向规范化）在臂系的
+    yaw（°，atan2(x,y) 口径，与 PC回球 yaw 同式）与 pitch（°，asin(n_z)，正=开面上仰）。
+    单源复用 extract_arm_bag.fk（0801 dz/yawrate 分析脚本同一公式），不在 JS 里抄第二份 FK 链。
+    **pitch 不需要减车 yaw**：J1/BASE_ROT 都是纯 z（垂直）转，只搬 n 的水平分量、不动 n_z，
+    故臂系 pitch ≡ 世界 pitch（车无 roll/pitch 前提），比 yaw 少一个误差源。
     关节残缺（None 或非 6 关节）时跳过该帧，报告列显示 —。
     导入失败不让整份报告挂掉，但必须打到 stderr：2026-08-05 前 run_tracker 的
     post-run 把 ROS2 pixi 的 site-packages 留在 PYTHONPATH 里，子进程 import numpy
-    命中 conda 版 C 扩展加载失败，这里静默 return 让两列拍面 yaw 整场空白，只有手工
+    命中 conda 版 C 扩展加载失败，这里静默 return 让两列拍面角整场空白，只有手工
     重跑才有（已由 run_tracker._report_tool_env 根治）。"""
     try:
         _here = str(Path(__file__).resolve().parent)
@@ -105,7 +107,7 @@ def _add_face_yaw(arm) -> None:
         from extract_arm_bag import fk, JOINTS
     except Exception as exc:
         print(
-            f"[report] 拍面yaw 两列不可用：import extract_arm_bag 失败（{exc!r}）",
+            f"[report] 拍面yaw,pitch 两列不可用：import extract_arm_bag 失败（{exc!r}）",
             file=sys.stderr,
         )
         return
@@ -120,10 +122,12 @@ def _add_face_yaw(arm) -> None:
                 and all(isinstance(v, (int, float)) for v in q)):
             continue
         rot = fk(q)["link_transforms"][link6]
-        n0, n1 = float(rot[0, 0]), float(rot[1, 0])  # R @ [1,0,0] = 第一列
+        # R @ [1,0,0] = 第一列；前向规范化要同时翻 n_z，否则 pitch 会跟着 n_y 变号
+        n0, n1, n2 = float(rot[0, 0]), float(rot[1, 0]), float(rot[2, 0])
         if n1 < 0:
-            n0, n1 = -n0, -n1
+            n0, n1, n2 = -n0, -n1, -n2
         s["fy"] = round(_m.degrees(_m.atan2(n0, n1)), 2)
+        s["fp"] = round(_m.degrees(_m.asin(max(-1.0, min(1.0, n2)))), 2)
 
 
 def generate_html(
@@ -139,7 +143,7 @@ def generate_html(
         data = _merge_racket_json(data, _load_json(racket_json_path), racket_json_path)
     if arm_json_path:
         data["arm"] = _load_json(arm_json_path)
-        _add_face_yaw(data["arm"])
+        _add_face_angles(data["arm"])
     if rk_tracking_json_path:
         data["rk_tracking"] = _load_json(rk_tracking_json_path)
     if rk_time_bias is not None:
@@ -1376,36 +1380,41 @@ const pcReturnAt = tApprox => {
   return null;
 };
 // [[pc-return-core-end]]
-// 拍面世界yaw@accepted HT（0803）：臂系 face_yaw（Python _add_face_yaw 逐帧 FK，link6 +X 法向）
-// 取冲击前窗 [−80,−6]ms 线性外推到 accepted HT——J5 冲击突跳（触始+13ms 机械传递，本场 ≈ht−3ms）
-// 会污染跨冲击帧的直接插值（rebound 位姿采样同款约定）；车 yaw 取挥拍前 [−450,−150]ms 窗圆均值
-// （击球 ±0.4s 车位姿有挥拍塌陷伪迹，禁读）。ψ_world = fy − 车yaw，口径与 PC回球 yaw 同为
-// atan2(x,y)（车体 CCW 正旋转使 ψ_world 变小）；纯 FK 值，不含 δ6 球侧偏置。
-const armFyRows = ARM ? ARM.states.filter(s=>isNum(s.fy)) : [];
+// 拍面世界yaw,pitch@臂最后更新HT：臂系 face_yaw/face_pitch（Python _add_face_angles 逐帧 FK，
+// link6 +X 法向）取冲击前窗 [−80,−6]ms 线性外推到该 HT——J5 冲击突跳（触始+13ms 机械传递，
+// 本场 ≈ht−3ms）会污染跨冲击帧的直接插值（rebound 位姿采样同款约定）；车 yaw 取挥拍前
+// [−450,−150]ms 窗圆均值（击球 ±0.4s 车位姿有挥拍塌陷伪迹，禁读）。ψ_world = fy − 车yaw，
+// 口径与 PC回球 yaw 同为 atan2(x,y)（车体 CCW 正旋转使 ψ_world 变小）；纯 FK 值，不含 δ6 球侧偏置。
+// **pitch 不减车 yaw**：J1/BASE_ROT 是纯 z 转、不动 n_z，故臂系 pitch ≡ 世界 pitch（车无 roll/pitch
+// 前提），θ_world 比 ψ_world 少一个车侧误差源；且 θ̇≈0（挥拍是近水平圆弧，法向在 yaw 里飞扫、
+// 在 pitch 里冻结），故 pitch 对时序误差天然免疫，两列之差应当接近 0。
+const armFaceRows = ARM ? ARM.states.filter(s=>isNum(s.fy)&&isNum(s.fp)) : [];
 const wrapDeg = d => ((d+180)%360+360)%360-180;
-// 冲击前窗 [−80,−6]ms（相对 accepted HT）线性拟合 fy，在 tEval 处取值：
-// tEval=accHt 为 ≤6ms 外推；tEval=accHt−10ms 落在窗内，为纯插值。
-const fitFaceYawTo = (accHtRk,tEval) => {
-  if(accHtRk==null || !isNum(tEval) || !armFyRows.length) return null;
-  const seg=armFyRows.filter(s=>s.t>=accHtRk-0.08 && s.t<=accHtRk-0.006);
+// 冲击前窗 [−80,−6]ms（相对该 HT）线性拟合 fy 与 fp，在 tEval 处取值：
+// tEval=htRk 为 ≤6ms 外推；tEval=htRk−10ms 落在窗内，为纯插值。
+const fitFaceAnglesTo = (accHtRk,tEval) => {
+  if(accHtRk==null || !isNum(tEval) || !armFaceRows.length) return null;
+  const seg=armFaceRows.filter(s=>s.t>=accHtRk-0.08 && s.t<=accHtRk-0.006);
   if(seg.length<2) return null;
-  let st=0,sv=0,stt=0,stv=0;
-  seg.forEach(s=>{const u=s.t-tEval; st+=u; sv+=s.fy; stt+=u*u; stv+=u*s.fy;});
+  let st=0,sy=0,stt=0,sty=0,sp=0,stp=0;
+  seg.forEach(s=>{const u=s.t-tEval; st+=u; stt+=u*u; sy+=s.fy; sty+=u*s.fy; sp+=s.fp; stp+=u*s.fp;});
   const n=seg.length, den=n*stt-st*st;
   if(Math.abs(den)<1e-12) return null;
-  return {fy:(sv*stt-st*stv)/den, rate:(n*stv-st*sv)/den, n};
+  return {fy:(sy*stt-st*sty)/den, rate:(n*sty-st*sy)/den,
+          fp:(sp*stt-st*stp)/den, pitchRate:(n*stp-st*sp)/den, n};
 };
-const faceYawWorldAt = accHtRk => {
-  const fit=fitFaceYawTo(accHtRk,accHtRk);
+const faceAnglesWorldAt = accHtRk => {
+  const fit=fitFaceAnglesTo(accHtRk,accHtRk);
   if(!fit) return null;
   const tPc=rkToPc(accHtRk);
   let ss=0,sc=0,m=0;
   pcCarRows.forEach(r=>{ if(r.t>=tPc-0.45 && r.t<=tPc-0.15 && isNum(r.yaw)){ ss+=Math.sin(r.yaw); sc+=Math.cos(r.yaw); m++; } });
   if(!m) return null;
   const carYaw=Math.atan2(ss,sc)*180/Math.PI;
-  return {deg:wrapDeg(fit.fy-carYaw), fy:fit.fy, carYaw, n:fit.n, rate:fit.rate, m};
+  return {deg:wrapDeg(fit.fy-carYaw), fy:fit.fy, carYaw, n:fit.n, rate:fit.rate, m,
+          pitch:fit.fp, pitchRate:fit.pitchRate};
 };
-// 拍面yaw@accepted HT−10ms（世界系）：fy 同款冲击前窗拟合改在 HT−10ms 取值；车 yaw
+// 拍面yaw,pitch@臂最后更新HT−10ms（世界系）：fy/fp 同款冲击前窗拟合改在 HT−10ms 取值；车 yaw
 // 不用挥拍前圆均值，直接取该时刻 /bot_state yaw——车控接受 AprilTag 定位后 yaw 由
 // IMU 连续更新，直到 HT 结束后才用 AprilTag 重定位更新 bot_state，因此 HT 前采样点
 // 的 bot yaw 是无重定位台阶的瞬时值（挥拍塌陷伪迹只污染位置，yaw 走 IMU 不受累）。
@@ -1443,14 +1452,15 @@ const imuYawRateDegAt = t => {
   return (n && Math.abs(n.t-t)<=0.06) ? n.w*180/Math.PI : null;
 };
 const FACE_YAW_PRE_S=0.010;
-const faceYawWorldPreAt = accHtRk => {
+const faceAnglesWorldPreAt = accHtRk => {
   if(accHtRk==null) return null;
   const tEval=accHtRk-FACE_YAW_PRE_S;
-  const fit=fitFaceYawTo(accHtRk,tEval);
+  const fit=fitFaceAnglesTo(accHtRk,tEval);
   if(!fit) return null;
   const botYaw=botYawDegAt(tEval);
   if(botYaw==null) return null;
-  return {deg:wrapDeg(fit.fy-botYaw), fy:fit.fy, botYaw, n:fit.n, rate:fit.rate};
+  return {deg:wrapDeg(fit.fy-botYaw), fy:fit.fy, botYaw, n:fit.n, rate:fit.rate,
+          pitch:fit.fp, pitchRate:fit.pitchRate};
 };
 // RK≈300ms 主表与机械臂最后 accepted 分表：两个合同独立取值、独立对齐 PC 真值。
 const reportThrows = rkThrows.filter(t=>(t.msgs||0)>=3).sort((a,b)=>a.ht-b.ht);
@@ -1687,7 +1697,7 @@ const rk300TableHtml = () => {
     // 1ms≈10mm）。挥拍中 ht 重定相生效时臂实际执行的是臂最后更新HT，与本列锚点之差见 Δht 重定相列。
     const truthAcc=accHt!=null?pcTruthAt(rkToPc(accHt)):null;
     // 臂最后更新 HT：臂真正受理的最后一条 /predict_hit_pos 的原始 ht——挥拍窗内 ht 重定相
-    // 生效时就是那条 late ht saved 的 ht，否则退回最后一条 accepted 的 ht。两列拍面 yaw
+    // 生效时就是那条 late ht saved 的 ht，否则退回最后一条 accepted 的 ht。两列拍面 yaw,pitch
     // 都锚在它上面（不减臂内 HIT_TIME_ADVANCE_SEC，本场自标定值见表下注记；右列固定再减 10ms 取值）。
     const finalHt=accepted&&isNum(accepted.finalHt)?accepted.finalHt-RK.t0:accHt;
     const rsw=accepted?accepted.reswing:null;
@@ -1696,16 +1706,19 @@ const rk300TableHtml = () => {
           ? '；HT源=挥拍中重定相后的最后一条late ht saved（老触球'+tableSigned(rsw.delta)+'ms）'
           : '；重定相因剩余'+(rsw.remain*1000).toFixed(0)+'ms<60ms放弃，HT源退回最后一条accepted')
       : '；HT源=最后一条accepted（本拍无挥拍窗内更新）';
-    const faceYaw=faceYawWorldAt(finalHt);
+    const faceYaw=faceAnglesWorldAt(finalHt);
     const faceYawCell=faceYaw
       ? '<span title="'+tableEsc('臂系FK face_yaw='+tableSigned(faceYaw.fy)+'°（冲击前窗['
           +'−80,−6]ms '+faceYaw.n+'帧线性外推@臂最后更新HT，ψ̇='+tableSigned(faceYaw.rate)+'°/s）'
           +'；车yaw='+tableSigned(faceYaw.carYaw)+'°（挥拍前0.45~0.15s窗圆均值'+faceYaw.m+'帧）'
           +'；世界ψ=face_yaw−车yaw，口径同PC回球yaw=atan2(x,y)；纯FK不含δ6球侧偏置'
+          +'。pitch='+tableSigned(faceYaw.pitch)+'°（同窗同帧拟合的 asin(n_z)，正=开面上仰，'
+          +'θ̇='+tableSigned(faceYaw.pitchRate)+'°/s）——**不减车yaw**：J1/BASE_ROT 纯 z 转不动 n_z，'
+          +'臂系pitch≡世界pitch；θ̇≈0 故 pitch 对时序免疫，与右列 pitch 之差 = θ̇×10ms'
           +htSrcNote)+'">'
-          +tableSigned(faceYaw.deg)+'</span>'
+          +tableSigned(faceYaw.deg)+'/'+tableSigned(faceYaw.pitch)+'</span>'
       : '—';
-    const faceYawPre=faceYawWorldPreAt(finalHt);
+    const faceYawPre=faceAnglesWorldPreAt(finalHt);
     const faceYawPreCell=faceYawPre
       ? '<span title="'+tableEsc('臂系FK face_yaw='+tableSigned(faceYawPre.fy)+'°（冲击前窗[−80,−6]ms '
           +faceYawPre.n+'帧线性拟合@臂最后更新HT−10ms取值，ψ̇='+tableSigned(faceYawPre.rate)+'°/s）'
@@ -1713,14 +1726,17 @@ const rk300TableHtml = () => {
           +'；世界ψ=face_yaw−车yaw；HT−10ms 固定探针：臂内提前量本场='
           +(armConstCal.adv!=null?(armConstCal.adv*1000).toFixed(0):'?')+'ms，'
           +'配 roundtrip 实测触始=ht−5.3ms，本列≈接触起始前后的拍面，并兼作时序敏感度探针'
-          +'（与左列之差 = ψ̇×10ms）'+htSrcNote)+'">'
-          +tableSigned(faceYawPre.deg)+'</span>'
+          +'（与左列之差 = ψ̇×10ms）'
+          +'。pitch='+tableSigned(faceYawPre.pitch)+'°（同窗拟合@HT−10ms，θ̇='
+          +tableSigned(faceYawPre.pitchRate)+'°/s，不减车yaw：臂系pitch≡世界pitch）'
+          +htSrcNote)+'">'
+          +tableSigned(faceYawPre.deg)+'/'+tableSigned(faceYawPre.pitch)+'</span>'
       : '—';
-    // 车yaw@臂最后更新HT：与右侧两列拍面yaw、左侧两列击球真值同锚（臂真正执行的击球时刻）。
+    // 车yaw@臂最后更新HT：与右侧两列拍面yaw,pitch、左侧两列击球真值同锚（臂真正执行的击球时刻）。
     // 取 /bot_state yaw 瞬时值——车控 accept AprilTag 定位后 yaw 由 IMU 连续更新、
     // HT 结束后才用 AprilTag 重定位，故 HT 前采样点无重定位台阶；挥拍位姿伪迹只塌陷位置不动 yaw。
     // 悬停给 IMU yaw_speed（零滞后）换算的 10ms 时序灵敏度，以及 PC AprilTag 挥拍前窗圆均值对照
-    // ——那正是右侧「拍面yaw@臂最后更新HT」列里减掉的车 yaw，两者之差即两列口径差的车侧来源。
+    // ——那正是右侧「拍面yaw,pitch@臂最后更新HT」列的 yaw 里减掉的车 yaw，两者之差即两列口径差的车侧来源。
     const carYawAcc=finalHt!=null?botYawDegAt(finalHt):null;
     const carYawRate=finalHt!=null?imuYawRateDegAt(finalHt):null;
     const carYawCell=carYawAcc!=null
@@ -1730,7 +1746,7 @@ const rk300TableHtml = () => {
           +(carYawRate!=null?('；IMU yaw_speed='+tableSigned(carYawRate)+'°/s（零滞后陀螺，'
             +'10ms 时序误差≈'+(carYawRate>=0?'+':'')+(carYawRate*0.01).toFixed(2)+'°车yaw）'):'；本场无 IMU yaw_speed')
           +(faceYaw?('；对照 PC AprilTag 挥拍前[−450,−150]ms 圆均值='+tableSigned(faceYaw.carYaw)
-            +'°（右侧拍面yaw@臂最后更新HT 列减掉的车yaw），差 '
+            +'°（右侧拍面yaw,pitch@臂最后更新HT 列的 yaw 减掉的车yaw），差 '
             +tableSigned(wrapDeg(carYawAcc-faceYaw.carYaw))+'°'):''))+'">'
           +tableSigned(carYawAcc)+'</span>'
       : '<span title="无 accepted/臂最后更新HT，或该时刻 50ms 内无 /bot_state">—</span>';
@@ -1867,7 +1883,7 @@ const rk300TableHtml = () => {
   });
   const notes=[
     '每行RK ct、x/z、n_fit、lead 严格来自同一条S1消息：在该抛所有正提前量S1中选择 |(HT−ct)−300ms| 最小者；RK@≈300ms x/z 列为该消息 rel_x/rel_z（臂端合同值，车体系、x含偏置），仅此列与accepted目标/TCP列保留车体系',
-    '击球真值两列（2026-08-05 起：原「HT真实(触球)」与「HT err@300」两列删除，第三个 ht 不再单列，误差全部改在空间上量）共用同一份 RK 全量无污染真值——球取该抛 S1 期 RK 球世界观测（z≥0.15、[该抛RK最终HT−450,−25]ms 窗）三轴二次拟合、按主运动轴 y 做 3σ 剔污染后 x/z 复用同一批点，车取 bot 位姿挥拍前[−160,−28]ms 窗 x/y 线性外推（避开挥拍瞬间 bot_y 塌陷伪迹），车中心 z≡地面0（/bot_state 无 z，实测消息 rel_z 恒等球世界z）；三条曲线都不含任何预测量，评估时刻统一取**臂最后更新HT**（= 臂受理的最后一条 /predict_hit_pos 的原始 ht，重定相生效时就是被消费的那条 late ht saved，即臂真正执行的击球时刻，与右侧两列拍面yaw同锚）——注意与 PC真值/TCP/车yaw 那三列的「accepted HT」锚点不同，后者是最后一条 accepted 的原消息 ht，两者之差就是 Δht 重定相列',
+    '击球真值两列（2026-08-05 起：原「HT真实(触球)」与「HT err@300」两列删除，第三个 ht 不再单列，误差全部改在空间上量）共用同一份 RK 全量无污染真值——球取该抛 S1 期 RK 球世界观测（z≥0.15、[该抛RK最终HT−450,−25]ms 窗）三轴二次拟合、按主运动轴 y 做 3σ 剔污染后 x/z 复用同一批点，车取 bot 位姿挥拍前[−160,−28]ms 窗 x/y 线性外推（避开挥拍瞬间 bot_y 塌陷伪迹），车中心 z≡地面0（/bot_state 无 z，实测消息 rel_z 恒等球世界z）；三条曲线都不含任何预测量，评估时刻统一取**臂最后更新HT**（= 臂受理的最后一条 /predict_hit_pos 的原始 ht，重定相生效时就是被消费的那条 late ht saved，即臂真正执行的击球时刻，与右侧两列拍面yaw,pitch同锚）——注意与 PC真值/TCP/车yaw 那三列的「accepted HT」锚点不同，后者是最后一条 accepted 的原消息 ht，两者之差就是 Δht 重定相列',
     '球面y−车y @臂最后更新HT(mm) = 时序误差的空间形态：dy=(球心y−R球33mm)−车y，车y面≡拍面（RK rel_y 无臂基y补偿），故 dy=0 即球面刚够到拍面=真实触球，正=那一刻球还没够到(ht 偏早)、负=已穿过(ht 偏晚)，含车未到位造成的顺延与球半径项；悬停给等效时序 dy/v_rel（正=偏晚，与旧 HT err@300 同向）、闭合速度、球/车两侧拟合明细与车−冻结面偏移',
     '击球点@300预测 − RK全量真值@臂最后更新HT dx/dz(mm，世界轴) = 该抛 S1@≈300ms 那条消息预测的击球点 (x,z) − 上一条所述那份 RK 全量真值在臂最后更新HT 上的球心 (x,z)（与左列「球面y−车y」同一份拟合、同一个取值时刻，只是取 x/z 分量）：预测侧取消息自带的世界 x 减同条消息的 car_pred_x、z 取 rel_z（车中心 z≡地面0、yaw 不转 z，故 rel_z 即世界 z），真值侧取球心x−车实际x 与球心z——两侧同轴同基准，既不含车体系↔世界轴的 yaw 旋转项，也不含 rel_x 里那个手写 +0.04 偏置；正=预测点落在真实球位的 +x 侧/上方，即臂被瞄偏的方向。无 accepted、观测不足、评估点离该抛拟合窗>300ms 或该抛无 S1@≈300ms 参考消息时显示—',
     '车RUN末帧取与该抛最终HT最近且相差不超过100ms的正常RUN→BRAKE_IN_SWING转换前最后一条/bot_state，并与抛球一对一匹配；差值=(target_x−x)/(target_y−y)，RK世界系，单位cm；未匹配或异常退出显示—',
@@ -1880,9 +1896,9 @@ const rk300TableHtml = () => {
     'Δht 重定相(ms) = 挥拍时用的 ht（最后一条 accepted 的原消息 ht）→ 挥拍中重定相更新后的 ht，正=新预测把击球点推晚；两者都是原始 ht，各减臂内 10ms 后即新老触球时刻，差值等价。灰字 (未采纳) = 新触球距触发点不足 SWING_HT_UPDATE_MIN_REMAINING_SEC=60ms，控制器放弃重定相、实际仍走老时间轴，显示的是候选值；— = 挥拍窗内没有新预测到达。注意重建挥拍段是「从当前命令帧在剩余时间内重规划」，即使 Δht 只有几 ms，指令加速度与触球拍速也会跟着变（触球拍速是派生量）',
     '臂最后更新HT = 臂受理的最后一条 /predict_hit_pos 的**原始 ht**（不减臂内 HIT_TIME_ADVANCE_SEC）：重定相生效时取被消费的那条 late ht saved 的 ht（挥拍窗内最后一条，触发 tick 之后一律 reject hit phase in progress），否则退回最后一条 accepted 的 ht；late ht saved 状态本身只有 duration，其 ht 由 /predict_hit_pos↔/tennis/status 顺序一对一回配得到，并按 t+duration+提前量≈ht 自校验（失配显示—）',
     armConstNote,
-    '车yaw@臂最后更新HT(°) = 该时刻 /bot_state yaw 瞬时值（线性插值，容差50ms），锚点同左侧两列击球真值与右侧两列拍面yaw（臂受理的最后一条预测的原始 ht，未减臂内提前量；不是 PC真值/TCP 两列用的 accepted HT，两锚之差见 Δht 重定相列）：车控 accept AprilTag 定位后 yaw 由 IMU 连续更新、HT 结束后才用 AprilTag 重定位，故 HT 前采样点无重定位台阶；挥拍瞬间的位姿伪迹只塌陷 bot 位置、不动 yaw。悬停给该时刻 IMU yaw_speed（/chassis_can/imu 原值，零滞后）及其 10ms 时序等效 yaw 偏差，并对照右侧「拍面yaw@臂最后更新HT」列减掉的 PC AprilTag 挥拍前窗圆均值——两者之差就是那一列与 HT−10ms 列口径差的车侧来源（注意 bot_state yaw 本身有 0.3~0.5s 滤波滞后，只可读瞬时角，切勿对它数值求导当角速度）',
-    '拍面yaw@臂最后更新HT（世界系）= 臂系FK face_yaw − 车yaw：face_yaw为完整FK（extract_arm_bag.fk单源）拍面法向（link6 +X）的atan2(x,y)角，冲击前窗[−80,−6]ms线性外推到臂最后更新HT（避开J5冲击突跳污染）；车yaw取挥拍前0.45~0.15s窗圆均值（避开挥拍位姿伪迹）；口径同PC回球yaw，纯FK不含δ6球侧偏置',
-    '拍面yaw@臂最后更新HT−10ms（世界系）：face_yaw同款冲击前窗[−80,−6]ms线性拟合改在HT−10ms处取值（落在窗内，纯插值）。HT−10ms 是**固定探针**不随臂内提前量走：0803及以前臂内瞄准的正是 ht−10ms（提前量10/15ms），2026-08-04 起提前量归零、臂瞄准原始 ht，本列改读「接触起始附近」（roundtrip 实测触始=ht−5.3ms）并兼作时序敏感度探针——与左列之差 = 拍面 yaw 角速度×10ms，即 10ms 时序误差能造成多大拍面 yaw 偏差；车yaw直接取该时刻/bot_state yaw——车控接受AprilTag定位后yaw由IMU连续更新，HT结束后才用AprilTag重定位更新bot_state，故采样点无重定位台阶；ψ=face_yaw−车yaw，口径同左列',
+    '车yaw@臂最后更新HT(°) = 该时刻 /bot_state yaw 瞬时值（线性插值，容差50ms），锚点同左侧两列击球真值与右侧两列拍面yaw,pitch（臂受理的最后一条预测的原始 ht，未减臂内提前量；不是 PC真值/TCP 两列用的 accepted HT，两锚之差见 Δht 重定相列）：车控 accept AprilTag 定位后 yaw 由 IMU 连续更新、HT 结束后才用 AprilTag 重定位，故 HT 前采样点无重定位台阶；挥拍瞬间的位姿伪迹只塌陷 bot 位置、不动 yaw。悬停给该时刻 IMU yaw_speed（/chassis_can/imu 原值，零滞后）及其 10ms 时序等效 yaw 偏差，并对照右侧「拍面yaw,pitch@臂最后更新HT」列的 yaw 减掉的 PC AprilTag 挥拍前窗圆均值——两者之差就是那一列与 HT−10ms 列口径差的车侧来源（注意 bot_state yaw 本身有 0.3~0.5s 滤波滞后，只可读瞬时角，切勿对它数值求导当角速度）',
+    '拍面yaw,pitch@臂最后更新HT（世界系）= 同一份冲击前窗[−80,−6]ms 线性拟合（完整FK，extract_arm_bag.fk 单源，拍面法向=link6 +X 前向规范化）外推到臂最后更新HT（避开 J5 冲击突跳污染）的两个角：**yaw** = face_yaw(atan2(n_x,n_y)) − 车yaw，车yaw取挥拍前0.45~0.15s窗圆均值（避开挥拍位姿伪迹），口径同PC回球yaw，纯FK不含δ6球侧偏置；**pitch** = asin(n_z)（正=开面上仰）**不减车yaw**——J1 与 BASE_ROT 都是纯 z（垂直）转，只搬 n 的水平分量、不动 n_z，故臂系 pitch ≡ 世界 pitch（车无 roll/pitch 前提），比 yaw 少一个车侧误差源。悬停给两路角速度：ψ̇ 常达几百°/s，θ̇ 只有个位数°/s（挥拍是近水平圆弧，法向在 yaw 里飞扫、在 pitch 里冻结）⇒ pitch 通道对时序误差天然免疫，别把 yaw 的时序结论套到 pitch 上',
+    '拍面yaw,pitch@臂最后更新HT−10ms（世界系）：同款冲击前窗[−80,−6]ms线性拟合改在HT−10ms处取值（落在窗内，纯插值）。HT−10ms 是**固定探针**不随臂内提前量走：0803及以前臂内瞄准的正是 ht−10ms（提前量10/15ms），2026-08-04 起提前量归零、臂瞄准原始 ht，本列改读「接触起始附近」（roundtrip 实测触始=ht−5.3ms）并兼作时序敏感度探针——与左列之差 = 角速度×10ms，即 10ms 时序误差能造成多大拍面角偏差：yaw 上是度级（ψ̇×10ms），pitch 上≈0（θ̇×10ms，实测 0805 场 10 抛全在 0.06° 内）；车yaw直接取该时刻/bot_state yaw——车控接受AprilTag定位后yaw由IMU连续更新，HT结束后才用AprilTag重定位更新bot_state，故采样点无重定位台阶；ψ=face_yaw−车yaw，pitch 同左列不减车yaw',
     '备注仅在该抛没有机械臂accepted时显示回配到该抛时间窗的reject hit原因，并合并同类原因计数',
     'PC回球 yaw/俯仰 纯由PC球观测统计：先以入弧/出弧y(t)二次拟合交点定触球时刻（入弧vy<−1、出弧vy>0.15；锚点=该抛accepted HT，无accepted退RK最终HT并小范围扫描），再取触球后[+20,+400]ms出弧连续段拟合三轴速度取触球时刻导数（z先扣重力）；yaw=atan2(vx,vy)（+为+x侧）、俯仰=atan2(vz,水平速)，灰字为出球速率；脏数据过滤：z<0.12贴地/静止球剔除，观测按断档>150ms或帧间>20m/s跳变（换球；门槛在最快回球之上）切段后按点数优先选首个真出向段（静止球段vy≈0被拒；被拍/臂遮挡断档后用遮挡后真弧，段首距触球≤300ms），vz降转升突增>3m/s判地面反弹截断防污染俯仰；出弧vy≤0.5、水平速<1m/s或点数不足显示—（挥空/脱拍无值）',
     'ct/HT已加同一个RK offset显示在PC报告轴；lead=HT−ct，不受offset影响',
@@ -1920,12 +1936,19 @@ const rk300TableHtml = () => {
     '正=预测点落在真实球位的 +x 侧/上方，即臂被瞄偏的方向">'+
     '击球点@300预测 − RK全量真值@臂最后更新HT<br>dx/dz(mm, 世界轴)</th>'+
     '<th title="车体 yaw@臂最后更新HT（臂受理的最后一条预测的原始 ht，未减臂内提前量；与左侧两列'+
-    '击球真值、右侧两列拍面yaw 同锚）：取 /bot_state 瞬时值——车控 accept AprilTag 定位后 yaw 由 '+
+    '击球真值、右侧两列拍面yaw,pitch 同锚）：取 /bot_state 瞬时值——车控 accept AprilTag 定位后 yaw 由 '+
     'IMU 连续更新、HT 结束后才重定位，故采样点无重定位台阶，挥拍位姿伪迹只塌陷位置不动 yaw。'+
-    '悬停看 IMU yaw_speed 换算的 10ms 时序灵敏度，以及右侧拍面yaw@臂最后更新HT 列所减的 '+
+    '悬停看 IMU yaw_speed 换算的 10ms 时序灵敏度，以及右侧拍面yaw,pitch@臂最后更新HT 列所减的 '+
     'PC AprilTag 挥拍前窗圆均值对照">'+
     '车yaw@臂最后更新HT(°)</th>'+
-    '<th>拍面yaw@臂最后更新HT(°,世界系)</th><th>拍面yaw@臂最后更新HT−10ms(°,世界系)</th>'+
+    '<th title="拍面法向（FK link6 +X）的世界 yaw / pitch，同一份冲击前窗[−80,−6]ms 线性拟合。'+
+    'yaw=face_yaw−车yaw（车侧取挥拍前圆均值）；pitch=asin(n_z) 不减车yaw——J1/BASE_ROT 纯 z 转'+
+    '不动 n_z，臂系 pitch≡世界 pitch，正=开面上仰。悬停看两个角速度：ψ̇ 几百°/s（时序敏感），'+
+    'θ̇≈0（挥拍是近水平圆弧，pitch 冻结、对时序免疫）">'+
+    '拍面yaw,pitch@臂最后更新HT(°,世界系)</th>'+
+    '<th title="同左列同一份拟合，只把取值时刻挪到 HT−10ms（落在窗内，纯插值）：与左列之差就是'+
+    '10ms 时序误差能造成多大拍面角偏差——yaw 上是 ψ̇×10ms（度级），pitch 上≈0">'+
+    '拍面yaw,pitch@臂最后更新HT−10ms(°,世界系)</th>'+
     '<th>PC回球 yaw/俯仰(°)</th><th>消息</th><th>备注</th></tr></thead>'+
     '<tbody>'+rows.join('')+'</tbody></table>'+
     '<div style="font-size:11px;color:#a0a0c0;margin:2px 0 6px">'+notes.join('；')+'。</div></div>';
