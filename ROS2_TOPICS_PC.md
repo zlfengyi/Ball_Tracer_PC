@@ -94,7 +94,7 @@ PC 侧 AprilTag 多目定位成功后发布的小车位置结果。
 
 PC 主进程不再订阅任何 topic。整个局域网的 topic（RK 球轨迹/预测、底盘、
 `/joint_states`、`/tennis/*` 等）由独立的 **rosbag 录制进程**（`src/rosbag_recorder.py`，
-tracker 启动时自动拉起）全量录制到 `tracker_output/{run_id}_rosbag/`，事后经
+tracker 启动时自动拉起）全量录制到 `tracker_output/{run_id}/{run_id}_rosbag/`，事后经
 `test_src/extract_arm_bag.py` / `test_src/extract_rk_tracking_bag.py` 提取供报告使用。
 
 ## 历史桥接脚本说明

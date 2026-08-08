@@ -24,10 +24,12 @@
   python run_tracker.py [--duration 60] [--no-video] [--output-dir tracker_output]
                         [--display] [--ros2-mode auto|direct|bridge|off]
 
-输出文件（存放在 tracker_output/ 下）：
+输出文件（每个 session 一个子目录 tracker_output/tracker_YYYYMMDD_HHMMSS/，
+run 产物与后处理产物全部落在该目录内）：
   tracker_YYYYMMDD_HHMMSS.avi     — 原始拼接视频（半分辨率）
   tracker_YYYYMMDD_HHMMSS.json    — 观测、预测、状态变化等完整日志
   tracker_YYYYMMDD_HHMMSS_rosbag/ — ros2 bag（局域网全部 ROS topic 录制）
+停止文件 .stop_tracker 仍固定在 tracker_output/ 根目录。
 """
 
 from __future__ import annotations
@@ -1542,11 +1544,13 @@ def main() -> int:
     args = parser.parse_args()
     save_logs = not args.no_log
 
-    output_dir = Path(args.output_dir)
-    if save_logs or not args.no_video:
-        output_dir.mkdir(parents=True, exist_ok=True)
+    output_root = Path(args.output_dir)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     run_id = f"tracker_{ts}"
+    # 每个 session 一个子目录：tracker_output/tracker_YYYYMMDD_HHMMSS/
+    output_dir = output_root / run_id
+    if save_logs or not args.no_video:
+        output_dir.mkdir(parents=True, exist_ok=True)
     json_path = output_dir / f"{run_id}.json"
 
     # ── 加载追踪配置 ──────────────────────────────────────────────────────
@@ -2005,7 +2009,8 @@ def main() -> int:
 
         # ── 信号处理（确保被终止时也能保存数据）──
         _shutdown = threading.Event()
-        _stop_file = output_dir / '.stop_tracker'
+        # stop 文件固定在输出根目录（外部工具约定路径，不随 session 子目录走）
+        _stop_file = output_root / '.stop_tracker'
         _stop_file.unlink(missing_ok=True)  # 清除上次残留
 
         def _signal_handler(sig, frame):

@@ -1684,21 +1684,10 @@ const rk300TableHtml = () => {
       ? tableSigned((th.ref300CarX-runEnd.x)*100)+'/'+tableSigned((th.ref300CarY-runEnd.y)*100)
       : '—';
     const accHt=accepted&&isNum(accepted.wht)?accepted.wht-RK.t0:null;
-    const tcp=accHt!=null?tcpAt(accHt):null;
-    const acceptedTarget=accepted?tableXz(accepted.wx,accepted.wz):'—';
-    const tcpWorld=tcp?[tcp[0],tcp[1],tcp[2]-(isNum(armZOff)?armZOff:0)]:null;
-    const tcpCell=tcpWorld?tableXyz(tcpWorld[0],tcpWorld[1],tcpWorld[2]):tableFmt(null,4);
-    const tcpAcceptedDx=accepted&&tcpWorld&&isNum(accepted.wx)?(tcpWorld[0]-accepted.wx)*100:null;
-    const tcpAcceptedDz=accepted&&tcpWorld&&isNum(accepted.wz)?(tcpWorld[2]-accepted.wz)*100:null;
-    const tcpAcceptedError=tableSigned(tcpAcceptedDx)+'/'+tableSigned(tcpAcceptedDz);
-    // PC真值@accepted HT：与左侧 @HT300 列同一套入弧拟合真值（x/y=拟合球世界−同时刻车世界、
-    // z=世界高度），只把评估时刻换成臂最后一条 accepted 的原消息 ht（原始值，不减臂内提前量，
-    // 与 TCP@accepted HT 同锚）。两列之差 = 真值本身在这段 ht 差里移动了多少（球速≈10m/s 时
-    // 1ms≈10mm）。挥拍中 ht 重定相生效时臂实际执行的是臂最后更新HT，与本列锚点之差见 Δht 重定相列。
-    const truthAcc=accHt!=null?pcTruthAt(rkToPc(accHt)):null;
     // 臂最后更新 HT：臂真正受理的最后一条 /predict_hit_pos 的原始 ht——挥拍窗内 ht 重定相
-    // 生效时就是那条 late ht saved 的 ht，否则退回最后一条 accepted 的 ht。两列拍面 yaw,pitch
-    // 都锚在它上面（不减臂内 HIT_TIME_ADVANCE_SEC，本场自标定值见表下注记；右列固定再减 10ms 取值）。
+    // 生效时就是那条 late ht saved 的 ht，否则退回最后一条 accepted 的 ht。全表空间量列
+    // （PC真值/TCP/球面y−车y/击球点@300/车yaw/两列拍面 yaw,pitch）统一锚在它上面
+    // （不减臂内 HIT_TIME_ADVANCE_SEC，本场自标定值见表下注记；拍面右列固定再减 10ms 取值）。
     const finalHt=accepted&&isNum(accepted.finalHt)?accepted.finalHt-RK.t0:accHt;
     const rsw=accepted?accepted.reswing:null;
     const htSrcNote=rsw
@@ -1706,6 +1695,49 @@ const rk300TableHtml = () => {
           ? '；HT源=挥拍中重定相后的最后一条late ht saved（老触球'+tableSigned(rsw.delta)+'ms）'
           : '；重定相因剩余'+(rsw.remain*1000).toFixed(0)+'ms<60ms放弃，HT源退回最后一条accepted')
       : '；HT源=最后一条accepted（本拍无挥拍窗内更新）';
+    const acceptedTarget=accepted?tableXz(accepted.wx,accepted.wz):'—';
+    const carYawAcc=finalHt!=null?botYawDegAt(finalHt):null;
+    const carYawRate=finalHt!=null?imuYawRateDegAt(finalHt):null;
+    // TCP−车心@臂最后更新HT（世界轴）：FK TCP 是臂系值，臂基≡车心（0标恒等式），臂系 x/y 按该
+    // 时刻车 yaw（/bot_state 瞬时值，IMU 连续更新无重定位台阶）旋到世界轴、z−armZOff 还原世界
+    // 高度，即拍心相对车中心的世界轴偏移——与左列 PC真值(球−车,世界轴) 同轴同基准，两列相减≈拍−球。
+    // 未加 rel_x 合同里的手写 +0.04 臂基x补偿。azimuth 口径 atan2(x,y)：世界θ=臂系θ−车yaw。
+    const tcp=finalHt!=null?tcpAt(finalHt):null;
+    const tcpYawRad=(carYawAcc!=null?carYawAcc:0)*Math.PI/180;
+    const tcpWorld=tcp?[tcp[0]*Math.cos(tcpYawRad)-tcp[1]*Math.sin(tcpYawRad),
+                        tcp[0]*Math.sin(tcpYawRad)+tcp[1]*Math.cos(tcpYawRad),
+                        tcp[2]-(isNum(armZOff)?armZOff:0)]:null;
+    const tcpCell=tcpWorld
+      ? '<span title="'+tableEsc('臂系FK TCP=('+tcp[0].toFixed(4)+', '+tcp[1].toFixed(4)+', '
+          +tcp[2].toFixed(4)+')m @臂最后更新HT '+rkToPc(finalHt).toFixed(3)+'s（原始ht，未减臂内提前量）'
+          +'；按车yaw ψ='+(carYawAcc!=null?tableSigned(carYawAcc)+'°':'—（该时刻无/bot_state，按0°）')
+          +' 旋到世界轴（xw=x·cosψ−y·sinψ、yw=x·sinψ+y·cosψ）、z−臂系z偏移'
+          +(isNum(armZOff)?armZOff.toFixed(3):'0')+'m 还原世界高度'
+          +'；臂基≡车心（0标恒等式），故本列=拍心TCP−车中心的世界轴偏移，与左列PC真值(球−车)'
+          +'同轴同基准，两列相减≈拍−球；未加 rel_x 手写+0.04 臂基x补偿'+htSrcNote)+'">'
+          +tableXyz(tcpWorld[0],tcpWorld[1],tcpWorld[2])+'</span>'
+      : tableFmt(null,4);
+    // TCP−accepted目标（世界轴）：目标侧 dx 取该 accepted 消息自带的 世界x−car_pred_x（与 lead 表
+    // accepted−PC、击球点@300 列同一约定，不掺 rel_x 手写+0.04）、dz 取 rel_z(≡世界z)。
+    // 两侧同为世界轴、各自相对自家车心；dz 与老口径臂系伺服差恒等（z 不随 yaw 转）。
+    const tgtWx=accepted&&isNum(accepted.wxw)&&isNum(accepted.wcarx)?accepted.wxw-accepted.wcarx:null;
+    const tcpAcceptedDx=(tcpWorld&&tgtWx!=null)?(tcpWorld[0]-tgtWx)*100:null;
+    const tcpAcceptedDz=accepted&&tcpWorld&&isNum(accepted.wz)?(tcpWorld[2]-accepted.wz)*100:null;
+    const tcpServoDx=(tcp&&accepted&&isNum(accepted.wx))?(tcp[0]-accepted.wx)*100:null;
+    const tcpAcceptedError=(tcpAcceptedDx!=null||tcpAcceptedDz!=null)
+      ? '<span title="'+tableEsc('世界轴，各自相对自家车心：dx=TCP世界x−(accepted消息世界x−car_pred_x'
+          +(tgtWx!=null?('='+tgtWx.toFixed(4)+'m）'):'）——老bag缺世界x/car_pred_x字段，dx无值')
+          +'、dz=TCP世界z−rel_z(≡世界z)；目标不随挥拍中重定相变（后续消息只存触球时刻不换目标），'
+          +'TCP取臂最后更新HT，即臂真正击球时刻拍心是否到位'
+          +(tcpServoDx!=null?('；老口径臂系伺服差 dx=tcp_x−rel_x='+tableSigned(tcpServoDx)
+            +'cm（dz两口径恒等），世界差−伺服差=车yaw旋转泄漏+手写+0.04补偿的实物归属'):'')
+          +htSrcNote)+'">'
+          +tableSigned(tcpAcceptedDx)+'/'+tableSigned(tcpAcceptedDz)+'</span>'
+      : tableSigned(null)+'/'+tableSigned(null);
+    // PC真值@臂最后更新HT：与左侧 @HT300 列同一套入弧拟合真值（x/y=拟合球世界−同时刻车世界、
+    // z=世界高度），评估时刻=臂最后更新HT（原始值不减臂内提前量，与 TCP 列同锚）。两列之差 =
+    // 真值在 HT300→臂最后更新HT 这段里真实移动了多少（球速≈10m/s 时 1ms≈10mm）。
+    const truthAcc=finalHt!=null?pcTruthAt(rkToPc(finalHt)):null;
     const faceYaw=faceAnglesWorldAt(finalHt);
     const faceYawCell=faceYaw
       ? '<span title="'+tableEsc('臂系FK face_yaw='+tableSigned(faceYaw.fy)+'°（冲击前窗['
@@ -1737,8 +1769,6 @@ const rk300TableHtml = () => {
     // HT 结束后才用 AprilTag 重定位，故 HT 前采样点无重定位台阶；挥拍位姿伪迹只塌陷位置不动 yaw。
     // 悬停给 IMU yaw_speed（零滞后）换算的 10ms 时序灵敏度，以及 PC AprilTag 挥拍前窗圆均值对照
     // ——那正是右侧「拍面yaw,pitch@臂最后更新HT」列的 yaw 里减掉的车 yaw，两者之差即两列口径差的车侧来源。
-    const carYawAcc=finalHt!=null?botYawDegAt(finalHt):null;
-    const carYawRate=finalHt!=null?imuYawRateDegAt(finalHt):null;
     const carYawCell=carYawAcc!=null
       ? '<span title="'+tableEsc('/bot_state yaw@臂最后更新HT '+rkToPc(finalHt).toFixed(3)+'s（PC轴，'
           +'臂受理的最后一条预测的原始 ht，未减臂内提前量）：AprilTag accept 后由 IMU 连续更新，'
@@ -1882,21 +1912,21 @@ const rk300TableHtml = () => {
       '<td>'+info+'</td><td class="armTblNote"><div>'+rejectNote+'</div></td></tr>';
   });
   const notes=[
-    '每行RK ct、x/z、n_fit、lead 严格来自同一条S1消息：在该抛所有正提前量S1中选择 |(HT−ct)−300ms| 最小者；RK@≈300ms x/z 列为该消息 rel_x/rel_z（臂端合同值，车体系、x含偏置），仅此列与accepted目标/TCP列保留车体系',
-    '击球真值两列（2026-08-05 起：原「HT真实(触球)」与「HT err@300」两列删除，第三个 ht 不再单列，误差全部改在空间上量）共用同一份 RK 全量无污染真值——球取该抛 S1 期 RK 球世界观测（z≥0.15、[该抛RK最终HT−450,−25]ms 窗）三轴二次拟合、按主运动轴 y 做 3σ 剔污染后 x/z 复用同一批点，车取 bot 位姿挥拍前[−160,−28]ms 窗 x/y 线性外推（避开挥拍瞬间 bot_y 塌陷伪迹），车中心 z≡地面0（/bot_state 无 z，实测消息 rel_z 恒等球世界z）；三条曲线都不含任何预测量，评估时刻统一取**臂最后更新HT**（= 臂受理的最后一条 /predict_hit_pos 的原始 ht，重定相生效时就是被消费的那条 late ht saved，即臂真正执行的击球时刻，与右侧两列拍面yaw,pitch同锚）——注意与 PC真值/TCP/车yaw 那三列的「accepted HT」锚点不同，后者是最后一条 accepted 的原消息 ht，两者之差就是 Δht 重定相列',
+    '每行RK ct、x/z、n_fit、lead 严格来自同一条S1消息：在该抛所有正提前量S1中选择 |(HT−ct)−300ms| 最小者；RK@≈300ms x/z 列为该消息 rel_x/rel_z（臂端合同值，车体系、x含偏置），仅此列与accepted目标列保留车体系（TCP列 0807 起已按车yaw转世界轴）',
+    '击球真值两列（2026-08-05 起：原「HT真实(触球)」与「HT err@300」两列删除，第三个 ht 不再单列，误差全部改在空间上量）共用同一份 RK 全量无污染真值——球取该抛 S1 期 RK 球世界观测（z≥0.15、[该抛RK最终HT−450,−25]ms 窗）三轴二次拟合、按主运动轴 y 做 3σ 剔污染后 x/z 复用同一批点，车取 bot 位姿挥拍前[−160,−28]ms 窗 x/y 线性外推（避开挥拍瞬间 bot_y 塌陷伪迹），车中心 z≡地面0（/bot_state 无 z，实测消息 rel_z 恒等球世界z）；三条曲线都不含任何预测量，评估时刻统一取**臂最后更新HT**（= 臂受理的最后一条 /predict_hit_pos 的原始 ht，重定相生效时就是被消费的那条 late ht saved，即臂真正执行的击球时刻）——0807 起全表空间量列（PC真值@臂最后更新HT/TCP/车yaw/两列拍面yaw,pitch）同此锚，与最后一条 accepted 原消息 ht 之差见 Δht 重定相列',
     '球面y−车y @臂最后更新HT(mm) = 时序误差的空间形态：dy=(球心y−R球33mm)−车y，车y面≡拍面（RK rel_y 无臂基y补偿），故 dy=0 即球面刚够到拍面=真实触球，正=那一刻球还没够到(ht 偏早)、负=已穿过(ht 偏晚)，含车未到位造成的顺延与球半径项；悬停给等效时序 dy/v_rel（正=偏晚，与旧 HT err@300 同向）、闭合速度、球/车两侧拟合明细与车−冻结面偏移',
     '击球点@300预测 − RK全量真值@臂最后更新HT dx/dz(mm，世界轴) = 该抛 S1@≈300ms 那条消息预测的击球点 (x,z) − 上一条所述那份 RK 全量真值在臂最后更新HT 上的球心 (x,z)（与左列「球面y−车y」同一份拟合、同一个取值时刻，只是取 x/z 分量）：预测侧取消息自带的世界 x 减同条消息的 car_pred_x、z 取 rel_z（车中心 z≡地面0、yaw 不转 z，故 rel_z 即世界 z），真值侧取球心x−车实际x 与球心z——两侧同轴同基准，既不含车体系↔世界轴的 yaw 旋转项，也不含 rel_x 里那个手写 +0.04 偏置；正=预测点落在真实球位的 +x 侧/上方，即臂被瞄偏的方向。无 accepted、观测不足、评估点离该抛拟合窗>300ms 或该抛无 S1@≈300ms 参考消息时显示—',
     '车RUN末帧取与该抛最终HT最近且相差不超过100ms的正常RUN→BRAKE_IN_SWING转换前最后一条/bot_state，并与抛球一对一匹配；差值=(target_x−x)/(target_y−y)，RK世界系，单位cm；未匹配或异常退出显示—',
     'RK@≈300ms预测车取本行同一条S1 /predict_hit_pos的car_pred_x/y，即该消息预测的HT时刻车世界位置；误差=预测车−RUN末帧实际车，单位cm',
-    'PC真值两列（@HT300 / @accepted HT）只差评估时刻，公式完全相同：@HT300 锚在本行那条 |lead−300ms| 最小的 S1 消息的 ht，@accepted HT 锚在臂最后一条 accepted 的原消息 ht（原始值不减臂内提前量，与 TCP@accepted HT 同锚）；故两列之差就是球在这段 ht 差里真实移动的位移（球速≈10m/s 时 1ms≈10mm），不是精度差。无 accepted 或该时刻入弧观测不足时显示—；挥拍中 ht 重定相生效时臂最终执行的是「臂最后更新HT」，与本列锚点差值见 Δht 重定相列',
+    'PC真值两列（@HT300 / @臂最后更新HT）只差评估时刻，公式完全相同：@HT300 锚在本行那条 |lead−300ms| 最小的 S1 消息的 ht，另一列锚在臂最后更新HT——臂真正执行的击球时刻（重定相生效=被消费的那条 late ht saved 的原始 ht，否则=最后一条 accepted 的原始 ht；不减臂内提前量，与 TCP 列同锚）；故两列之差就是球在这段 ht 差里真实移动的位移（球速≈10m/s 时 1ms≈10mm），不是精度差。无 accepted 或该时刻入弧观测不足时显示—',
     'RK≈300ms字段不回退到最终RK消息；机械臂两列独立回配该抛最后一条accepted原消息',
-    '机械臂目标取该accepted消息的原始RK rel_x/rel_z；TCP取该消息自身HT时刻的FK state插值，z按机械臂偏移还原世界系；无accepted或HT无state覆盖时显示—',
+    '机械臂目标取该accepted消息的原始RK rel_x/rel_z（车体系合同值）；TCP取臂最后更新HT时刻的FK state插值，臂系x/y按该时刻/bot_state yaw旋到世界轴（臂基≡车心0标恒等式）、z按机械臂偏移还原世界系，即拍心−车中心世界轴偏移；TCP−accepted 的 dx 目标侧用同条消息的世界x−car_pred_x（不掺rel_x手写+0.04）、dz用rel_z(≡世界z)，悬停有老口径臂系伺服差对照；无accepted或HT无state覆盖时显示—，老bag缺世界x字段时dx显示—',
     '最后更新−挥拍起(ms) = 臂真正受理的最后一条 /predict_hit_pos 到达时刻 − 挥拍段起点(老触球−HIT_T 0.25s)：2026-08-03 arm_controller 上线「挥拍中 ht 重定相」后，挥拍窗内到达的预测不再拒收（status `late ht saved`），只存触球时刻，到老触球−100ms 一次性重建挥拍段（剩余<60ms 放弃）；故本列正值=最后一次更新发生在挥拍开始之后，绝对值即挥拍开始后还吃进了多久的新预测。悬停可见最后更新/挥拍起/最后accepted 三个绝对时刻、重定相触发时刻与新老触球时刻及是否生效',
     '盲区 ht−ct@臂最后更新(ms) = 臂最终执行的那条 /predict_hit_pos 的 ht−ct：ct 是喂给预测器的最晚一颗球的观测时刻、ht 是它算出的击球时刻，这段时间里预测纯外推、没有任何新观测进来，故称盲区；与左侧主表的 lead(ms) 不同——那个是该抛 S1@≈300ms 那条参考消息的提前量，这里是最终生效的那条。重定相生效时 ct/ht 同取被消费的那条 late ht saved（必须同源，回配失配则整条退回最后一条 accepted）',
     'Δht 重定相(ms) = 挥拍时用的 ht（最后一条 accepted 的原消息 ht）→ 挥拍中重定相更新后的 ht，正=新预测把击球点推晚；两者都是原始 ht，各减臂内 10ms 后即新老触球时刻，差值等价。灰字 (未采纳) = 新触球距触发点不足 SWING_HT_UPDATE_MIN_REMAINING_SEC=60ms，控制器放弃重定相、实际仍走老时间轴，显示的是候选值；— = 挥拍窗内没有新预测到达。注意重建挥拍段是「从当前命令帧在剩余时间内重规划」，即使 Δht 只有几 ms，指令加速度与触球拍速也会跟着变（触球拍速是派生量）',
     '臂最后更新HT = 臂受理的最后一条 /predict_hit_pos 的**原始 ht**（不减臂内 HIT_TIME_ADVANCE_SEC）：重定相生效时取被消费的那条 late ht saved 的 ht（挥拍窗内最后一条，触发 tick 之后一律 reject hit phase in progress），否则退回最后一条 accepted 的 ht；late ht saved 状态本身只有 duration，其 ht 由 /predict_hit_pos↔/tennis/status 顺序一对一回配得到，并按 t+duration+提前量≈ht 自校验（失配显示—）',
     armConstNote,
-    '车yaw@臂最后更新HT(°) = 该时刻 /bot_state yaw 瞬时值（线性插值，容差50ms），锚点同左侧两列击球真值与右侧两列拍面yaw,pitch（臂受理的最后一条预测的原始 ht，未减臂内提前量；不是 PC真值/TCP 两列用的 accepted HT，两锚之差见 Δht 重定相列）：车控 accept AprilTag 定位后 yaw 由 IMU 连续更新、HT 结束后才用 AprilTag 重定位，故 HT 前采样点无重定位台阶；挥拍瞬间的位姿伪迹只塌陷 bot 位置、不动 yaw。悬停给该时刻 IMU yaw_speed（/chassis_can/imu 原值，零滞后）及其 10ms 时序等效 yaw 偏差，并对照右侧「拍面yaw,pitch@臂最后更新HT」列的 yaw 减掉的 PC AprilTag 挥拍前窗圆均值——两者之差就是那一列与 HT−10ms 列口径差的车侧来源（注意 bot_state yaw 本身有 0.3~0.5s 滤波滞后，只可读瞬时角，切勿对它数值求导当角速度）',
+    '车yaw@臂最后更新HT(°) = 该时刻 /bot_state yaw 瞬时值（线性插值，容差50ms），锚点同两列击球真值、PC真值/TCP 两列与右侧两列拍面yaw,pitch（0807 起全表空间量列统一锚臂最后更新HT——臂受理的最后一条预测的原始 ht，未减臂内提前量）：车控 accept AprilTag 定位后 yaw 由 IMU 连续更新、HT 结束后才用 AprilTag 重定位，故 HT 前采样点无重定位台阶；挥拍瞬间的位姿伪迹只塌陷 bot 位置、不动 yaw。悬停给该时刻 IMU yaw_speed（/chassis_can/imu 原值，零滞后）及其 10ms 时序等效 yaw 偏差，并对照右侧「拍面yaw,pitch@臂最后更新HT」列的 yaw 减掉的 PC AprilTag 挥拍前窗圆均值——两者之差就是那一列与 HT−10ms 列口径差的车侧来源（注意 bot_state yaw 本身有 0.3~0.5s 滤波滞后，只可读瞬时角，切勿对它数值求导当角速度）',
     '拍面yaw,pitch@臂最后更新HT（世界系）= 同一份冲击前窗[−80,−6]ms 线性拟合（完整FK，extract_arm_bag.fk 单源，拍面法向=link6 +X 前向规范化）外推到臂最后更新HT（避开 J5 冲击突跳污染）的两个角：**yaw** = face_yaw(atan2(n_x,n_y)) − 车yaw，车yaw取挥拍前0.45~0.15s窗圆均值（避开挥拍位姿伪迹），口径同PC回球yaw，纯FK不含δ6球侧偏置；**pitch** = asin(n_z)（正=开面上仰）**不减车yaw**——J1 与 BASE_ROT 都是纯 z（垂直）转，只搬 n 的水平分量、不动 n_z，故臂系 pitch ≡ 世界 pitch（车无 roll/pitch 前提），比 yaw 少一个车侧误差源。悬停给两路角速度：ψ̇ 常达几百°/s，θ̇ 只有个位数°/s（挥拍是近水平圆弧，法向在 yaw 里飞扫、在 pitch 里冻结）⇒ pitch 通道对时序误差天然免疫，别把 yaw 的时序结论套到 pitch 上',
     '拍面yaw,pitch@臂最后更新HT−10ms（世界系）：同款冲击前窗[−80,−6]ms线性拟合改在HT−10ms处取值（落在窗内，纯插值）。HT−10ms 是**固定探针**不随臂内提前量走：0803及以前臂内瞄准的正是 ht−10ms（提前量10/15ms），2026-08-04 起提前量归零、臂瞄准原始 ht，本列改读「接触起始附近」（roundtrip 实测触始=ht−5.3ms）并兼作时序敏感度探针——与左列之差 = 角速度×10ms，即 10ms 时序误差能造成多大拍面角偏差：yaw 上是度级（ψ̇×10ms），pitch 上≈0（θ̇×10ms，实测 0805 场 10 抛全在 0.06° 内）；车yaw直接取该时刻/bot_state yaw——车控接受AprilTag定位后yaw由IMU连续更新，HT结束后才用AprilTag重定位更新bot_state，故采样点无重定位台阶；ψ=face_yaw−车yaw，pitch 同左列不减车yaw',
     '备注仅在该抛没有机械臂accepted时显示回配到该抛时间窗的reject hit原因，并合并同类原因计数',
@@ -1909,11 +1939,17 @@ const rk300TableHtml = () => {
     '<th>RK@≈300ms x/z(m)</th><th>车RUN末帧 目标−实际 dx/dy(cm)<br>(RK世界系)</th>'+
     '<th>RK@≈300ms预测车@HT−RUN末实际 dx/dy(cm)<br>(RK世界系)</th><th>机械臂最后accepted目标 x/z(m)</th>'+
     '<th>PC真值@HT300 x/y/z(m)</th>'+
-    '<th title="与左列同一套入弧拟合真值，只把评估时刻换成臂最后一条 accepted 的原消息 ht'+
-    '（原始 ht，未减臂内提前量，与右侧 TCP 列同锚）。两列之差=真值随 ht 变化移动的量'+
-    '（球速≈10m/s 时 1ms≈10mm）；重定相生效时臂实际执行的是臂最后更新HT，差值见 Δht 重定相列">'+
-    'PC真值@accepted HT x/y/z(m)</th>'+
-    '<th>TCP@accepted HT x/y/z(m)</th><th>TCP−accepted dx/dz(cm)</th>'+
+    '<th title="与左列同一套入弧拟合真值，只把评估时刻换成臂最后更新HT——臂真正执行的击球时刻'+
+    '（重定相生效=被消费的那条 late ht saved 的原始 ht，否则=最后一条 accepted 的原始 ht；'+
+    '未减臂内提前量，与右侧 TCP 列同锚）。两列之差=真值随 ht 变化移动的量'+
+    '（球速≈10m/s 时 1ms≈10mm）">'+
+    'PC真值@臂最后更新HT x/y/z(m)</th>'+
+    '<th title="FK TCP 臂系 x/y 按该时刻车yaw（/bot_state 瞬时值）旋到世界轴、z−armZOff 还原世界'+
+    '高度；臂基≡车心（0标恒等式），即拍心−车中心的世界轴偏移，与左列 PC真值(球−车) 同轴同基准，'+
+    '两列相减≈拍−球。悬停看臂系原值与旋转明细">TCP−车心@臂最后更新HT x/y/z(m,世界轴)</th>'+
+    '<th title="TCP(世界轴,rel实际车心)@臂最后更新HT − accepted目标(世界轴,rel car_pred)：'+
+    'dx 目标侧=该消息世界x−car_pred_x（不掺 rel_x 手写+0.04），dz=rel_z(≡世界z)；'+
+    '目标不随挥拍中重定相变。悬停对照老口径臂系伺服差">TCP−accepted dx/dz(cm,世界轴)</th>'+
     '<th title="臂受理的最后一条 /predict_hit_pos 到达时刻 − 挥拍段起点(老触球−HIT_T 0.25s)；'+
     '正=更新落在挥拍开始之后（0803 起挥拍窗内不再拒收，这些消息就是 ht 重定相的养料）。'+
     '悬停看两个绝对时刻与重定相是否生效">最后更新−挥拍起<br>(ms)</th>'+

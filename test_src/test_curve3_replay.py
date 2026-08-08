@@ -4,7 +4,7 @@
 逐帧喂给 Curve3Tracker，生成相同格式的 JSON 并调用 HTML 可视化。
 
 用法：
-  python test_curve3_replay.py --input tracker_output/tracker_20260227_124452.json
+  python test_curve3_replay.py --input tracker_output/tracker_20260227_124452/tracker_20260227_124452.json
                                [--ideal-hit-z 500] [--cor 0.75] [--cor-xy 0.45]
                                [--motion-window 0.2] [--motion-min-y 500]
                                [--no-html]

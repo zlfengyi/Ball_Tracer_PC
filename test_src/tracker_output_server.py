@@ -43,14 +43,17 @@ a.f small{{display:block;color:#a0a0c0;font-size:12px;margin-top:4px}}
 
 
 def _index() -> str:
-    files = sorted(ROOT.glob("tracker_*.html"), key=lambda p: p.stat().st_mtime, reverse=True)
+    # 布局：每 session 一个子目录 tracker_*/tracker_*.html；根目录平铺为历史遗留
+    candidates = list(ROOT.glob("tracker_*.html")) + list(ROOT.glob("tracker_*/tracker_*.html"))
+    files = sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)
     items = []
     for p in files:
         st = p.stat()
         mtime = datetime.fromtimestamp(st.st_mtime).strftime("%m-%d %H:%M")
         size_mb = st.st_size / 1e6
+        rel = p.relative_to(ROOT).as_posix()
         items.append(
-            f'<a class="f" href="/{html.escape(p.name)}">{html.escape(p.stem)}'
+            f'<a class="f" href="/{html.escape(rel)}">{html.escape(p.stem)}'
             f"<small>{mtime} · {size_mb:.1f} MB</small></a>"
         )
     return PAGE.format(count=len(files), now=datetime.now().strftime("%H:%M:%S"),
@@ -64,8 +67,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "text/html; charset=utf-8", _index().encode("utf-8"))
             return
         name = path.lstrip("/")
-        # 只允许 tracker_output 下的单层文件名，拒绝路径穿越
-        if not re.fullmatch(r"[\w.\-]+", name):
+        # 只允许 tracker_output 下最多一层子目录的文件名，拒绝路径穿越
+        if not re.fullmatch(r"[\w.\-]+(?:/[\w.\-]+)?", name) or ".." in name:
             self._send(404, "text/plain; charset=utf-8", b"not found")
             return
         target = ROOT / name

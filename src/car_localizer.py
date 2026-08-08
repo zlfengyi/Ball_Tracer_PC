@@ -82,6 +82,8 @@ class CarLoc:
     yaw: float                     # 底盘绕 z 轴旋转角 (rad)
     yaw_valid: bool                # 双 tag 或 3+ 相机、且四角误差合格才允许修正底盘 yaw
     tag_ids: list[int] = field(default_factory=list)  # 参与最终拟合的全部 tag
+    # 参与最终拟合的各 (相机, tag) 检测角点 {序列号: {tag_id: (4,2) 像素}}，供离线叠加画识别框
+    corners_px: dict[str, dict[int, np.ndarray]] = field(default_factory=dict)
 
 
 @dataclass
@@ -332,9 +334,11 @@ class CarLocalizer:
         )
 
         pixels: dict[str, tuple[float, float]] = {}
+        corners_px: dict[str, dict[int, np.ndarray]] = {}
         for sn, tag_id, det in units:
             if sn not in pixels or tag_id == primary_tag:
                 pixels[sn] = (det.cx, det.cy)
+            corners_px.setdefault(sn, {})[tag_id] = det.corners
 
         return CarLoc(
             x=float(pose[0]) * _WORLD_SCALE_M_PER_MM,
@@ -351,6 +355,7 @@ class CarLocalizer:
                 and (len(tag_ids) >= 2 or len(cameras_used) >= 3)
             ),
             tag_ids=tag_ids,
+            corners_px=corners_px,
         )
 
     def estimate_pose(

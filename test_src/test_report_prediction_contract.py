@@ -450,10 +450,11 @@ def test_ball_car_gap_measured_at_given_time_and_rejects_pollution(tmp_path):
 def test_main_pc_truth_uses_rk_ht_and_accepted_uses_own_ht():
     source = SRC.read_text(encoding="utf-8")
     assert "const truth=pcTruthAt(htPc);" in source
-    # 0805 起：全量RK重估的第三个 ht 不再单列，击球误差改成 accepted HT 上的两列空间量——
+    # 0805 起：全量RK重估的第三个 ht 不再单列，击球误差改成两列空间量——
     # dy 是时序误差的空间形态，dx/dz 是 @300 预测击球点与真值的落点差（两侧同轴同基准）
-    # 两列都锚在「臂最后更新HT」= 臂真正执行的击球时刻（重定相生效时是那条 late ht saved），
-    # 不是 PC真值/TCP/车yaw 三列用的 accepted HT——两个锚之差就是 Δht 重定相列
+    # 0807 起全表空间量列（PC真值/TCP/车yaw/拍面yaw,pitch/这两列）统一锚「臂最后更新HT」
+    # = 臂真正执行的击球时刻（重定相生效时是那条 late ht saved），
+    # 与最后一条 accepted 原消息 ht 之差就是 Δht 重定相列
     assert "const gapFin=finalHt!=null?ballCarGapForThrow(th,finalHt):null;" in source
     assert "球面y−车y @臂最后更新HT<br>(mm, RK全量真值)</th>" in source
     assert "击球点@300预测 − RK全量真值@臂最后更新HT<br>dx/dz(mm, 世界轴)</th>" in source
@@ -467,8 +468,8 @@ def test_main_pc_truth_uses_rk_ht_and_accepted_uses_own_ht():
     assert "const truth=pcTruthAt(accHtPc);" in source
     assert "<td>'+pcTruthCell(truth,true)+'</td>" in source
     assert "<td>'+pcTruthCell(truth)+'</td>" in source
-    # 主表第二列 PC 真值：同一套拟合，评估时刻换成臂最后 accepted 的原消息 ht（与 TCP 同锚）
-    assert "const truthAcc=accHt!=null?pcTruthAt(rkToPc(accHt)):null;" in source
+    # 主表第二列 PC 真值：同一套拟合，评估时刻换成臂最后更新HT（臂真正执行的击球时刻，与 TCP 同锚）
+    assert "const truthAcc=finalHt!=null?pcTruthAt(rkToPc(finalHt)):null;" in source
     # 有/无 S1@300 两条渲染路径都要出这一列（该列只依赖 accepted，不依赖 @300 参考消息）
     assert source.count("pcTruthCell(truthAcc,true)") == 2
     # 0803 起已删列：开始触球t/PC球×车相交t/HT−开始触球/HT−PC相交/RK−PC dx/dz/
@@ -486,24 +487,34 @@ def test_main_pc_truth_uses_rk_ht_and_accepted_uses_own_ht():
     assert "hitTableHtml" not in source
 
 
-def test_rk300_table_includes_last_accepted_target_and_tcp_at_accepted_ht():
+def test_rk300_table_includes_last_accepted_target_and_tcp_at_final_ht():
     source = SRC.read_text(encoding="utf-8")
     assert "const accepted=lastAcceptedForThrow(th);" in source
     assert "const accHt=accepted&&isNum(accepted.wht)?accepted.wht-RK.t0:null;" in source
-    assert "const tcp=accHt!=null?tcpAt(accHt):null;" in source
-    assert "const tcpWorld=tcp?[tcp[0],tcp[1],tcp[2]-(isNum(armZOff)?armZOff:0)]:null;" in source
-    assert "const tcpCell=tcpWorld?tableXyz(tcpWorld[0],tcpWorld[1],tcpWorld[2]):tableFmt(null,4);" in source
-    assert "const tcpAcceptedDx=accepted&&tcpWorld&&isNum(accepted.wx)?(tcpWorld[0]-accepted.wx)*100:null;" in source
+    # 0807 起：TCP/PC真值/TCP−accepted 三列锚点由 accepted HT 改为臂最后更新HT（finalHt），
+    # TCP 臂系 x/y 按该时刻 /bot_state yaw 旋到世界轴（臂基≡车心 0标恒等式）、z−armZOff 还原
+    # 世界高度，即拍心−车中心世界轴偏移，与 PC真值(球−车,世界轴) 同轴同基准
+    assert "const tcp=finalHt!=null?tcpAt(finalHt):null;" in source
+    assert "tcpAt(accHt)" not in source
+    assert "const tcpYawRad=(carYawAcc!=null?carYawAcc:0)*Math.PI/180;" in source
+    assert "const tcpWorld=tcp?[tcp[0]*Math.cos(tcpYawRad)-tcp[1]*Math.sin(tcpYawRad)," in source
+    assert "tcp[0]*Math.sin(tcpYawRad)+tcp[1]*Math.cos(tcpYawRad)," in source
+    assert "tcp[2]-(isNum(armZOff)?armZOff:0)]:null;" in source
+    # TCP−accepted：dx 目标侧=同条消息的世界x−car_pred_x（不掺 rel_x 手写+0.04）、dz=rel_z(≡世界z)，
+    # 悬停保留老口径臂系伺服差 tcp_x−rel_x 对照
+    assert "const tgtWx=accepted&&isNum(accepted.wxw)&&isNum(accepted.wcarx)?accepted.wxw-accepted.wcarx:null;" in source
+    assert "const tcpAcceptedDx=(tcpWorld&&tgtWx!=null)?(tcpWorld[0]-tgtWx)*100:null;" in source
     assert "const tcpAcceptedDz=accepted&&tcpWorld&&isNum(accepted.wz)?(tcpWorld[2]-accepted.wz)*100:null;" in source
+    assert "const tcpServoDx=(tcp&&accepted&&isNum(accepted.wx))?(tcp[0]-accepted.wx)*100:null;" in source
     assert "armPredictionMatchesAccepted(p,e.t+RK.t0,rec.tx,rec.tz,dur)" in source
     headers = [
         "<th>车RUN末帧 目标−实际 dx/dy(cm)<br>(RK世界系)</th>",
         "<th>RK@≈300ms预测车@HT−RUN末实际 dx/dy(cm)<br>(RK世界系)</th>",
         "<th>机械臂最后accepted目标 x/z(m)</th>",
         "<th>PC真值@HT300 x/y/z(m)</th>",
-        "PC真值@accepted HT x/y/z(m)</th>",
-        "<th>TCP@accepted HT x/y/z(m)</th>",
-        "<th>TCP−accepted dx/dz(cm)</th>",
+        "PC真值@臂最后更新HT x/y/z(m)</th>",
+        "TCP−车心@臂最后更新HT x/y/z(m,世界轴)</th>",
+        "TCP−accepted dx/dz(cm,世界轴)</th>",
         "最后更新−挥拍起<br>(ms)</th>",
         "盲区 ht−ct@臂最后更新<br>(ms)</th>",
         "Δht 重定相<br>(ms)</th>",
@@ -530,7 +541,7 @@ def test_rk300_table_includes_last_accepted_target_and_tcp_at_accepted_ht():
     assert "视觉球拍" not in source
     assert "visualRacketAt" not in source
     assert "visualRacketCell" not in source
-    # 车yaw@臂最后更新HT 列：/bot_state 瞬时值，锚同两列击球真值与两列拍面yaw（不是 accepted HT）
+    # 车yaw@臂最后更新HT 列：/bot_state 瞬时值，锚同全表其余空间量列（0807 起统一臂最后更新HT）
     assert "const carYawAcc=finalHt!=null?botYawDegAt(finalHt):null;" in source
     assert "const carYawRate=finalHt!=null?imuYawRateDegAt(finalHt):null;" in source
     assert source.count("<td>'+carYawCell+'</td>") == 2
@@ -543,7 +554,11 @@ def test_rk300_table_includes_last_accepted_target_and_tcp_at_accepted_ht():
     assert "ys(RK.bot,'yaw')" in source
     assert "<th>/tennis/status 字符串</th>" not in source
     assert "<th>/predict_hit_pos 字符串</th>" not in source
-    assert "const tcpWorld=tcp?[tcp[0],tcp[1],tcp[2]-(isNum(armZOff)?armZOff:0)]:null;" in source
+    # 旧车体系 TCP 列与 accepted HT 锚点命名不应残留（lead 分表的 PC真值@accepted HT 除外，
+    # 那边评估的是 accepted 消息自身预测质量，锚它自己的 ht 语义正确）
+    assert "const tcpWorld=tcp?[tcp[0],tcp[1],tcp[2]-(isNum(armZOff)?armZOff:0)]:null;" not in source
+    assert "TCP@accepted HT" not in source
+    assert "PC真值@accepted HT x/y/z" not in source
     assert "tableXyz(tcpWorld[0],tcpWorld[1],tcpWorld[2])" in source
     assert "(runEnd.tx-runEnd.x)*100" in source
     assert "(runEnd.ty-runEnd.y)*100" in source

@@ -2,6 +2,11 @@
 """
 离线标注脚本：读取拼接视频 + JSON 数据，生成带标注的视频。
 
+画面标注刻意保持极简（用户反馈：框/数字/标记太多反而看不清）：panel 内只画两种框，
+不带任何文字——网球检测框、车载 AprilTag 识别框（真实检测角点四边形）；回球期间另有
+青色速度矢量箭头（无旁标文字）。球 3D/回球 yaw·pitch·速度仅保留在底部文字行，不写
+车位姿、不画状态角标、不画 RK 目标点标记。
+
 在原有球框/球 3D/curve3 标注之外，还会在离线阶段调用 ArmCalibration 同款的
 `yolo_model/racket.onnx + yolo_model/racket_pose.onnx`，只使用关键点 0-3 的几何中心
 做球拍 2D/3D 定位，并将结果补充回 JSON；视频画面只绘制球拍关键点与几何中心。
@@ -10,20 +15,19 @@
 含贴地球/断档/跳变/地面反弹脏数据过滤），在触球后 400ms 帧区间叠加回球速度矢量
 （RETURN 文字行 + 各相机按标定投影的青色箭头），事件同时写回 JSON pc_return_events。
 
-若同目录存在 <stem>_rk_tracking.json，还会在每次抛球（bot_state target_active）期间
-叠加小车要去的目标点（红圈 TGT）与当前位置（绿点 CAR，PC AprilTag 地面投影）及连线；
-RK 时轴用共享小车位姿锚对齐（同报告 clockAnchor 思路），锚不足时自动跳过。
+若同目录存在 <stem>_rk_tracking.json，会用共享小车位姿锚对齐 RK 时轴（同报告
+clockAnchor 思路，锚不足时自动跳过）并把每次抛球的 target_active 时间段打印到控制台，
+供核对 RK/PC 时轴对齐质量；不在视频画面上叠加目标点标记。
 
 用法：
-  python test_src/annotate_video.py --input tracker_output/tracker_20260311_193455.json
-  python test_src/annotate_video.py --input tracker_output/tracker_20260311_193455.json ^
-      --output tracker_output/tracker_20260311_193455_annotated.avi
+  python test_src/annotate_video.py --input tracker_output/tracker_20260311_193455/tracker_20260311_193455.json
+  python test_src/annotate_video.py --input tracker_output/tracker_20260311_193455/tracker_20260311_193455.json ^
+      --output tracker_output/tracker_20260311_193455/tracker_20260311_193455_annotated.avi
 """
 
 from __future__ import annotations
 
 import argparse
-import bisect
 import json
 import math
 import sys
@@ -53,14 +57,11 @@ BOX_COLORS = [
     (255, 0, 255),     # 紫色 - 4号相机
 ]
 RACKET_BOX_COLOR = (255, 0, 255)
-STATIONARY_BOX_COLOR = (180, 180, 180)
 TEXT_COLOR = (255, 255, 255)
 TEXT_3D_COLOR = (0, 255, 255)
 TEXT_RACKET_3D_COLOR = (255, 0, 255)
 RETURN_COLOR = (255, 255, 0)  # 青色 - 回球速度矢量
-TARGET_COLOR = (0, 0, 255)  # 红色 - 小车要去的目标点（RK bot_state target）
-CAR_MARK_COLOR = (0, 255, 0)  # 绿色 - 小车当前位置（PC AprilTag 地面投影）
-CAR_TGT_LINE_COLOR = (200, 200, 200)
+CAR_TAG_BOX_COLOR = (0, 200, 255)  # 橙黄 - 车载 AprilTag 识别框
 STATE_COLORS = {
     "idle":         (128, 128, 128),
     "tracking_s0":  (255, 200, 0),
@@ -95,39 +96,6 @@ def guess_tracker_video_path(json_path: Path, data: dict) -> Path:
             return candidate_path
 
     return json_path.with_suffix(".avi")
-
-
-def draw_badge(
-    img: np.ndarray,
-    text: str,
-    x: int,
-    y: int,
-    color: tuple[int, int, int],
-    *,
-    font_scale: float = 1.2,
-    thickness: int = 3,
-) -> int:
-    """Draw a high-contrast text badge and return the box right edge."""
-    (text_w, text_h), baseline = cv2.getTextSize(
-        text, FONT, font_scale, thickness
-    )
-    pad_x = 12
-    pad_y = 10
-    box_tl = (x, y)
-    box_br = (x + text_w + pad_x * 2, y + text_h + baseline + pad_y * 2)
-    cv2.rectangle(img, box_tl, box_br, (0, 0, 0), -1)
-    cv2.rectangle(img, box_tl, box_br, color, 2)
-    cv2.putText(
-        img,
-        text,
-        (x + pad_x, y + pad_y + text_h),
-        FONT,
-        font_scale,
-        color,
-        thickness,
-        cv2.LINE_AA,
-    )
-    return box_br[0]
 
 
 def _format_xyz_m(x: float, y: float, z: float) -> str:
@@ -317,31 +285,6 @@ def build_relative_frame_time_s(
     if time_reference is None:
         return float(timestamp)
     return max(0.0, float(timestamp) - float(time_reference))
-
-
-def describe_car_loc_status(
-    frame_data: dict,
-    sample_every_frames: int | None,
-) -> tuple[str, tuple[int, int, int]] | None:
-    status = frame_data.get("car_loc_status")
-    if not isinstance(status, str) or not status:
-        return None
-
-    sample_text = ""
-    if isinstance(sample_every_frames, int) and sample_every_frames > 1:
-        sample_text = f"  sample=1/{sample_every_frames}"
-
-    if status == "skipped":
-        return (f"AprilTag: skipped{sample_text}", (160, 160, 160))
-    if status == "miss":
-        return (f"AprilTag: sampled, no tag{sample_text}", (0, 165, 255))
-    if status == "hit":
-        return (f"AprilTag: sampled{sample_text}", (0, 200, 255))
-    if status == "dropped":
-        return (f"AprilTag: dropped backlog{sample_text}", (0, 96, 255))
-    if status == "pending":
-        return ("AprilTag: pending", (180, 180, 180))
-    return None
 
 
 # ---------------- PC 回球检测与速度矢量叠加 ----------------
@@ -813,22 +756,6 @@ def estimate_rk_bias_from_hits(
     return bias, len(cluster), mad
 
 
-def bot_sample_near(rk_bot: dict, rk_t: float, max_dt: float = 0.2) -> dict | None:
-    ts = rk_bot["sample_ts"]
-    if not ts:
-        return None
-    i = bisect.bisect_left(ts, rk_t)
-    best = None
-    for j in (i - 1, i):
-        if 0 <= j < len(ts):
-            cand = rk_bot["samples"][j]
-            if best is None or abs(cand["t"] - rk_t) < abs(best["t"] - rk_t):
-                best = cand
-    if best is None or abs(best["t"] - rk_t) > max_dt:
-        return None
-    return best
-
-
 def target_episodes(rk_bot: dict, bias: float) -> list[tuple[float, float]]:
     """target_active 连续段（PC 报告轴），间隔 >1s 分段——每次抛球一段。"""
     episodes: list[tuple[float, float]] = []
@@ -843,74 +770,25 @@ def target_episodes(rk_bot: dict, bias: float) -> list[tuple[float, float]]:
     return episodes
 
 
-def _draw_floor_marker(
+def draw_car_tag_boxes(
     out: np.ndarray,
-    cam: dict,
-    xy: tuple[float, float],
+    car_loc: dict,
+    sn: str,
     x_offset: int,
     y_offset: int,
-    panel_w: int,
-    panel_h: int,
-    *,
-    color: tuple[int, int, int],
-    label: str,
-    filled: bool,
-) -> tuple[int, int] | None:
-    """把世界系地面点 (x,y,0) 投到 panel 画标记；越界/在相机后返回 None。"""
-    p = project_world_point_m(cam, (xy[0], xy[1], 0.0))
-    if p is None:
-        return None
-    scale = 0.5
-    px = p[0] * scale
-    py = p[1] * scale
-    if not (-40 <= px <= panel_w + 40 and -40 <= py <= panel_h + 40):
-        return None
-    pt = (int(round(px + x_offset)), int(round(py + y_offset)))
-    if filled:
-        cv2.circle(out, pt, 7, color, -1, cv2.LINE_AA)
-    else:
-        cv2.circle(out, pt, 13, color, 3, cv2.LINE_AA)
-        cv2.drawMarker(out, pt, color, cv2.MARKER_CROSS, 16, 2)
-    cv2.putText(
-        out, label, (pt[0] + 14, pt[1] - 8), FONT, 0.8, color, 2, cv2.LINE_AA
-    )
-    return pt
-
-
-def draw_car_target_overlay(
-    out: np.ndarray,
-    sample: dict,
-    car_xy: tuple[float, float] | None,
-    serials: list[str],
-    panel_w: int,
-    panel_h: int,
-    cols: int,
-    cam_projections: dict[str, dict] | None,
+    scale: float,
 ) -> None:
-    """各 panel 绘制 目标点(红圈十字) / 小车当前位置(绿点) / 连线。"""
-    if cam_projections is None:
+    """把该相机参与拟合的车载 AprilTag 检测角点画成四边形识别框（无文字）。"""
+    tag_corners = car_loc.get("tag_corners")
+    if not isinstance(tag_corners, dict):
         return
-    for cam_idx, sn in enumerate(serials):
-        cam = cam_projections.get(sn)
-        if cam is None:
-            continue
-        x_offset, y_offset = grid_slot(cam_idx, panel_w, panel_h, cols=cols)
-        pt_tgt = _draw_floor_marker(
-            out, cam, (sample["tx"], sample["ty"]), x_offset, y_offset,
-            panel_w, panel_h, color=TARGET_COLOR, label="TGT", filled=False,
+    for quad in (tag_corners.get(sn) or {}).values():
+        pts = np.array(
+            [[int(round(u * scale)) + x_offset, int(round(v * scale)) + y_offset]
+             for u, v in quad],
+            dtype=np.int32,
         )
-        pt_car = None
-        if car_xy is not None:
-            pt_car = _draw_floor_marker(
-                out, cam, car_xy, x_offset, y_offset,
-                panel_w, panel_h, color=CAR_MARK_COLOR, label="CAR", filled=True,
-            )
-        if pt_tgt is not None and pt_car is not None:
-            ok, p0, p1 = cv2.clipLine(
-                (x_offset, y_offset, panel_w, panel_h), pt_car, pt_tgt
-            )
-            if ok:
-                cv2.line(out, p0, p1, CAR_TGT_LINE_COLOR, 2, cv2.LINE_AA)
+        cv2.polylines(out, [pts], True, CAR_TAG_BOX_COLOR, 2, cv2.LINE_AA)
 
 
 def convert_racket_loc_mm_to_m(loc: RacketLoc) -> RacketLoc:
@@ -1126,6 +1004,15 @@ def serialize_car_loc(obj3d: CarLoc, *, elapsed_s: float | None) -> dict:
             sn: [round(float(px)), round(float(py))]
             for sn, (px, py) in obj3d.pixels.items()
         },
+        "tag_corners": {
+            sn: {
+                str(tag_id): [
+                    [round(float(u), 1), round(float(v), 1)] for u, v in quad
+                ]
+                for tag_id, quad in tags.items()
+            }
+            for sn, tags in obj3d.corners_px.items()
+        },
     }
 
 
@@ -1265,43 +1152,14 @@ def draw_scaled_detections(
     y_offset: int,
     scale: float,
     color: tuple[int, int, int],
-    *,
-    draw_center: bool = False,
-    label_prefix: str = "",
 ) -> None:
-    """把全分辨率检测结果按缩放比例绘制到 annotated 视频。"""
+    """把全分辨率检测框按缩放比例绘制到 annotated 视频（只画框，不写文字）。"""
     for det in detections:
-        label = det.get("label")
-        draw_color = color
-        if label == "stationary_object":
-            draw_color = STATIONARY_BOX_COLOR
-
         x1 = int(det["x1"] * scale) + x_offset
         y1 = int(det["y1"] * scale) + y_offset
         x2 = int(det["x2"] * scale) + x_offset
         y2 = int(det["y2"] * scale) + y_offset
-        cv2.rectangle(out, (x1, y1), (x2, y2), draw_color, 2)
-
-        if label == "tennis_ball":
-            conf_text = f"B {det['conf']:.2f}"
-        elif label == "stationary_object":
-            conf_text = f"S {det['conf']:.2f}"
-        else:
-            conf_text = f"{label_prefix}{det['conf']:.2f}"
-        cv2.putText(
-            out, conf_text, (x1, max(y_offset + 20, y1 - 5)),
-            FONT, FONT_SCALE, draw_color, FONT_THICKNESS,
-        )
-
-        if draw_center:
-            cx = int(det["x"] * scale) + x_offset
-            cy = int(det["y"] * scale) + y_offset
-            cv2.drawMarker(
-                out, (cx, cy), draw_color,
-                markerType=cv2.MARKER_CROSS,
-                markerSize=18,
-                thickness=2,
-            )
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
 
 
 def draw_racket_detections(
@@ -1346,13 +1204,10 @@ def annotate_frame(
     layout_cols: int,
     *,
     show_racket: bool = False,
-    car_sample_every_frames: int | None = None,
     relative_time_s: float | None = None,
     return_event: dict | None = None,
     cam_projections: dict[str, dict] | None = None,
     frame_time: float | None = None,
-    bot_target: dict | None = None,
-    car_floor_xy: tuple[float, float] | None = None,
 ) -> np.ndarray:
     """在拼接画面上绘制球/球拍/3D/状态等离线标注。"""
     h, w = img.shape[:2]
@@ -1363,33 +1218,18 @@ def annotate_frame(
 
     detections = frame_data.get("detections", {})
     racket_detections = frame_data.get("racket_detections", {})
-    tiles = frame_data.get("tiles", {})
     frame_car_loc = frame_data.get("car_loc")
-    detection_counts = frame_data.get("detection_counts", {})
 
     for cam_idx, sn in enumerate(serials):
         color = BOX_COLORS[cam_idx % len(BOX_COLORS)]
         x_offset, y_offset = grid_slot(cam_idx, panel_w, panel_h, cols=cols)
-        counts = detection_counts.get(sn)
-        if counts is None:
-            dets = detections.get(sn, [])
-            counts = {
-                "tennis_ball": sum(
-                    1 for det in dets if det.get("label", "tennis_ball") == "tennis_ball"
-                ),
-                "stationary_object": sum(
-                    1 for det in dets if det.get("label", "tennis_ball") == "stationary_object"
-                ),
-            }
-        ball_count = counts.get("tennis_ball", 0)
-        static_count = counts.get("stationary_object", 0)
-        car_count = 0
-        if frame_car_loc and "pixels" in frame_car_loc and sn in frame_car_loc["pixels"]:
-            car_count = 1
 
         draw_scaled_detections(
             out,
-            detections.get(sn, []),
+            [
+                det for det in detections.get(sn, [])
+                if det.get("label", "tennis_ball") == "tennis_ball"
+            ],
             x_offset,
             y_offset,
             scale,
@@ -1405,22 +1245,8 @@ def annotate_frame(
                 scale,
             )
 
-        if frame_car_loc and "pixels" in frame_car_loc and sn in frame_car_loc["pixels"]:
-            px, py = frame_car_loc["pixels"][sn]
-            cx = int(px * scale) + x_offset
-            cy = int(py * scale) + y_offset
-            cv2.drawMarker(
-                out, (cx, cy), (0, 200, 255),
-                cv2.MARKER_DIAMOND, 20, 2,
-            )
-
-        draw_badge(
-            out,
-            f"{sn[-3:]}  BALL {ball_count}  STATIC {static_count}  CAR {car_count}",
-            x_offset + 10,
-            y_offset + 10,
-            color,
-        )
+        if frame_car_loc:
+            draw_car_tag_boxes(out, frame_car_loc, sn, x_offset, y_offset, scale)
 
     for col in range(1, cols):
         x = panel_w * col
@@ -1467,23 +1293,6 @@ def annotate_frame(
             RETURN_COLOR,
         ))
 
-    if bot_target is not None:
-        car_txt = (
-            f"({car_floor_xy[0]:+.2f},{car_floor_xy[1]:+.2f})m"
-            if car_floor_xy is not None
-            else "--"
-        )
-        dist_txt = (
-            f"{math.hypot(bot_target['tx'] - car_floor_xy[0], bot_target['ty'] - car_floor_xy[1]):.2f}m"
-            if car_floor_xy is not None
-            else "--"
-        )
-        lines.append((
-            f"CAR {car_txt}  ->  TGT ({bot_target['tx']:+.2f},{bot_target['ty']:+.2f})m  "
-            f"d={dist_txt}  {bot_target['phase']}",
-            (0, 80, 255),
-        ))
-
     racket3d = frame_data.get("racket3d")
     if show_racket and racket3d:
         cams = "+".join(s[-3:] for s in racket3d["cameras"])
@@ -1504,37 +1313,12 @@ def annotate_frame(
         )
     lines.append((state_str, state_color))
 
-    car_status_line = describe_car_loc_status(frame_data, car_sample_every_frames)
-    if car_status_line is not None:
-        lines.append(car_status_line)
-
-    if frame_car_loc:
-        cams = "+".join(s[-3:] for s in frame_car_loc["cameras_used"])
-        lines.append((
-            f"car: {_format_xyz_m(frame_car_loc['x'], frame_car_loc['y'], frame_car_loc['z'])}  "
-            f"yaw={math.degrees(frame_car_loc['yaw']):.1f}deg "
-            f"({'valid' if frame_car_loc['yaw_valid'] else 'position only'})  cams={cams}",
-            (0, 200, 255),
-        ))
-
     if return_event is not None and frame_time is not None:
         draw_return_vector(
             out,
             return_event,
             frame_time,
             ball3d,
-            serials,
-            panel_w,
-            panel_h,
-            cols,
-            cam_projections,
-        )
-
-    if bot_target is not None:
-        draw_car_target_overlay(
-            out,
-            bot_target,
-            car_floor_xy,
             serials,
             panel_w,
             panel_h,
@@ -1613,7 +1397,6 @@ def main() -> None:
             int(car_cfg["sample_every_frames"]),
             1,
         )
-    car_sample_every_frames = 1 if car_enabled else None
     cols, rows = infer_stitched_grid(n_cams, w, h)
     panel_w = w // cols
     panel_h = h // rows
@@ -1660,11 +1443,11 @@ def main() -> None:
             rk_bias = rk_anchor_info[0]
 
     cam_projections = None
-    if (return_events or rk_bot is not None) and not args.no_output_video:
+    if not args.no_output_video:
         try:
             cam_projections = load_camera_projections(calib_config_path)
         except (OSError, KeyError, ValueError) as e:
-            print(f"警告：标定加载失败，回球矢量/目标点只画文字行: {e}")
+            print(f"警告：标定加载失败，车框/球3D投影/回球矢量/目标点只画文字行: {e}")
 
     if car_enabled:
         clear_car_results(data)
@@ -1732,7 +1515,6 @@ def main() -> None:
 
     frame_idx = 0
     n_annotated = 0
-    last_car_xy: tuple[float, tuple[float, float]] | None = None
     car_observations: list[dict] = []
     car_frames_processed = 0
     racket_pipeline: Optional[RacketPipeline] = None
@@ -1817,31 +1599,6 @@ def main() -> None:
                     active_return = ev
                     break
 
-            frame_car_loc = fd.get("car_loc")
-            if (
-                isinstance(frame_car_loc, dict)
-                and _FINITE(frame_car_loc.get("x"))
-                and _FINITE(frame_car_loc.get("y"))
-            ):
-                last_car_xy = (
-                    frame_time,
-                    (float(frame_car_loc["x"]), float(frame_car_loc["y"])),
-                )
-
-            bot_target = None
-            car_floor_xy = None
-            if rk_bot is not None and rk_bias is not None:
-                sample = bot_sample_near(rk_bot, relative_time_s - rk_bias)
-                if (
-                    sample is not None
-                    and sample["active"]
-                    and sample["tx"] is not None
-                    and sample["ty"] is not None
-                ):
-                    bot_target = sample
-                    if last_car_xy is not None and frame_time - last_car_xy[0] <= 0.5:
-                        car_floor_xy = last_car_xy[1]
-
             annotated = annotate_frame(
                 img,
                 fd,
@@ -1851,13 +1608,10 @@ def main() -> None:
                 panel_h,
                 cols,
                 show_racket=racket_enabled,
-                car_sample_every_frames=car_sample_every_frames,
                 relative_time_s=relative_time_s,
                 return_event=active_return,
                 cam_projections=cam_projections,
                 frame_time=frame_time,
-                bot_target=bot_target,
-                car_floor_xy=car_floor_xy,
             )
             n_annotated += 1
         else:

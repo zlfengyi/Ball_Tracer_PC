@@ -55,7 +55,8 @@ function Get-ToolPython {
 function Get-LatestBaseTrackerJson {
     param([string]$SearchDir)
 
-    $latest = Get-ChildItem -Path $SearchDir -File -Filter 'tracker_*.json' |
+    # 布局：每 session 一个子目录 tracker_*/；根目录平铺为历史遗留（-Depth 1 两者都覆盖）
+    $latest = Get-ChildItem -Path $SearchDir -File -Filter 'tracker_*.json' -Recurse -Depth 1 |
         Where-Object { $_.BaseName -match '^tracker_\d{8}_\d{6}$' } |
         Sort-Object LastWriteTime -Descending |
         Select-Object -First 1
