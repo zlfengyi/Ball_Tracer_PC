@@ -102,7 +102,7 @@ def _synth(
     }
 
 
-def _run_estimate(obs, car, rk_data, tmp_path: Path) -> dict:
+def _run_estimate(obs, car, rk_data, tmp_path: Path, expr: str = "estimateTimeMap()") -> dict:
     harness = (
         "const isNum = v => typeof v==='number' && isFinite(v);\n"
         f"const obs = {json.dumps(obs)};\n"
@@ -110,7 +110,7 @@ def _run_estimate(obs, car, rk_data, tmp_path: Path) -> dict:
         "const relTime = v => v;\n"
         f"const RK = {json.dumps(rk_data)};\n"
         f"{_align_core_js()}\n"
-        "console.log(JSON.stringify(estimateTimeMap()));\n"
+        f"console.log(JSON.stringify({expr}));\n"
     )
     script = tmp_path / "align_harness.js"
     script.write_text(harness, encoding="utf-8")
@@ -188,6 +188,34 @@ def test_estimate_time_map_weights_flights_not_frames(tmp_path):
 
     best = _run_estimate(obs, car, rk_data, tmp_path)
     assert abs(best["bias"] - true_bias) <= 0.003, best
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_estimate_time_map_survives_contaminated_pose_anchors(tmp_path):
+    """0809 场：多数共享位姿锚配错，把 offMad 顶到秒级，8×offMad 反而全放行。
+
+    错锚拖歪 Theil–Sen 斜率 → scale 门跳闸 → 整组锚被丢弃 → bias 搜索退回全场
+    ±250s，在重复抛球形状里锁到错的一抛（该场锁偏 4.2s，z 形状误差 0.248m）。
+    锚阶段必须靠硬上限把错锚滤掉，仍然交出可用的 scale/bias 来收窄搜索窗。
+    """
+    bias = -10.11
+    obs, car, rk_data = _synth(bias, noise_amplitude=0.0)
+    # 2/3 的锚配错（本场 83 条里只有 30 条是真的），错量以真值为中心双向散开几秒到
+    # 二十几秒——直接扰动 PC 侧锚时刻即可等价表达这种配对错误。
+    for index, pose in enumerate(car):
+        if index % 3 == 0:
+            continue
+        pose["elapsed_s"] = round(pose["elapsed_s"] + ((index * 37) % 41 - 20) * 1.1, 6)
+
+    anchor = _run_estimate(obs, car, rk_data, tmp_path, expr="clockAnchor")
+    assert anchor["bias"] is not None, anchor
+    assert abs(anchor["scale"] - 1.0) <= 1e-4, anchor
+    assert abs(anchor["bias"] - bias) <= 0.05, anchor
+    assert anchor["anchors"] >= 20, anchor
+
+    best = _run_estimate(obs, car, rk_data, tmp_path)
+    assert best["err"] is not None and best["err"] < 0.05, best
+    assert abs(best["bias"] - bias) <= 0.01, best
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")

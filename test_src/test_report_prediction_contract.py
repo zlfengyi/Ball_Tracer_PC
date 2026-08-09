@@ -437,7 +437,7 @@ def test_ball_car_gap_measured_at_given_time_and_rejects_pollution(tmp_path):
     assert at["vRel"] == pytest.approx(-4.0, abs=0.06)
     assert at["carVy"] == pytest.approx(0.5, abs=0.03)   # 塌陷伪迹在窗外，不进车拟合
     assert at["carVx"] == pytest.approx(0.3, abs=0.03)
-    assert at["eA"] == pytest.approx(-100.0, abs=3)      # 车@ht − 冻结面 = −100mm
+    assert at["eA"] == pytest.approx(-0.100, abs=3e-3)   # 车@ht − 冻结面 = −0.1m（核心一律用米）
     # 真实触球处 dy 归零；再晚 13.25ms 球已穿过拍面，dy 转负（口径与旧 HT err 同向）
     assert result["contact"]["dy"] * 1000 == pytest.approx(0.0, abs=2)
     assert result["contact"]["dtMs"] == pytest.approx(0.0, abs=0.5)
@@ -456,10 +456,13 @@ def test_main_pc_truth_uses_rk_ht_and_accepted_uses_own_ht():
     # = 臂真正执行的击球时刻（重定相生效时是那条 late ht saved），
     # 与最后一条 accepted 原消息 ht 之差就是 Δht 重定相列
     assert "const gapFin=finalHt!=null?ballCarGapForThrow(th,finalHt):null;" in source
-    assert "球面y−车y @臂最后更新HT<br>(mm, RK全量真值)</th>" in source
-    assert "击球点@300预测 − RK全量真值@臂最后更新HT<br>dx/dz(mm, 世界轴)</th>" in source
-    assert "((th.ref300Xw-th.ref300CarX)-gapFin.dx)*1000" in source
-    assert "const aimDz=(gapFin&&isNum(th.ref300Z))?(th.ref300Z-gapFin.dz)*1000:null;" in source
+    assert "球面y−车y @臂最后更新HT<br>(cm, RK全量真值)</th>" in source
+    assert "击球点@300预测 − RK全量真值@臂最后更新HT<br>dx/dz(cm, 世界轴)</th>" in source
+    # 0809 起两列改 cm：算式一律留米，换算只在 cmSigned/cmFmt 显示层做
+    assert "? (th.ref300Xw-th.ref300CarX)-gapFin.dx : null;" in source
+    assert "const aimDz=(gapFin&&isNum(th.ref300Z))?th.ref300Z-gapFin.dz:null;" in source
+    assert "+cmSigned(aimDx)+'/'+cmSigned(aimDz)+'</span>'" in source
+    assert "+cmSigned(gapFin.dy)+'</span>'" in source
     assert "htAllS1ForThrow" not in source
     assert "hE300" not in source
     assert "<th>HT真实(触球)<br>(s,PC轴)</th>" not in source
@@ -510,10 +513,10 @@ def test_rk300_table_includes_last_accepted_target_and_tcp_at_final_ht():
     headers = [
         "<th>车RUN末帧 目标−实际 dx/dy(cm)<br>(RK世界系)</th>",
         "<th>RK@≈300ms预测车@HT−RUN末实际 dx/dy(cm)<br>(RK世界系)</th>",
-        "<th>机械臂最后accepted目标 x/z(m)</th>",
-        "<th>PC真值@HT300 x/y/z(m)</th>",
-        "PC真值@臂最后更新HT x/y/z(m)</th>",
-        "TCP−车心@臂最后更新HT x/y/z(m,世界轴)</th>",
+        "<th>机械臂最后accepted目标 x/z(cm)</th>",
+        "<th>PC真值@HT300 x/y/z(cm)</th>",
+        "PC真值@臂最后更新HT x/y/z(cm)</th>",
+        "TCP−车心@臂最后更新HT x/y/z(cm,世界轴)</th>",
         "TCP−accepted dx/dz(cm,世界轴)</th>",
         "最后更新−挥拍起<br>(ms)</th>",
         "盲区 ht−ct@臂最后更新<br>(ms)</th>",
@@ -589,7 +592,7 @@ def test_rk300_table_includes_last_accepted_target_and_tcp_at_final_ht():
     assert "const tcpWorld=tcp?[tcp[0],tcp[1],tcp[2]-(isNum(armZOff)?armZOff:0)]:null;" not in source
     assert "TCP@accepted HT" not in source
     assert "PC真值@accepted HT x/y/z" not in source
-    assert "tableXyz(tcpWorld[0],tcpWorld[1],tcpWorld[2])" in source
+    assert "tableXyzCm(tcpWorld[0],tcpWorld[1],tcpWorld[2])" in source
     assert "(runEnd.tx-runEnd.x)*100" in source
     assert "(runEnd.ty-runEnd.y)*100" in source
     assert source.count("<td>'+runTargetError+'</td>") == 2

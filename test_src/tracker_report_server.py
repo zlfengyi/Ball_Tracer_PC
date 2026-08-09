@@ -29,9 +29,10 @@ if str(_ROOT) not in sys.path:
 from test_src.generate_curve3_html import HTML_TEMPLATE, _merge_racket_json
 
 
+# ball_tracer_pc 2026-08-09 起不再是 tennis-man 的 submodule，产物只在本克隆下
 DEFAULT_TRACKER_OUTPUT_DIRS: tuple[Path, ...] = (
     Path("D:/tennis-man/data"),
-    Path("D:/tennis-man/ball_tracer_pc/tracker_output"),
+    Path("D:/Ball_Tracer_PC/tracker_output"),
 )
 _RUN_RE = re.compile(r"^(tracker_\d{8}_\d{6})(.*)$")
 _RUN_DIR_RE = re.compile(r"^tracker_\d{8}_\d{6}$")
