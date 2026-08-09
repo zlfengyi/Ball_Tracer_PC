@@ -886,10 +886,25 @@ const pcTruthAt = tPc => {
   const c=carAt(tPc);
   if(!c) return null;
   let win=pcRows.filter(p=>tPc-p.t>=0.02 && tPc-p.t<=0.75);
+  // 落地弹跳必须切掉，否则拟合窗横跨弹跳、残差门必爆。
+  // 判据按**轨迹形状**（vz 由降转升的突增），不是绝对高度：
+  // 29fps + 落地 |vz|≈5m/s ⇒ 半帧就走 8.7cm，弹跳最低点经常整个被跨过，
+  // 旧的 z<0.12 判据因此频繁不触发 —— 2026-08-09 两场失败抛采到的 z_min 是
+  // 0.126/0.154/0.165/0.180/0.464，全都在阈值之上。改判形状后 050621 由 9/14
+  // 升到 13/14、024150 由 6/9 升到 7/9，两场均无回退。
+  // 阈值与 [[pc-return-core]] 的 bounceCutRun 同款（降 <−0.5、反弹突增 >3m/s）。
   let loT=-Infinity;
-  win.forEach(p=>{
-    if(p.z<0.12 && p.t>loT) loT=p.t;
-  });
+  for(let i=1;i+1<win.length;i++){
+    const dt0=win[i].t-win[i-1].t, dt1=win[i+1].t-win[i].t;
+    if(!(dt0>0) || !(dt1>0)) continue;
+    const vzA=(win[i].z-win[i-1].z)/dt0, vzB=(win[i+1].z-win[i].z)/dt1;
+    // 切到最低点之后：最低点那一帧本身常被接触过程污染（曝光跨越触地），
+    // 050621 #13 实测 vz 在它之后是 1.3→4.4m/s 的"向上加速"，物理上不可能；
+    // 丢掉它，从干净的上升弧起拟合。
+    if(vzA<-0.5 && vzB-vzA>3.0) loT=win[i].t;
+  }
+  // 贴地观测（z<0.12）无论如何都不该进入入弧拟合：可能是场上静止球或弹跳采样点
+  win.forEach(p=>{ if(p.z<0.12 && p.t>loT) loT=p.t; });
   win=win.filter(p=>p.t>loT);
   const reg=(ts,vs)=>{
     const n=ts.length;
@@ -1095,8 +1110,12 @@ const _armHit = (()=>{
   // 但**跨 topic 的 bag 读出顺序会错位**（同一场实测出现过 S,S,P,P），所以不能按事件流 FIFO 配。
   // 做法：以 x/z 双 5e-4 精确回配成功的那条 accepted 为锚，按「hit_pos 派生状态的序号差 =
   // 预测序号差」平移——同一次挥拍里锚点与 late 只隔 ~300ms，中间不会丢消息。
-  // 每条再自校验 now=ht−10ms−duration 必须落在 [状态发布时刻−4ms, +0.6ms]（duration 打印
-  // 只到 1ms，发布开销实测 0.3~1.4ms；错配一格会让 now 跑到发布时刻之后，物理上不可能）。
+  // 每条再自校验 now=ht−advance−duration 必须落在 [状态发布时刻−8ms, +0.6ms]。gap=发布时刻−now
+  // 全在 arm_controller 进程内、同一单调钟（status 尾缀 t= 就是它发布时读的 perf_counter），
+  // 不含 DDS 与 PC：status 写进 last_status 后要等下一个 100Hz tick 才 push，故 gap 是 sub-tick
+  // 抖动，上限 = 一个 tick 10ms。旧上界 4ms 按"发布开销 0.3~1.4ms"取，0809 场实测到 4.90ms，
+  // 把 #6/#13 两拍判成失配、盲区列静默退回 accepted（174ms 真值显示成 327ms），故放宽到 8ms。
+  // 8ms 仍远小于错配一格的 32.5ms（视觉帧间隔），判别力不受影响。
   let si=-1;              // hit_pos 派生状态的序号
   let anchorSi=null, anchorPi=null;
   (ARM.events||[]).forEach(e=>{
@@ -1111,7 +1130,7 @@ const _armHit = (()=>{
         const dur=Number(m[1]);
         const p=anchorSi!=null?armPreds[anchorPi+(si-anchorSi)]:null;
         const gap=p?(e.t+RK.t0-(p.ht-HIT_TIME_ADVANCE_SEC-dur)):null;
-        const ok=!!(p && gap>=-0.0006 && gap<=0.004);
+        const ok=!!(p && gap>=-0.0006 && gap<=0.008);
         const ht=ok?p.ht:null;
         cur.lates.push({t:e.t, dur, ht, ct:ok?p.ct:null,
                         hitTime:ht!=null?ht-RK.t0-HIT_TIME_ADVANCE_SEC:e.t+dur});
@@ -1162,13 +1181,18 @@ const _armHit = (()=>{
   // 逐拍重建 ht 重定相：lastUpdateT = 臂真正受理的最后一条 /predict_hit_pos 的到达时刻
   // （挥拍窗内的 late ht saved 也算受理，它就是重定相的养料）；finalHt/finalCt = 那条消息的
   // **原始 ht/ct**（不减臂内 10ms 提前量），ht−ct 即该拍最终命令的盲区时间（击球点 − 最晚
-  // 那颗球的观测时刻）。重定相未生效（无 late / 剩余不足 / 回配失配）时全部退回最后一条 accepted。
+  // 那颗球的观测时刻）。重定相未生效（无 late / 剩余不足）时退回最后一条 accepted——那时臂本来
+  // 就只用了 accepted 那条，退回是**正确值**。
+  // ⚠ 唯一不能退回的是「重定相生效但回配失配」：此时臂用的是 late 那条的 ht/ct，但报告拿不到
+  // 同源真值，退回 accepted 会把 ~174ms 的盲区冒充成 ~330ms（0809 场 #6/#13 就是这么错的）。
+  // 这种情况置 finalMismatch，由盲区列显示 ⚠— 而不是给一个错的数。
   out.forEach(h=>{
     if(h.label!=='hit') return;
     h.lastUpdateT=h.lastAcceptT;
     h.finalHt=isNum(h.wht)?h.wht:null;
     h.finalCt=isNum(h.wct)?h.wct:null;
     h.finalDone=h.done;
+    h.finalMismatch=false;
     h.reswing=null;
     const lates=h.lates||[];
     if(!lates.length) return;
@@ -1182,6 +1206,7 @@ const _armHit = (()=>{
     if(ok){
       h.finalDone=last.hitTime;
       if(last.ht!=null){ h.finalHt=last.ht; h.finalCt=last.ct; }  // ht/ct 必须同源
+      else h.finalMismatch=true;                                   // 见上：不许拿 accepted 冒充
     }
   });
   zOffs.sort((a,b)=>a-b);
@@ -1967,13 +1992,19 @@ const rk300TableHtml = () => {
     // 盲区 ht−ct@臂最后更新：最终那条命令的「击球点时刻 − 它最晚看到的那颗球的观测时刻」。
     // 这段时间里预测纯外推、没有任何新观测进来，是本拍真正的信息盲区。
     const finalCt=accepted&&isNum(accepted.finalCt)?accepted.finalCt-RK.t0:null;
-    const blind=(finalHt!=null&&finalCt!=null)?(finalHt-finalCt)*1000:null;
+    const blindBad=!!(accepted&&accepted.finalMismatch);
+    const blind=(finalHt!=null&&finalCt!=null&&!blindBad)?(finalHt-finalCt)*1000:null;
     const blindCell=blind!=null
       ? '<span title="'+tableEsc('臂最后更新消息 ct='+rkToPc(finalCt).toFixed(3)+'s（最晚一颗球的观测时刻）'
           +'、ht='+rkToPc(finalHt).toFixed(3)+'s（预测击球时刻，原始值未减臂内提前量'
           +(armConstCal.adv!=null?(armConstCal.adv*1000).toFixed(0)+'ms':'')+'）'
           +'；这段是纯外推、无新观测的盲区'+htSrcNote)+'">'+blind.toFixed(1)+'</span>'
-      : '—';
+      : (blindBad
+        ? '<span style="color:#e0a24a" title="'+tableEsc('重定相已生效（臂用的是挥拍窗内最后一条 '
+            +'late ht saved 的 ht），但该条 status 回配原 /predict_hit_pos 失败，拿不到同源的 ht/ct，'
+            +'故本格不出数——退回最后一条 accepted 会把真实盲区（~170ms 量级）冒充成 ~330ms。'
+            +'失配判据见 [[arm-swing-ht-core]] 的 gap 自校验窗')+'">⚠—</span>'
+        : '—');
     // Δht 重定相：挥拍时用的 ht（最后一条 accepted）→ 更新后的 ht。二者都是原始 ht，
     // 同减臂内 10ms，故与臂内触球时刻之差完全等价。未采纳时显示候选值并置灰。
     const dHtCell=rsw
@@ -2123,8 +2154,11 @@ const rk300TableHtml = () => {
     '<th title="臂受理的最后一条 /predict_hit_pos 到达时刻 − 挥拍段起点(老触球−HIT_T 0.25s)；'+
     '正=更新落在挥拍开始之后（0803 起挥拍窗内不再拒收，这些消息就是 ht 重定相的养料）。'+
     '悬停看两个绝对时刻与重定相是否生效">最后更新−挥拍起<br>(ms)</th>'+
-    '<th title="臂最终执行的那条 /predict_hit_pos 的 ht−ct：击球点时刻 − 它最晚看到的那颗球的'+
-    '观测时刻。这段时间预测纯外推、没有任何新观测进来，即本拍的信息盲区">'+
+    '<th title="定义：finalHt−finalCt，二者取自臂真正消费掉的最后一条 /predict_hit_pos 的原始 '+
+    'ht/ct（同源、都不减臂内提前量）。重定相生效时=挥拍窗内最后一条 late ht saved 那条（它就是'+
+    '重定相吃掉的那条，本场典型 160~190ms）；重定相未触发/剩余不足时=最后一条 accepted 那条'+
+    '（典型 300~335ms）。这段时间预测纯外推、没有任何新观测进来，即本拍的信息盲区。'+
+    '⚠— = 重定相生效但该条回配失败，拿不到同源 ht/ct，不出数（不退回 accepted 冒充）">'+
     '盲区 ht−ct@臂最后更新<br>(ms)</th>'+
     '<th title="挥拍时用的 ht（最后一条 accepted）→ 挥拍中重定相更新后的 ht，正=新预测把击球点推晚；'+
     '两者同为原始 ht，与臂内触球时刻(各减10ms)之差等价。灰字(未采纳)=剩余不足 60ms 控制器放弃了重定相">'+

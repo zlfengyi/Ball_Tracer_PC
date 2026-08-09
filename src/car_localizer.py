@@ -217,6 +217,35 @@ class CarLocalizer:
         # yaw 对角点误差很敏感；检测后使用灰度梯度做亚像素角点细化。
         params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
         self._detector = cv2.aruco.ArucoDetector(aruco_dict, params)
+        # 暗光重试计数（诊断用）：raw 全空 → 拉对比度重试的次数 / 其中救回来的次数
+        self.low_light_retries = 0
+        self.low_light_recovered = 0
+        # 暗场自适应：连续多次「raw 空、增强能救」之后就直接从增强图起手。
+        # 否则暗场每帧要跑两遍 detectMarkers（~100ms 一遍），后台定位跟不上：
+        # 2026-08-09 050621 场实测 car_loc_dropped 从历来的 0 涨到 48%。
+        # 直接起手后暗场恢复成一遍，代价回到修复前水平。
+        self._prefer_enhanced = False
+        self._raw_fail_streak = 0
+        self._enhanced_since_probe = 0
+
+    # 连续 N 次 raw 空而增强有效 → 切到「增强起手」；之后每 M 次回探一次 raw，
+    # 免得光线恢复了还一直吃增强图（增强图角点有 ~0.27° 偏移，能不用就不用）。
+    _PREFER_ENHANCED_AFTER = 3
+    _RAW_PROBE_EVERY = 60
+
+    @staticmethod
+    def _enhance_for_low_light(gray: np.ndarray) -> np.ndarray:
+        """暗光下把 tag 的局部对比度拉回可解码范围。
+
+        参数在「救回率」和「角点保真」之间实测选出（034554 场 288 个角点，与 raw
+        检出角点比，tag 边长中位 45.7px）：linear stretch 只偏 0.04px 但仅救回 3/6；
+        CLAHE 2.0/16 全救回且偏 0.213px≈0.27°；gamma0.60 0.446px；CLAHE 3.0/8 0.630px。
+        增强图是非线性的，角点必然有偏移，而车 yaw 对角点敏感，所以要挑保真最好的一档。
+        （试过「增强图定位 + 回原图重跑 cornerSubPix」把几何拉回来：暗图梯度太弱，
+         细化会跑飞，p90 从 1.0px 恶化到 5.4px，已放弃。）
+        CLAHE 对象每次新建：detect() 跑在 ThreadPoolExecutor 里，共享内部缓冲不安全。
+        """
+        return cv2.createCLAHE(clipLimit=2.0, tileGridSize=(16, 16)).apply(gray)
 
     # ── 属性 ──────────────────────────────────────────────────────────
 
@@ -242,10 +271,41 @@ class CarLocalizer:
     def detect(self, image: np.ndarray) -> list[CarDetection]:
         """检测整张图像中的所有 AprilTag (tag36h11)。"""
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
-        corners_list, ids, _ = self._detector.detectMarkers(gray)
 
-        if ids is None:
-            return []
+        # 暗光救援：光线掉下去后 tag 白块只剩 20~30 灰度（黑块 ~2），ArUco 的自适应
+        # 阈值取不出边缘，整张图一个 tag 都出不来 —— 2026-08-09 夜实测就是这样：场景
+        # 均值和能用的场次一样（24.5 vs 24.1），但 tag 局部动态范围从 ~48 掉到 ~28，
+        # car_loc 直接 100% miss。拉一次局部对比度再检即可全部救回，且不必动曝光
+        # （动曝光会加重回球段拖影，见 detection_shape_gate 那条链路）。
+        probe_raw = (self._enhanced_since_probe >= self._RAW_PROBE_EVERY)
+        if self._prefer_enhanced and not probe_raw:
+            # 暗场稳态：跳过注定失败的 raw 一遍，只跑增强图，成本回到一次 detectMarkers
+            self._enhanced_since_probe += 1
+            self.low_light_retries += 1
+            corners_list, ids, _ = self._detector.detectMarkers(
+                self._enhance_for_low_light(gray))
+            if ids is None:
+                self._prefer_enhanced = False       # 连增强都不行了，回到常规路径重新判断
+                return []
+            self.low_light_recovered += 1
+        else:
+            corners_list, ids, _ = self._detector.detectMarkers(gray)
+            if ids is not None:
+                self._prefer_enhanced = False       # raw 能用（可能光线恢复了）
+                self._raw_fail_streak = 0
+                self._enhanced_since_probe = 0
+            else:
+                self._enhanced_since_probe = 0
+                self.low_light_retries += 1
+                corners_list, ids, _ = self._detector.detectMarkers(
+                    self._enhance_for_low_light(gray))
+                if ids is None:
+                    self._raw_fail_streak = 0
+                    return []
+                self.low_light_recovered += 1
+                self._raw_fail_streak += 1
+                if self._raw_fail_streak >= self._PREFER_ENHANCED_AFTER:
+                    self._prefer_enhanced = True
 
         results = []
         for i, tag_id in enumerate(ids.ravel()):

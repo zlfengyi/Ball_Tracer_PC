@@ -500,7 +500,7 @@ def test_rk300_table_includes_last_accepted_target_and_tcp_at_final_ht():
     assert "const tcpWorld=tcp?[tcp[0]*Math.cos(tcpYawRad)-tcp[1]*Math.sin(tcpYawRad)," in source
     assert "tcp[0]*Math.sin(tcpYawRad)+tcp[1]*Math.cos(tcpYawRad)," in source
     assert "tcp[2]-(isNum(armZOff)?armZOff:0)]:null;" in source
-    # TCP−accepted：dx 目标侧=同条消息的世界x−car_pred_x（不掺 rel_x 手写+0.04）、dz=rel_z(≡世界z)，
+    # TCP−accepted：dx 目标侧=同条消息的世界x−car_pred_x、dz=rel_z(≡世界z)，
     # 悬停保留老口径臂系伺服差 tcp_x−rel_x 对照
     assert "const tgtWx=accepted&&isNum(accepted.wxw)&&isNum(accepted.wcarx)?accepted.wxw-accepted.wcarx:null;" in source
     assert "const tcpAcceptedDx=(tcpWorld&&tgtWx!=null)?(tcpWorld[0]-tgtWx)*100:null;" in source
@@ -519,8 +519,9 @@ def test_rk300_table_includes_last_accepted_target_and_tcp_at_final_ht():
         "盲区 ht−ct@臂最后更新<br>(ms)</th>",
         "Δht 重定相<br>(ms)</th>",
         "车yaw@臂最后更新HT(°)</th>",
-        "拍面yaw,pitch@臂最后更新HT(°,世界系)</th>",
-        "拍面yaw,pitch@臂最后更新HT−10ms(°,世界系)</th>",
+        "目标挥拍速度/pitch<br>(m/s, °)</th>",
+        "拍面yaw,pitch,speed@臂最后更新HT(°,°,m/s;世界系)</th>",
+        "拍面yaw,pitch,speed@臂最后更新HT−12ms(°,世界系)</th>",
     ]
     assert [source.index(header) for header in headers] == sorted(
         source.index(header) for header in headers
@@ -534,9 +535,35 @@ def test_rk300_table_includes_last_accepted_target_and_tcp_at_final_ht():
     # 两列各自同时给 yaw 与 pitch（同一份窗内拟合），单元格文本为 yaw/pitch
     assert "tableSigned(faceYaw.deg)+'/'+tableSigned(faceYaw.pitch)" in source
     assert "tableSigned(faceYawPre.deg)+'/'+tableSigned(faceYawPre.pitch)" in source
+    # 两列都另带实测拍速（灰字 m/s）：各自取值时刻处直接插值，**不**沿用 yaw/pitch 的窗内
+    # 线性外推（S 曲线下拍速强非线性，外推会高估 40%+）；触球锚/σ/指令侧/J1 分量走悬停
+    assert "const swingSpeed=racketSpeedAt(finalHt);" in source
+    assert "const s=interpRow(armSpeedRows,t,RACKET_SPEED_MAX_GAP_S);" in source
+    assert "fitFaceAnglesTo(accHtRk,accHtRk)" in source          # yaw/pitch 仍是窗内拟合外推
+    assert "swingSpeed.v.toFixed(2)+'m/s'" in source
+    assert "swingSpeed.cmd" in source
+    # 触球锚只许由指令速度平台首帧定位；实测速度叠着 σ~0.5m/s 伺服振荡，
+    # 窗内 argmax 不是触球探测器（0808 首版的"峰值即触球"伪迹，不许回潮）
+    assert "swingSpeed.contactDt" in source and "swingSpeed.measContact" in source
+    assert "swingSpeed.osc" in source
+    assert "peakDt" not in source
+    # 目标挥拍速度/pitch 列：只吃 accepted 状态自带的计划量，两条渲染路径都要出
+    assert "const tgtSpeed=accepted&&isNum(accepted.tgtSpeed)?accepted.tgtSpeed:null;" in source
+    assert "const tgtPitch=accepted&&isNum(accepted.tgtPitch)?accepted.tgtPitch:null;" in source
+    assert "tgtSpeed:statusNum(e.text,'speed')" in source
+    assert "tgtSpeedReq:statusNum(e.text,'speed_req')" in source
+    assert source.count("<td>'+tgtSpeedCell+'</td>") == 2
     # 盲区列的 ct/ht 必须同源，且与主表 lead(ms)（@300ms 参考消息）不是一回事
     assert "const finalCt=accepted&&isNum(accepted.finalCt)?accepted.finalCt-RK.t0:null;" in source
-    assert "const blind=(finalHt!=null&&finalCt!=null)?(finalHt-finalCt)*1000:null;" in source
+    # 回配失配（重定相生效但拿不到同源 ht/ct）必须出 ⚠— 而不是退回 accepted 冒充：
+    # 0809 场 #6/#13 曾把 ~174ms 的真盲区显示成 327/306ms，且无任何提示
+    assert "const blindBad=!!(accepted&&accepted.finalMismatch);" in source
+    assert (
+        "const blind=(finalHt!=null&&finalCt!=null&&!blindBad)?(finalHt-finalCt)*1000:null;"
+        in source
+    )
+    assert "else h.finalMismatch=true;" in source
+    assert "⚠—" in source
     # 0803 已删列：视觉球拍@accepted HT（相对小车），其专用取值/单元格实现不应残留
     assert "视觉球拍" not in source
     assert "visualRacketAt" not in source
@@ -547,8 +574,11 @@ def test_rk300_table_includes_last_accepted_target_and_tcp_at_final_ht():
     assert source.count("<td>'+carYawCell+'</td>") == 2
     # 角速度只能取 IMU 零滞后原值，禁止对有 0.3~0.5s 滞后的 bot_state yaw 数值求导
     assert "ys(RK.imu,'yaw_speed')" in source
-    # HT−10ms 列：fy/fp 同窗拟合在 HT−10ms 取值；车 yaw 用 /bot_state 瞬时值（IMU 连续更新）
-    assert "const FACE_YAW_PRE_S=0.010;" in source
+    # HT−12ms 列（0808 由 −10ms 挪到 −12ms：指令平台首帧定位的臂内触球锚中位 −11ms）：
+    # fy/fp 同窗拟合在该刻取值、拍速同刻插值；车 yaw 用 /bot_state 瞬时值（IMU 连续更新）
+    assert "const FACE_YAW_PRE_S=0.012;" in source
+    assert "racketSpeedRawAt(finalHt-FACE_YAW_PRE_S)" in source
+    assert "swingSpeedPre.v.toFixed(2)+'m/s'" in source
     assert "fitFaceAnglesTo(accHtRk,tEval)" in source
     assert "botYawDegAt(tEval)" in source
     assert "ys(RK.bot,'yaw')" in source
@@ -569,9 +599,10 @@ def test_rk300_table_includes_last_accepted_target_and_tcp_at_final_ht():
 
 
 def test_add_face_angles_wiring_and_fk_properties():
-    """拍面yaw,pitch 两列的 Python 侧：_add_face_angles 正确附加 fy/fp、跳过残缺关节；
+    """拍面yaw,pitch,speed 三量的 Python 侧：_add_face_angles 正确附加 fy/fp/vt、跳过残缺关节；
     FK 性质：零位 fy=fp=0（拍面朝正前且不上仰）、J1 为垂直轴（Δfy=−Δq1 精确、fp 分毫不动
-    ——这正是 pitch 列不需要减车 yaw 的依据）。"""
+    ——这正是 pitch 列不需要减车 yaw 的依据）；vt 的解析 Jacobian 与数值差分一致，
+    且只有 J1 转时退化成 |q̇1|·r（r=hypot(tcp_x,tcp_y)），即 status speed= 的口径。"""
     pytest.importorskip("numpy")
     import math
     import sys
@@ -579,11 +610,13 @@ def test_add_face_angles_wiring_and_fk_properties():
     sys.path.insert(0, str(SRC.parent))
     try:
         from generate_curve3_html import _add_face_angles
+        from extract_arm_bag import fk
     finally:
         sys.path.pop(0)
 
     q = [0.1, -0.2, 0.3, 0.15, -0.4, 0.25]
     q1p = [0.3] + q[1:]
+    qd = [1.3, -0.4, 0.7, 0.2, -0.9, 0.5]
     arm = {"states": [
         {"t": 1.0, "position": q},
         {"t": 1.1, "position": [0.1, None, 0.3, 0.15, -0.4, 0.25]},  # 关节缺失
@@ -591,6 +624,10 @@ def test_add_face_angles_wiring_and_fk_properties():
         {"t": 1.3},                                                  # 无 position
         {"t": 1.4, "position": [0.0] * 6},
         {"t": 1.5, "position": q1p},
+        {"t": 1.6, "position": q, "velocity": qd},
+        {"t": 1.7, "position": q, "velocity": [2.0, 0.0, 0.0, 0.0, 0.0, 0.0]},
+        {"t": 1.8, "position": q, "velocity": [0.0] * 6},
+        {"t": 1.9, "position": q, "velocity": [0.1, None, 0, 0, 0, 0]},  # 速度残缺
     ]}
     _add_face_angles(arm)
     s = arm["states"]
@@ -604,6 +641,18 @@ def test_add_face_angles_wiring_and_fk_properties():
     )
     assert s[5]["fp"] == s[0]["fp"]                            # 纯 z 转不动 n_z ⇒ pitch 不变
     assert s[0]["fp"] == pytest.approx(15.42, abs=0.01)        # 该位形的拍面上仰角（回归锚）
+    # vt：只在有 6 个数值 velocity 的帧上出现
+    assert "vt" not in s[0] and "vt" not in s[5] and "vt" not in s[9]
+    # 解析 Jacobian ≡ 数值差分（沿 q̇ 方向前推一小步的位移速率）
+    step = 1e-6
+    tcp0 = fk(q)["tcp"]
+    tcp1 = fk([a + step * b for a, b in zip(q, qd)])["tcp"]
+    numeric = math.dist(tcp1, tcp0) / step
+    assert s[6]["vt"] == pytest.approx(numeric, abs=1e-4)      # vt 落盘保留 4 位（0.1mm/s）
+    # 只有 J1 转时退化成 |q̇1|·r（触球瞬间的构造，也是 status speed= 的口径）
+    lever = math.hypot(tcp0[0], tcp0[1])
+    assert s[7]["vt"] == pytest.approx(2.0 * lever, abs=1e-4)
+    assert s[8]["vt"] == 0.0                                   # 静止帧拍速为 0
 
 
 def test_rk300_table_shows_reject_reasons_only_without_accepted():

@@ -373,3 +373,159 @@ def test_locate_rejects_when_outlier_removal_drops_a_tag(tmp_path):
     images = _fake_locate_images(localizer, dets)
 
     assert localizer.locate(images) is None
+
+
+# ── 暗光 AprilTag 救援 ────────────────────────────────────────────────────
+# 2026-08-09 夜实测：光线掉下去后 tag 白块只剩 ~25 灰度（黑块 ~2），ArUco 自适应
+# 阈值取不出边缘，car_loc 从 miss 1.4% 直接变成 100%；而场景均值与可用场次相同
+# （24.5 vs 24.1），所以拉曝光救不回来——必须拉局部对比度。detect() 因此在 raw
+# 全空时用 CLAHE 重试一次。这里用打桩 detectMarkers 确定性地验证这条分支。
+
+
+def _localizer(tmp_path):
+    calib_path = tmp_path / "calib.json"
+    vehicle_path = tmp_path / "vehicle.json"
+    _write_calibration(calib_path)
+    _write_vehicle(vehicle_path)
+    return CarLocalizer(str(calib_path), str(vehicle_path))
+
+
+class _StubDetector:
+    """按调用次序返回 results 里的 (corners, ids)，并记录每次收到的图。
+
+    cv2.aruco.ArucoDetector 是 C++ 绑定、方法只读，只能整体替换。
+    """
+
+    def __init__(self, results):
+        self._results = results
+        self.seen: list[np.ndarray] = []
+
+    def detectMarkers(self, gray):
+        self.seen.append(gray)
+        corners, ids = self._results[min(len(self.seen) - 1, len(self._results) - 1)]
+        return corners, ids, None
+
+
+def _stub_detect_markers(localizer, results):
+    stub = _StubDetector(results)
+    localizer._detector = stub
+    return stub.seen
+
+
+def test_detect_retries_with_contrast_boost_when_raw_finds_nothing(tmp_path):
+    localizer = _localizer(tmp_path)
+    corners = [np.array([[[10.0, 10.0], [20.0, 10.0], [20.0, 20.0], [10.0, 20.0]]])]
+    seen = _stub_detect_markers(
+        localizer,
+        [(None, None), (corners, np.array([[0]]))],   # raw 空 → 重试命中
+    )
+    gray = np.full((64, 64), 8, np.uint8)
+    gray[20:40, 20:40] = 26                            # 暗光低对比
+
+    dets = localizer.detect(gray)
+
+    assert [d.tag_id for d in dets] == [0]
+    assert localizer.low_light_retries == 1
+    assert localizer.low_light_recovered == 1
+    assert len(seen) == 2, "raw 一次 + 重试一次"
+    # 第二次收到的必须是增强过的图（对比度被拉开），不是原图
+    assert seen[1].ptp() > seen[0].ptp()
+
+
+def test_detect_does_not_retry_when_raw_succeeds(tmp_path):
+    localizer = _localizer(tmp_path)
+    corners = [np.array([[[10.0, 10.0], [20.0, 10.0], [20.0, 20.0], [10.0, 20.0]]])]
+    seen = _stub_detect_markers(localizer, [(corners, np.array([[1]]))])
+
+    dets = localizer.detect(np.full((64, 64), 120, np.uint8))
+
+    assert [d.tag_id for d in dets] == [1]
+    assert localizer.low_light_retries == 0, "亮场不应付重试的 ~100ms"
+    assert len(seen) == 1
+
+
+def test_detect_counts_retry_but_not_recovery_when_boost_also_fails(tmp_path):
+    localizer = _localizer(tmp_path)
+    _stub_detect_markers(localizer, [(None, None), (None, None)])
+
+    assert localizer.detect(np.full((64, 64), 3, np.uint8)) == []
+    assert localizer.low_light_retries == 1
+    assert localizer.low_light_recovered == 0
+
+
+_STUB_CORNERS = [np.array([[[10.0, 10.0], [20.0, 10.0], [20.0, 20.0], [10.0, 20.0]]])]
+
+
+def _ptp(img) -> int:
+    return int(img.max()) - int(img.min())
+
+
+def _low_contrast_image():
+    """暗且低对比：raw 检不出，但增强后能拉开动态范围。"""
+    img = np.full((64, 64), 8, np.uint8)
+    img[20:40, 20:40] = 26
+    return img
+
+
+class _ContrastStubDetector:
+    """按图像动态范围决定成败，而不是按调用次序。
+
+    真实行为是「同一帧 raw 失败、增强后成功」，按次序打桩会在状态机切换后错位
+    （切换后不再跑 raw，次序桩就会把本该失败的那一档返回成功）。
+    """
+
+    def __init__(self, threshold: float):
+        self.threshold = threshold
+        self.seen: list[np.ndarray] = []
+
+    def detectMarkers(self, gray):
+        self.seen.append(gray)
+        if _ptp(gray) < self.threshold:
+            return None, None, None
+        return _STUB_CORNERS, np.array([[0]]), None
+
+
+def _stub_by_contrast(localizer, image):
+    """阈值由真实增强函数的效果推出，CLAHE 参数一改这里会立刻失效并报错。"""
+    raw_ptp = _ptp(image)
+    enhanced_ptp = _ptp(CarLocalizer._enhance_for_low_light(image))
+    assert enhanced_ptp > raw_ptp, "增强必须真的拉开动态范围，否则本用例无意义"
+    stub = _ContrastStubDetector((raw_ptp + enhanced_ptp) / 2.0)
+    localizer._detector = stub
+    return stub.seen
+
+
+def test_detect_switches_to_enhanced_first_after_repeated_dark_frames(tmp_path):
+    """暗场稳态下不能每帧都白跑一遍注定失败的 raw。
+
+    2026-08-09 050621 场实测：每帧两遍 detectMarkers（~100ms 一遍）让后台定位
+    跟不上，car_loc_dropped 从历来的 0 涨到 48%。连续几帧确认 raw 无效后应改为
+    直接从增强图起手，暗场成本回到一次。
+    """
+    localizer = _localizer(tmp_path)
+    dark = _low_contrast_image()
+    seen = _stub_by_contrast(localizer, dark)
+
+    for _ in range(localizer._PREFER_ENHANCED_AFTER):
+        assert [d.tag_id for d in localizer.detect(dark)] == [0]
+    assert len(seen) == 2 * localizer._PREFER_ENHANCED_AFTER, "切换前每帧两遍"
+    assert localizer._prefer_enhanced is True
+
+    before = len(seen)
+    assert [d.tag_id for d in localizer.detect(dark)] == [0]
+    assert len(seen) - before == 1, "切换后每帧只跑一遍（增强图）"
+
+
+def test_detect_probes_raw_again_so_recovered_light_stops_using_enhanced(tmp_path):
+    """光线恢复后要回到 raw —— 增强图角点有 ~0.27° 偏移，能不用就不用。"""
+    localizer = _localizer(tmp_path)
+    seen = _stub_by_contrast(localizer, _low_contrast_image())
+    bright = np.full((64, 64), 40, np.uint8)
+    bright[20:40, 20:40] = 200                                     # raw 就够检出
+
+    localizer._prefer_enhanced = True
+    localizer._enhanced_since_probe = localizer._RAW_PROBE_EVERY   # 该回探了
+
+    assert [d.tag_id for d in localizer.detect(bright)] == [0]
+    assert localizer._prefer_enhanced is False, "光线恢复后应停用增强图"
+    assert len(seen) == 1, "回探命中就不该再跑增强图"

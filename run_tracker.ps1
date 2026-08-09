@@ -9,6 +9,15 @@ param(
     [string]$PreferredEnv = 'auto',
     [int]$RosDomainId = 2,
     [string]$CameraConfig = '',
+    # 曝光临时覆盖（不改配置文件）。0 / 负数 = 用配置文件里的值。
+    # 18F 相机 Gain 上限只有 12.78dB 且出厂就顶格，**亮度只能靠曝光换**，-GainDb 基本没用。
+    # 曝光越长运动拖影越大，回球段最吃亏（像面速度 ~1400px/s，是来球段的 2~3 倍）：
+    # 9000μs 拖影 12.6px、和球直径（13~18px）同量级，2026-08-09 场击球后连丢 4 帧、
+    # 回球统计整场为空。当前默认 9000μs 是光线过暗下的被动选择（当晚亮度一路下滑），
+    # **回球段数据在这一档本来就不可靠**，看 summary.detection_shape_gate 确认是不是形状门在拦。
+    # 光线一好转就调短：-ExposureUs 6000（拖影 8.4px）或 4000（5.6px，回球段最稳）
+    [double]$ExposureUs = 0,
+    [double]$GainDb = -1,
     [string]$CalibrationConfig = '',
     [ValidateRange(0, 1)]
     [int]$CameraReverse180 = 1,
@@ -281,6 +290,12 @@ if ($NoLog) {
 }
 if ($FullResVideo) {
     $args += "--full-res-video"
+}
+if ($ExposureUs -gt 0) {
+    $args += @("--exposure-us", $ExposureUs.ToString())
+}
+if ($GainDb -ge 0) {
+    $args += @("--gain-db", $GainDb.ToString())
 }
 
 & $selection.Python @args

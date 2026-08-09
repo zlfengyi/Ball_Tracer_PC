@@ -8,7 +8,7 @@
     "max_reproj_error_px": 15.0,
     "detection_postprocess": {
         "duplicate_iou_threshold": 0.95,
-        "max_box_aspect_ratio": 1.2
+        "max_box_aspect_ratio": 1.6
     },
     "stationary_filter": {
         "enabled": true,

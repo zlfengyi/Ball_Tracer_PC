@@ -87,3 +87,42 @@ def test_postprocess_keeps_box_at_exact_twenty_percent_ratio() -> None:
 
     assert len(processed) == 1
     assert math.isclose(processed[0].aspect_ratio, 1.2, rel_tol=1e-9)
+
+
+def test_shape_gate_stats_count_rejected_tennis_balls() -> None:
+    """形状门要能事后回答「这场漏检是不是拖影把球框拉长了」。"""
+    BallDetector.reset_shape_gate_stats()
+
+    detections = [
+        _det(0, 0, 30, 30, 0.95),            # 圆，留
+        _det(50, 50, 80, 110, 0.88),         # 长宽比 2.0，拦
+        _det(200, 200, 230, 245, 0.70),      # 长宽比 1.5，拦
+        _det(400, 400, 430, 490, 0.60, label="stationary_object"),  # 非网球，不计
+    ]
+
+    processed = BallDetector.postprocess_detections(
+        detections,
+        duplicate_iou_threshold=0.95,
+        max_box_aspect_ratio=1.2,
+    )
+
+    assert len(processed) == 1
+    stats = BallDetector.shape_gate_stats
+    assert stats["ball_kept"] == 1
+    assert stats["ball_rejected"] == 2
+    assert math.isclose(stats["rejected_aspect_max"], 2.0, rel_tol=1e-9)
+    assert math.isclose(stats["rejected_aspect_sum"], 3.5, rel_tol=1e-9)
+
+
+def test_shape_gate_stats_reset_clears_counters() -> None:
+    BallDetector.reset_shape_gate_stats()
+    BallDetector.postprocess_detections(
+        [_det(0, 0, 30, 90, 0.9)],
+        duplicate_iou_threshold=0.95,
+        max_box_aspect_ratio=1.2,
+    )
+    assert BallDetector.shape_gate_stats["ball_rejected"] == 1
+
+    BallDetector.reset_shape_gate_stats()
+    assert BallDetector.shape_gate_stats["ball_rejected"] == 0
+    assert BallDetector.shape_gate_stats["rejected_aspect_max"] == 0.0

@@ -691,6 +691,29 @@ def _build_video_time_text(
     return f"#{frame_idx}  t={elapsed_s:.3f}s  perf={exposure_perf:.6f}s"
 
 
+def _shape_gate_summary() -> dict[str, float]:
+    """把 BallDetector 的形状门计数整理成 session json 里的一段。
+
+    只看 3D 观测无法区分「相机没看见球」和「看见了但框被拦掉」。拒绝率高
+    通常是曝光过长把球拉成条（拖影 ≈ 像面速度 × 曝光），回球段像面速度是来球的
+    2~3 倍，最先在那里成片漏检 —— 对症是降曝光，不是无脑放宽 max_box_aspect_ratio
+    （放宽会让一台相机冒出第 2 个球框，反而在 "恰好 1 个检测" 那步把整台相机废掉）。
+    """
+    stats = BallDetector.shape_gate_stats
+    kept = int(stats.get("ball_kept", 0))
+    rejected = int(stats.get("ball_rejected", 0))
+    total = kept + rejected
+    return {
+        "ball_kept": kept,
+        "ball_rejected": rejected,
+        "rejected_frac": round(rejected / total, 4) if total else 0.0,
+        "rejected_aspect_mean": (
+            round(stats.get("rejected_aspect_sum", 0.0) / rejected, 3) if rejected else 0.0
+        ),
+        "rejected_aspect_max": round(stats.get("rejected_aspect_max", 0.0), 3),
+    }
+
+
 def _grid_dimensions(n_panels: int, cols: int = 2) -> tuple[int, int]:
     cols = max(1, min(cols, n_panels))
     rows = max(1, math.ceil(n_panels / cols))
@@ -1536,6 +1559,21 @@ def main() -> int:
         default=str(config_dir / "camera.json"),
         help="相机采集配置",
     )
+    # 曝光/增益按当场光照临时覆盖，不用改配置文件。
+    # 曝光直接决定运动拖影：blur_px = v_img(px/s) × T。整条弹道里回球段像面速度最高
+    # （出拍后向上横切，~1400px/s，是来球段 200~900px/s 的 2~3 倍），所以最先在那里
+    # 成片漏检。2026-08-09 场实测：T=9ms 时回球段拖影 11~13px，与球本身直径 13~18px
+    # 同量级；击球后连丢 4 帧（138ms）导致出弧只剩 3~4 点，回球统计整场为空。
+    # 具体是被形状门还是重投影门拦下的，看 summary.detection_shape_gate。
+    parser.add_argument(
+        "--exposure-us", type=float, default=None,
+        help="覆盖相机曝光（μs）；不给则用 --camera-config 里的值。"
+             "光线足时调小可减运动拖影（回球段拖影 ∝ 曝光）",
+    )
+    parser.add_argument(
+        "--gain-db", type=float, default=None,
+        help="覆盖相机增益（dB）；配合 --exposure-us 补回亮度（+6dB ≈ 亮度×2）",
+    )
     parser.add_argument(
         "--calib-config",
         default=str(config_dir / "four_camera_calib.json"),
@@ -1717,11 +1755,25 @@ def main() -> int:
 
     # ── 打开同步相机 ────────────────────────────────────────────────────
     print("[5/5] 打开同步相机...")
-    with SyncCapture.from_config(args.camera_config) as cap:
+    capture_overrides: dict[str, float] = {}
+    if args.exposure_us is not None:
+        capture_overrides["exposure_us"] = float(args.exposure_us)
+    if args.gain_db is not None:
+        capture_overrides["gain_db"] = float(args.gain_db)
+    with SyncCapture.from_config(args.camera_config, **capture_overrides) as cap:
         sync_sns = cap.sync_serials
         capture_fps = cap.fps
+        # 相机实际生效的曝光/增益（读回，不是配置里写的值——越界写入会被相机拒绝）。
+        # 曝光是回球段能不能连续检出的决定因素：拖影 px ≈ 像面速度 × 曝光，
+        # 回球段像面速度 ~1400px/s，球本身才 13~18px 宽。
+        camera_settings = cap.camera_settings()
         print(f"  同步相机: {sync_sns}")
         print(f"  配置帧率: {capture_fps:.1f} fps")
+        for _sn in sync_sns:
+            _s = camera_settings.get(_sn)
+            if _s:
+                print(f"    {_sn}: 曝光 {_s.get('exposure_us', float('nan')):.0f}μs  "
+                      f"增益 {_s.get('gain_db', float('nan')):.2f}dB")
 
         # 确认当前采集相机与标定文件一致
         missing = [sn for sn in calib_serials if sn not in sync_sns]
@@ -2031,6 +2083,9 @@ def main() -> int:
         _t_yolo_sum = 0.0
         _t_other_sum = 0.0
 
+        # 预热期的推理不计入形状门统计
+        BallDetector.reset_shape_gate_stats()
+
         print(f"\n{'*' * 60}")
         print(f"  预热完成，开始追踪！（{args.duration}s）按 Ctrl+C 提前结束")
         print(f"{'*' * 60}\n")
@@ -2332,6 +2387,11 @@ def main() -> int:
         "config": {
             "first_frame_exposure_pc": first_frame_exposure_pc,
             "serials": cam_serials,
+            "camera_config_path": str(Path(args.camera_config).resolve()),
+            # 逐相机读回的实际曝光/增益。拖影 px ≈ v_img(px/s) × 曝光(s)，
+            # 回球段 v_img ~1400px/s 是全弹道最高，最先在那里成片漏检
+            "camera_settings": camera_settings,
+            "camera_capture_overrides": capture_overrides,
             "calib_config_path": str(Path(args.calib_config).resolve()),
             "duration_s": processing_elapsed,
             "end_to_end_duration_s": total_elapsed,
@@ -2446,8 +2506,21 @@ def main() -> int:
             "car_locs": len(log_car_locs),
             "car_loc_sampled_frames": car_loc_sampled_frames,
             "car_loc_misses": car_loc_missed_frames,
+            # 暗光 tag 救援：raw 检测全空 → CLAHE 拉对比度重试的次数 / 救回来的次数。
+            # retries 长期不为 0 说明现场照度已经在 AprilTag 的边缘上，该补光了。
+            "car_loc_low_light_retries": (
+                getattr(car_localizer, "low_light_retries", 0)
+                if car_localizer is not None else 0
+            ),
+            "car_loc_low_light_recovered": (
+                getattr(car_localizer, "low_light_recovered", 0)
+                if car_localizer is not None else 0
+            ),
             "car_loc_dropped_frames": car_loc_dropped_frames,
             "state_transitions": len(log_state_transitions),
+            # 形状门统计：被 max_box_aspect_ratio 拦掉的网球框有多少、平均/最大长宽比多少。
+            # rejected 占比高 = 曝光太长、球被拖影拉长（回球段最严重），该降曝光而不是放宽门。
+            "detection_shape_gate": _shape_gate_summary(),
             "reset_times": tracker.reset_times,
             "video_frames_dropped": drop_count,
             "video_frames_written": len(written_frame_indices),

@@ -110,6 +110,27 @@ class BallDetector:
     `.onnx` 默认走 ONNX Runtime 直推；`.pt/.engine` 继续走 Ultralytics。
     """
 
+    # 形状门诊断（进程级累计，纯计数不改行为）。
+    # 运动拖影会把球框沿运动方向拉长：blur_px ≈ v_img(px/s) × 曝光(s)，
+    # 回球段 v_img 可达来球的 2~3 倍，长宽比随之冲高，可能整段被形状门吃掉。
+    # 事后只看 3D 观测是分不清「没检出」和「检出后被门拦掉」的 —— 这组计数就是
+    # 为了把这两种情况分开，落进 session json 的 summary.detection_shape_gate。
+    shape_gate_stats: dict[str, float] = {
+        "ball_kept": 0,
+        "ball_rejected": 0,
+        "rejected_aspect_max": 0.0,
+        "rejected_aspect_sum": 0.0,
+    }
+
+    @classmethod
+    def reset_shape_gate_stats(cls) -> None:
+        cls.shape_gate_stats = {
+            "ball_kept": 0,
+            "ball_rejected": 0,
+            "rejected_aspect_max": 0.0,
+            "rejected_aspect_sum": 0.0,
+        }
+
     def __init__(
         self,
         model_path: Optional[str | Path] = None,
@@ -390,10 +411,19 @@ class BallDetector:
         duplicate_iou_threshold: Optional[float] = 0.95,
         max_box_aspect_ratio: Optional[float] = 1.2,
     ) -> list[BallDetection]:
-        filtered = [
-            det for det in detections
-            if cls._passes_box_shape(det, max_box_aspect_ratio)
-        ]
+        filtered: list[BallDetection] = []
+        stats = cls.shape_gate_stats
+        for det in detections:
+            if cls._passes_box_shape(det, max_box_aspect_ratio):
+                filtered.append(det)
+                if det.is_tennis_ball:
+                    stats["ball_kept"] += 1
+            elif det.is_tennis_ball:
+                ar = det.aspect_ratio
+                stats["ball_rejected"] += 1
+                if math.isfinite(ar):
+                    stats["rejected_aspect_sum"] += ar
+                    stats["rejected_aspect_max"] = max(stats["rejected_aspect_max"], ar)
         filtered.sort(key=lambda det: det.confidence, reverse=True)
 
         kept: list[BallDetection] = []

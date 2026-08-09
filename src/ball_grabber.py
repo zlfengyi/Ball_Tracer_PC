@@ -62,6 +62,7 @@ from CameraParams_header import (
     MV_FRAME_OUT,
     MV_GIGE_DEVICE,
     MV_USB_DEVICE,
+    MVCC_FLOATVALUE,
     MVCC_INTVALUE_EX,
 )
 from PixelType_header import (
@@ -542,25 +543,38 @@ def open_camera(
             )
 
         # ── 曝光 / 增益 ──
+        # SetFloatValue 越界不抛异常、只返回错误码（如 0x80000102）。以前这里连返回值都不看，
+        # 于是"配置里写了但相机没接受"完全无声：MV-CS050 的 Gain 上限只有 12.78dB，
+        # 写 20 会被静默丢弃、实际仍跑在旧增益上。超界只告警不抛，避免因一个参数写不进去
+        # 就废掉整场采集，但必须让操作者看见。
+        def _try_set_float(node: str, value: float, unit: str) -> None:
+            ret = cam.MV_CC_SetFloatValue(node, float(value))
+            if int(ret) == 0:
+                return
+            rng = ""
+            try:
+                cur = MVCC_FLOATVALUE()
+                if int(cam.MV_CC_GetFloatValue(node, cur)) == 0:
+                    rng = (f"；相机允许 [{cur.fMin:.2f}, {cur.fMax:.2f}]{unit}"
+                           f"，当前仍为 {cur.fCurValue:.2f}{unit}")
+            except Exception:
+                pass
+            print(f"[相机 {serial}] 警告: {node}={value:g}{unit} 未被接受 "
+                  f"(ret=0x{int(ret) & 0xFFFFFFFF:08x}){rng}")
+
         if exposure_us > 0:
             try:
                 cam.MV_CC_SetEnumValueByString("ExposureAuto", "Off")
             except Exception:
                 pass
-            try:
-                cam.MV_CC_SetFloatValue("ExposureTime", float(exposure_us))
-            except Exception:
-                pass
+            _try_set_float("ExposureTime", exposure_us, "μs")
 
         if gain_db >= 0:
             try:
                 cam.MV_CC_SetEnumValueByString("GainAuto", "Off")
             except Exception:
                 pass
-            try:
-                cam.MV_CC_SetFloatValue("Gain", float(gain_db))
-            except Exception:
-                pass
+            _try_set_float("Gain", gain_db, "dB")
 
         # ── 自定义 ROI（X 轴：宽度裁剪）──
         if roi_width > 0:
@@ -1005,6 +1019,27 @@ class SyncCapture:
     def sync_serials(self) -> list[str]:
         """参与同步输出的相机序列号列表（get_frames 返回的相机）。"""
         return list(self._sync_serials)
+
+    def camera_settings(self) -> dict[str, dict[str, float]]:
+        """逐相机读回相机**实际生效**的曝光/增益。
+
+        不能用帧头的 fExposureTime —— MV-CS050 这一档根本不填该字段（实测恒为 0）。
+        写进 session json 是为了事后能直接判定"这场是不是曝光太长导致回球段拖影漏检"，
+        而不是靠 git 翻配置反推（配置可能被 --exposure-us 覆盖，或越界写入被相机拒绝）。
+        """
+        out: dict[str, dict[str, float]] = {}
+        for sn, cam in self._cameras.items():
+            entry: dict[str, float] = {}
+            for node, key in (("ExposureTime", "exposure_us"), ("Gain", "gain_db")):
+                try:
+                    val = MVCC_FLOATVALUE()
+                    if int(cam.MV_CC_GetFloatValue(node, val)) == 0:
+                        entry[key] = round(float(val.fCurValue), 2)
+                except Exception:
+                    pass
+            if entry:
+                out[sn] = entry
+        return out
 
     @property
     def fps(self) -> float:
