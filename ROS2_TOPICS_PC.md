@@ -49,9 +49,23 @@ PC 侧 AprilTag 多目定位成功后发布的小车位置结果。
 
 ### 发布时机
 
-- **两块车载 tag（id0、id1）都参与联合拟合成功时才发布**
-- 只识别到一块 tag 时不发布（单 tag 短基线 yaw + 安装杠杆位置误差，精度不足）
-- 没有定位结果时不发
+- **两块车载 tag（id0、id1）都参与联合拟合成功**：发布完整位姿，`yaw` 为数值
+- **只剩一块 tag 可见**（2026-08-11 起）：仍然发布位置，但 `yaw` 为 **`null`**、
+  `yaw_valid` 为 `false`。位置由该 tag 中心的多视图三角化 + **冻结的**最近一次
+  可信 yaw 反解；冻结 yaw 超过 0.5s 未刷新则整帧不发
+- 一块 tag 都没被 ≥2 台相机看到时不发
+
+### ⚠ 消费端契约（`yaw == null`）
+
+收到 `yaw: null` 时**必须保持自身当前 yaw 不变**，只用 `x`/`y` 修正位置。
+不要把 `null` 当 0、不要沿用上一帧的 `yaw` 数值再当成新观测喂进滤波器
+（那等于把同一个历史值反复吸收，会让航向估计过度自信）。
+
+背景：车上 id1 贴在左前立柱上，会被臂座平台自遮挡，四台相机里常年只有两台
+看得见；而此前"两块 tag 都在才发布"的与门让击球瞬间成片丢定位（0811 053055 场
+实测 9 个 >0.5s 的空洞、共 11.3s，18 抛里 4 抛的 PC 真值因此为空）。同批 miss
+帧里 id0 在 ≥2 台相机的检出率是 15/15，所以退化路径能把绝大多数空洞填上。
+位置侧代价：0.5s 陈旧 yaw ≈ 1.5°，经 id0 的 0.42m 安装杠杆 ≈ 11mm。
 
 ### JSON 格式
 
@@ -77,11 +91,11 @@ PC 侧 AprilTag 多目定位成功后发布的小车位置结果。
 | `x` | `number` | 小车 `car_base` 参考点世界坐标 X，单位米 |
 | `y` | `number` | 小车 `car_base` 参考点世界坐标 Y，单位米 |
 | `z` | `number` | 小车 `car_base` 参考点世界坐标 Z，单位米（车心定义在地面，恒为 0） |
-| `yaw` | `number` | 本帧估计的小车绕 z 轴朝向，单位弧度 |
-| `yaw_valid` | `boolean` | 双 tag 参与拟合（~0.9m 中心基线）或单 tag 但至少 3 台相机、且四角重投影误差合格时为 `true`，RK 才使用 `yaw` 修正航向；否则本帧只修正 `x/y` |
+| `yaw` | `number \| null` | 本帧估计的小车绕 z 轴朝向，单位弧度。**`null` = 本帧给不出 yaw（单 tag 退化），消费端保持自身 yaw 不更新** |
+| `yaw_valid` | `boolean` | 双 tag 参与拟合（~0.9m 中心基线）或单 tag 但至少 3 台相机、且四角重投影误差合格时为 `true`，RK 才使用 `yaw` 修正航向；否则本帧只修正 `x/y`。`yaw` 为 `null` 时恒为 `false` |
 | `t` | `number` | 定位时间，时间轴是 Windows `perf_counter()` 秒 |
 | `tag_id` | `integer` | 主 tag（拟合中相机数最多的车载 tag；并列取小 id），兼容保留 |
-| `tag_ids` | `integer[]` | 参与本次联合拟合的全部车载 tag ID；因单 tag 不发布，实际恒为 `[0, 1]` |
+| `tag_ids` | `integer[]` | 参与本次联合拟合的全部车载 tag ID。`[0, 1]` = 双 tag 完整解；长度为 1 = 单 tag 退化解（此时 `yaw` 必为 `null`） |
 
 ### 备注
 
@@ -89,6 +103,9 @@ PC 侧 AprilTag 多目定位成功后发布的小车位置结果。
 - 车上现装两块 tag（id0 右后、id1 左前），车体系布局见
   `src/config/arm_poe_racket_center.json` 的 `vehicle_reference.apriltags`，
   由 `test_src/measure_car_tag_layout.py` 实测生成；单块可见时退化为单 tag 拟合
+- 单 tag 退化帧的条数记在 session json 的 `summary.car_loc_single_tag_frames`。
+  这个数长期偏高 = 有一块 tag 被长期遮挡，该挪安装位置或补第三块，而不是靠退化
+  路径长期兜着（退化解不带 yaw 信息，车航向会只能靠 IMU 递推）
 
 ## PC 侧的消费（订阅）
 

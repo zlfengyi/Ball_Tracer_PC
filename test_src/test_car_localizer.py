@@ -106,7 +106,7 @@ def main():
                     print(
                         f"{frame_count:4d}  {cams:>12s}  {tags:>6s}  "
                         f"{car_loc.x:8.3f}  {car_loc.y:8.3f}  "
-                        f"{math.degrees(car_loc.yaw):7.2f}  "
+                        f"{'    n/a' if car_loc.yaw is None else f'{math.degrees(car_loc.yaw):7.2f}'}  "
                         f"{'Y' if car_loc.yaw_valid else 'n':>2s}  "
                         f"{car_loc.reprojection_error:5.1f}px  "
                         f"{dt_ms:5.1f}ms"

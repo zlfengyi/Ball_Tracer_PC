@@ -347,7 +347,9 @@ def test_locate_publishes_only_with_both_tags(tmp_path):
     assert result.tag_ids == [0, 1]
 
 
-def test_locate_rejects_single_tag_by_default(tmp_path):
+def test_locate_rejects_single_tag_before_any_yaw_lock(tmp_path):
+    """还没锁定过双 tag yaw 时，单 tag 帧一律不发：印面 0.161m 短基线的 yaw
+    撑不住 0.42m 安装杠杆，宁可空着也不发一个说不清误差的位置。"""
     localizer, dets = _make_case(
         tmp_path,
         x_m=0.3, y_m=2.2, yaw=0.1,
@@ -356,23 +358,129 @@ def test_locate_rejects_single_tag_by_default(tmp_path):
     images = _fake_locate_images(localizer, dets)
 
     assert localizer.locate(images) is None
-    # 诊断口径仍可解
+    assert localizer.single_tag_frames == 0
+    # 诊断口径（自由 yaw 单 tag）仍可解
     assert localizer.locate(images, min_tags=1) is not None
 
 
-def test_locate_rejects_when_outlier_removal_drops_a_tag(tmp_path):
-    localizer, dets = _make_case(
-        tmp_path,
+# ── 单 tag 退化路径（2026-08-11）────────────────────────────────────────────
+# 实车 id1 贴在左前立柱、会被臂座自遮挡，四台相机常年只有两台看得见，而"两块都在
+# 才发布"的与门让击球瞬间成片丢定位。退化路径：位置照解、yaw 冻结不发。
+
+
+def _case_factory(tmp_path):
+    """同一台 localizer 复用于多个车位姿（跨帧状态测试要的就是这个）。"""
+    calib_path = tmp_path / "calib.json"
+    vehicle_path = tmp_path / "vehicle.json"
+    rotations, positions_m = _write_calibration(calib_path)
+    _write_vehicle(vehicle_path)
+    localizer = CarLocalizer(str(calib_path), str(vehicle_path))
+
+    def make_dets(*, x_m, y_m, yaw, tag_cameras):
+        out: dict[int, dict[str, CarDetection]] = {}
+        for tag_id, serials in tag_cameras.items():
+            corners_mm = _tag_world_corners_mm(tag_id, x_m, y_m, yaw)
+            for sn in serials:
+                out.setdefault(tag_id, {})[sn] = _detection(
+                    tag_id, _project(corners_mm, rotations[sn], positions_m[sn])
+                )
+        return out
+
+    return localizer, make_dets
+
+
+def _locate(localizer, dets, t):
+    return localizer.locate(_fake_locate_images(localizer, dets), t=t)
+
+
+def test_single_tag_fallback_keeps_position_and_reports_yaw_none(tmp_path):
+    localizer, make_dets = _case_factory(tmp_path)
+    pose = (0.3, 2.2, 0.1)
+    locked = _locate(localizer, make_dets(
+        x_m=pose[0], y_m=pose[1], yaw=pose[2],
+        tag_cameras={0: ALL_CAMS, 1: ALL_CAMS}), t=100.0)
+    assert locked is not None and locked.yaw is not None
+
+    # 0.2s 后只剩 id0 可见（id1 被臂座挡住）
+    result = _locate(localizer, make_dets(
+        x_m=pose[0], y_m=pose[1], yaw=pose[2],
+        tag_cameras={0: ALL_CAMS}), t=100.2)
+
+    assert result is not None
+    assert result.tag_ids == [0]
+    assert result.yaw is None            # 本帧不带 yaw 信息
+    assert result.yaw_valid is False
+    assert result.x == pytest.approx(pose[0], abs=0.002)
+    assert result.y == pytest.approx(pose[1], abs=0.002)
+    assert localizer.single_tag_frames == 1
+
+
+def test_single_tag_fallback_expires_with_stale_yaw(tmp_path):
+    localizer, make_dets = _case_factory(tmp_path)
+    assert _locate(localizer, make_dets(
         x_m=0.3, y_m=2.2, yaw=0.1,
-        tag_cameras={0: ALL_CAMS, 1: ["cam3"]},
-    )
+        tag_cameras={0: ALL_CAMS, 1: ALL_CAMS}), t=100.0) is not None
+
+    single = make_dets(x_m=0.3, y_m=2.2, yaw=0.1, tag_cameras={0: ALL_CAMS})
+    assert _locate(localizer, single, t=100.4) is not None      # 0.4s 内可用
+    assert _locate(localizer, single, t=100.9) is None          # 0.9s 太旧
+    # 退化帧不刷新冻结 yaw，否则误差会沿退化链自我累积
+    assert localizer.single_tag_frames == 1
+
+
+def test_single_tag_position_error_is_bounded_by_mounting_lever(tmp_path):
+    """冻结 yaw 陈旧 ⇒ 位置误差 ≈ 杠杆 × yaw 误差。这条把误差预算钉死：
+    1.5°（0.5s × ~3°/s 上界）经 id0 的 0.42m 杠杆 ≈ 11mm，报告端按这个数
+    并进 PC 真值列的误差棒（PC_TRUTH_SINGLE_TAG_ERR）。"""
+    localizer, make_dets = _case_factory(tmp_path)
+    yaw0 = 0.1
+    assert _locate(localizer, make_dets(
+        x_m=0.3, y_m=2.2, yaw=yaw0,
+        tag_cameras={0: ALL_CAMS, 1: ALL_CAMS}), t=100.0) is not None
+
+    # 车在 0.3s 内真实转了 1.5°，而冻结用的还是老 yaw
+    drift = math.radians(1.5)
+    truth = (0.3, 2.2, yaw0 + drift)
+    result = _locate(localizer, make_dets(
+        x_m=truth[0], y_m=truth[1], yaw=truth[2],
+        tag_cameras={0: ALL_CAMS}), t=100.3)
+
+    assert result is not None
+    lever_m = float(np.hypot(*LAYOUT[0]["center"][:2]))
+    err_m = math.hypot(result.x - truth[0], result.y - truth[1])
+    assert err_m < lever_m * drift * 1.35        # 杠杆量级，不放大
+    assert err_m > lever_m * drift * 0.5         # 也确实吃到了这项误差
+
+
+def test_locate_falls_back_when_outlier_removal_drops_a_tag(tmp_path):
+    localizer, make_dets = _case_factory(tmp_path)
+    assert _locate(localizer, make_dets(
+        x_m=0.3, y_m=2.2, yaw=0.1,
+        tag_cameras={0: ALL_CAMS, 1: ALL_CAMS}), t=100.0) is not None
+
+    dets = make_dets(x_m=0.3, y_m=2.2, yaw=0.1,
+                     tag_cameras={0: ALL_CAMS, 1: ["cam3"]})
     bad = dets[1]["cam3"]
     bad.corners = bad.corners + np.array(
         [[90.0, -70.0], [130.0, 40.0], [-80.0, 100.0], [-120.0, -50.0]]
     )
-    images = _fake_locate_images(localizer, dets)
+    result = _locate(localizer, dets, t=100.2)
 
-    assert localizer.locate(images) is None
+    assert result is not None
+    assert result.tag_ids == [0]
+    assert result.yaw is None
+    assert result.x == pytest.approx(0.3, abs=0.002)
+
+
+def test_single_tag_fallback_can_be_disabled(tmp_path):
+    localizer, make_dets = _case_factory(tmp_path)
+    assert _locate(localizer, make_dets(
+        x_m=0.3, y_m=2.2, yaw=0.1,
+        tag_cameras={0: ALL_CAMS, 1: ALL_CAMS}), t=100.0) is not None
+
+    images = _fake_locate_images(localizer, make_dets(
+        x_m=0.3, y_m=2.2, yaw=0.1, tag_cameras={0: ALL_CAMS}))
+    assert localizer.locate(images, t=100.2, single_tag_fallback=False) is None
 
 
 # ── 暗光 AprilTag 救援 ────────────────────────────────────────────────────

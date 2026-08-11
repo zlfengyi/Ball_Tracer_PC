@@ -469,12 +469,17 @@ def test_main_pc_truth_uses_rk_ht_and_accepted_uses_own_ht():
     assert "HT err@300<br>" not in source
     assert "'<td>'+htPc.toFixed(3)+'</td>'" not in source
     assert "const truth=pcTruthAt(accHtPc);" in source
-    assert "<td>'+pcTruthCell(truth,true)+'</td>" in source
-    assert "<td>'+pcTruthCell(truth)+'</td>" in source
+    assert "<td>'+pcTruthCell(truth,true,htPc)+'</td>" in source
+    assert "<td>'+pcTruthCell(truth,false,accHtPc)+'</td>" in source
     # 主表第二列 PC 真值：同一套拟合，评估时刻换成臂最后更新HT（臂真正执行的击球时刻，与 TCP 同锚）
     assert "const truthAcc=finalHt!=null?pcTruthAt(rkToPc(finalHt)):null;" in source
     # 有/无 S1@300 两条渲染路径都要出这一列（该列只依赖 accepted，不依赖 @300 参考消息）
-    assert source.count("pcTruthCell(truthAcc,true)") == 2
+    assert source.count("pcTruthCell(truthAcc,true,finalHt!=null?rkToPc(finalHt):null)") == 2
+    # 空值必须带原因：取值时刻要传进单元格，否则 "—" 分不清缺小车位姿、缺球观测还是拟合没过门
+    assert "const pcTruthCell = (f,withY=false,tPc=null) => {" in source
+    assert "if(!f) return pcTruthMissCell(tPc);" in source
+    assert "PC 小车定位在该时刻缺失" in source
+    assert "PC 球观测不足" in source
     # 0803 起已删列：开始触球t/PC球×车相交t/HT−开始触球/HT−PC相交/RK−PC dx/dz/
     # PC真值@开始触球，相关实现与辅助函数不应残留
     assert "touchT" not in source

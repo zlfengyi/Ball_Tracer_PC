@@ -34,6 +34,7 @@ import json
 import math
 import re
 import statistics
+import sys
 from pathlib import Path
 from typing import Iterable
 
@@ -208,6 +209,13 @@ MONO_MAX_SEC = 1e8
 # status 文本尾缀发布时刻（arm_controller 单调钟版追加）："... t=9203.123456"
 STATUS_T_RE = re.compile(r"\s+t=([0-9]+\.[0-9]+)$")
 
+# 事件文本必须原样落盘：/predict_hit_pos 是报告端要 JSON.parse 的载荷、status 的发布时刻
+# `t=` 挂在尾部，截一刀两者都静默失效。原来的 500 字上限就这么炸过一次——0809 103849 场
+# RK 端加了 spin/cor 在线估计字段后 payload 越过 500，625 条 predict_hit_pos 全部 parse
+# 失败 → armPreds 空 → accepted 回配 0 票 → 整张臂表全是 —，页面上没有任何报错。
+# 这里只留一个防病态消息的宽上限，且一旦触发就在 stderr 告警，不再无声截断。
+EVENT_TEXT_MAX = 4000
+
 
 def _ordered(values: list[float], names: list[str], joint_names: tuple[str, ...]) -> list[float | None]:
     """按 joint_names 顺序重排（与 session_viewer._ordered 一致）。"""
@@ -295,6 +303,7 @@ def main() -> int:
     counts: dict[str, int] = {}
     seen_state_names: list[str] = []
     seen_command_names: list[str] = []
+    truncated: dict[str, int] = {}
     start_ns: int | None = None
     end_ns: int | None = None
 
@@ -373,7 +382,10 @@ def main() -> int:
                 )
             else:
                 text = str(msg)
-            event = {"recv": recv, "topic": topic, "text": text[:500], "t_payload": None}
+            if len(text) > EVENT_TEXT_MAX:
+                truncated[topic] = truncated.get(topic, 0) + 1
+                text = text[:EVENT_TEXT_MAX]
+            event = {"recv": recv, "topic": topic, "text": text, "t_payload": None}
             if topic == "/predict_hit_pos":
                 # payload 自带 ct（RK 单调钟，球观测时刻）——事件直接用它，
                 # 与 rk_tracking 的 pred 序列同源同值。
@@ -394,6 +406,14 @@ def main() -> int:
 
     if start_ns is None:
         raise RuntimeError(f"bag has no messages: {args.bag}")
+
+    if truncated:
+        detail = ", ".join(f"{topic} × {n}" for topic, n in sorted(truncated.items()))
+        print(
+            f"[extract_arm_bag] 警告：事件文本超过 {EVENT_TEXT_MAX} 字被截断（{detail}）——"
+            "JSON 载荷会 parse 失败、status 尾缀 t= 会丢，报告端相关列将整列为空",
+            file=sys.stderr,
+        )
 
     # ---- stamp 时钟域判定（按话题多数）----
     def _stamp_domain(rows: list[dict]) -> str | None:

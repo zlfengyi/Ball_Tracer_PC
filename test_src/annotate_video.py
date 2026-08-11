@@ -992,7 +992,8 @@ def serialize_car_loc(obj3d: CarLoc, *, elapsed_s: float | None) -> dict:
         "x": round(obj3d.x, 4),
         "y": round(obj3d.y, 4),
         "z": round(obj3d.z, 4),
-        "yaw": round(obj3d.yaw, 4),
+        # 单 tag 退化帧 yaw 是 None（本帧无可信 yaw），如实写 null
+        "yaw": None if obj3d.yaw is None else round(obj3d.yaw, 4),
         "yaw_valid": obj3d.yaw_valid,
         "t": obj3d.t,
         "elapsed_s": round(elapsed_s, 3) if elapsed_s is not None else None,

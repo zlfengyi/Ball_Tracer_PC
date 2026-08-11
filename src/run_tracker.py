@@ -260,6 +260,12 @@ class ArchiveJob:
     compute_done_t: Optional[float] = None
 
 
+def _round_opt(value: float | None, digits: int) -> float | None:
+    """None 直通的 round：CarLoc.yaw 在单 tag 退化帧上是 None（本帧无可信 yaw，
+    消费端应保持自身 yaw），JSON/topic 里要如实发成 null，不能补 0 也不能丢字段。"""
+    return None if value is None else round(value, digits)
+
+
 @dataclass
 class CarLocEvent:
     """car_loc 工作线程或主线程（drop 时）发给归档线程的事件。"""
@@ -1485,7 +1491,7 @@ class ArchiveThread:
             "x": round(loc.x, 4),
             "y": round(loc.y, 4),
             "z": round(loc.z, 4),
-            "yaw": round(loc.yaw, 4),
+            "yaw": _round_opt(loc.yaw, 4),
             "yaw_valid": loc.yaw_valid,
             "t": ev.exposure_pc,
             "elapsed_s": (
@@ -1506,7 +1512,7 @@ class ArchiveThread:
             "x": round(loc.x, 4),
             "y": round(loc.y, 4),
             "z": round(loc.z, 4),
-            "yaw": round(loc.yaw, 4),
+            "yaw": _round_opt(loc.yaw, 4),
             "yaw_valid": loc.yaw_valid,
             "t": ev.exposure_pc,
             "elapsed_s": (
@@ -1973,7 +1979,7 @@ def main() -> int:
                             "x": round(loc.x, 4),
                             "y": round(loc.y, 4),
                             "z": round(loc.z, 4),
-                            "yaw": round(loc.yaw, 4),
+                            "yaw": _round_opt(loc.yaw, 4),
                             "yaw_valid": loc.yaw_valid,
                             "t": round(job.exposure_pc, 6),
                             "tag_id": loc.tag_id,
@@ -2517,6 +2523,12 @@ def main() -> int:
                 if car_localizer is not None else 0
             ),
             "car_loc_dropped_frames": car_loc_dropped_frames,
+            # 单 tag 退化帧：只剩一块 tag，位置照发但 yaw=null（消费端保持自身
+            # yaw）。这个数高说明有一块 tag 长期被挡/看不见，该挪位置或补第三块。
+            "car_loc_single_tag_frames": (
+                getattr(car_localizer, "single_tag_frames", 0)
+                if car_localizer is not None else 0
+            ),
             "state_transitions": len(log_state_transitions),
             # 形状门统计：被 max_box_aspect_ratio 拦掉的网球框有多少、平均/最大长宽比多少。
             # rejected 占比高 = 曝光太长、球被拖影拉长（回球段最严重），该降曝光而不是放宽门。
@@ -2574,7 +2586,8 @@ def main() -> int:
         f"hits={len(log_car_locs)}  "
         f"sampled={car_loc_sampled_frames}  "
         f"misses={car_loc_missed_frames}  "
-        f"dropped={car_loc_dropped_frames}"
+        f"dropped={car_loc_dropped_frames}  "
+        f"single_tag={getattr(car_localizer, 'single_tag_frames', 0)}"
     )
     print(f"  状态转换:   {len(log_state_transitions)}")
     print(f"  超时次数:   {timeout_count}")

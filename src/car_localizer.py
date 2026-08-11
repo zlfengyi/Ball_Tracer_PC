@@ -16,8 +16,10 @@
   6. 直接输出车底盘中心位姿（车心即优化变量，无需 tag→车心换算）
 
 双 tag 同时可见时 ~0.9 m 的中心基线让 yaw 远优于单 tag 16 cm 边长的短基线。
-产品约定：locate() 只在两块 tag 都参与拟合时给出结果（单 tag 不发布）；
-单 tag 拟合仅供诊断（estimate_car_pose / estimate_pose 直调）。
+产品约定：locate() 首选两块 tag 联合拟合（x/y/yaw 全解）；只剩一块 tag 时退化为
+「冻结最近一次可信 yaw、只解 x/y」并返回 yaw=None，由消费端保持自身 yaw 不更新
+（2026-08-11 起；此前是单 tag 一律不发布）。自由 yaw 的单 tag 拟合仍只供诊断
+（estimate_car_pose / estimate_pose 直调）。
 
 用法：
   localizer = CarLocalizer()
@@ -57,6 +59,11 @@ _HUBER_DELTA_PX = 3.0
 _VIEW_OUTLIER_MIN_PX = 4.0
 _VIEW_OUTLIER_RATIO = 2.5
 _YAW_MAX_REPROJECTION_ERROR_PX = 8.0
+# 单 tag 退化拟合时，冻结用的「最近一次双 tag yaw」允许多陈旧 (s)。
+# 车 yaw 变化慢：0811 场实测各定位空洞两端 yaw 差 1~5°/1.2~2.2s（≈3°/s 上界），
+# 0.5s 陈旧 ⇒ ~1.5°，经 tag0 的 0.42m 安装杠杆只值 ~11mm，比整帧丢定位好两个量级。
+# 再旧就不发——单 tag 自己的印面短基线 yaw（0.161m）不拿来解位置，见 locate()。
+_SINGLE_TAG_YAW_MAX_AGE_S = 0.5
 
 
 @dataclass
@@ -79,7 +86,9 @@ class CarLoc:
     cameras_used: list[str]        # 参与最终刚体拟合的相机序列号
     pixels: dict[str, tuple[float, float]]  # {序列号: 主 tag 中心 (u, v)}
     reprojection_error: float      # 平均重投影误差 (px)
-    yaw: float                     # 底盘绕 z 轴旋转角 (rad)
+    # 底盘绕 z 轴旋转角 (rad)。None = 本帧给不出可信 yaw（单 tag 退化，位置是拿
+    # 冻结的历史 yaw 解出来的），消费端必须保持自身 yaw 不更新，只吃 x/y。
+    yaw: Optional[float]
     yaw_valid: bool                # 双 tag 或 3+ 相机、且四角误差合格才允许修正底盘 yaw
     tag_ids: list[int] = field(default_factory=list)  # 参与最终拟合的全部 tag
     # 参与最终拟合的各 (相机, tag) 检测角点 {序列号: {tag_id: (4,2) 像素}}，供离线叠加画识别框
@@ -227,6 +236,11 @@ class CarLocalizer:
         self._prefer_enhanced = False
         self._raw_fail_streak = 0
         self._enhanced_since_probe = 0
+        # 单 tag 退化路径用的冻结 yaw：只由「双 tag 且 yaw_valid」的结果刷新，
+        # 单 tag 帧自己解出的 yaw 绝不回灌（否则误差会沿着退化链自我累积）。
+        self._hold_yaw: Optional[float] = None
+        self._hold_yaw_t: Optional[float] = None
+        self.single_tag_frames = 0     # 诊断计数：走退化路径发出的帧数
 
     # 连续 N 次 raw 空而增强有效 → 切到「增强起手」；之后每 M 次回探一次 raw，
     # 免得光线恢复了还一直吃增强图（增强图角点有 ~0.27° 偏移，能不用就不用）。
@@ -326,6 +340,7 @@ class CarLocalizer:
         self,
         tag_detections: dict[int, dict[str, CarDetection]],
         t: float = 0.0,
+        fixed_yaw: Optional[float] = None,
     ) -> Optional[CarLoc]:
         """
         对多台相机中若干车载 tag 的四角做车位姿联合刚体拟合。
@@ -335,6 +350,8 @@ class CarLocalizer:
                 tag；至少一块 tag 需被 >=2 台相机看到（用于初值三角化），
                 其余 1 台相机的 tag 观测也会加入联合优化。
             t: 时间戳 (perf_counter)。
+            fixed_yaw: 给定时 yaw 冻结在该值上只解 x/y，返回的 CarLoc.yaw 为
+                None、yaw_valid 为 False（单 tag 退化路径，见 locate()）。
 
         Returns:
             CarLoc，或 None（初值不可解 / 剔除后有效相机不足 2 台）。
@@ -344,7 +361,7 @@ class CarLocalizer:
             for tag_id, cam_dets in tag_detections.items()
             if tag_id in self._tags and cam_dets
         }
-        pose = self._initial_pose(usable)
+        pose = self._initial_pose(usable, fixed_yaw)
         if pose is None:
             return None
 
@@ -357,7 +374,9 @@ class CarLocalizer:
 
         # Huber 拟合后按视图四角 RMS 逐个剔除明显离群者；剩 2 个视图时停止。
         while True:
-            pose, residual = self._fit_car_pose(pose, units)
+            pose, residual = self._fit_car_pose(
+                pose, units, free_yaw=(fixed_yaw is None)
+            )
             if len(units) <= 2:
                 break
             view_rms = [
@@ -409,9 +428,12 @@ class CarLocalizer:
             cameras_used=cameras_used,
             pixels=pixels,
             reprojection_error=reprojection_error,
-            yaw=yaw,
+            # yaw 冻结解出来的位姿不带 yaw 信息：本帧的 yaw 是历史值，原样发回去
+            # 会让消费端把陈旧值当新观测反复吸收，必须显式报 None。
+            yaw=None if fixed_yaw is not None else yaw,
             yaw_valid=(
-                reprojection_error <= _YAW_MAX_REPROJECTION_ERROR_PX
+                fixed_yaw is None
+                and reprojection_error <= _YAW_MAX_REPROJECTION_ERROR_PX
                 and (len(tag_ids) >= 2 or len(cameras_used) >= 3)
             ),
             tag_ids=tag_ids,
@@ -441,6 +463,7 @@ class CarLocalizer:
         images: dict[str, np.ndarray],
         t: float = 0.0,
         min_tags: int = 2,
+        single_tag_fallback: bool = True,
     ) -> Optional[CarLoc]:
         """
         检测 + 车位姿联合估计一步完成。
@@ -448,19 +471,26 @@ class CarLocalizer:
         在所有图像中检测 AprilTag，收集所有已配置车载 tag 的观测，
         联合做车位姿刚体拟合。
 
-        默认要求至少 2 块车载 tag 参与最终拟合才返回结果——单 tag 位姿
-        的 yaw 基线短、且经安装杠杆放大位置误差，不发布（产品约定）。
-        生产链路（tracker 发布 /pc_car_loc、离线补标）都走本入口；
-        诊断需要单 tag 结果时传 min_tags=1 或直接用 estimate_car_pose。
+        **首选路径**是 min_tags 块 tag 联合拟合（默认 2），x/y/yaw 全解。
+
+        **退化路径**（single_tag_fallback，2026-08-11 加）：首选路径拿不到结果、
+        但仍有一块 tag 被 >=2 台相机看到时，用最近一次可信 yaw 冻结着只解 x/y，
+        返回 `yaw=None` 的 CarLoc。动机是 0811 053055 场实测：tag1 被臂座自遮挡，
+        373/378 两台常年看不到它，而与门要求两块都在，于是击球瞬间成片丢定位
+        （18 抛里 4 抛的真值因此为空，空洞 0.65~2.2s）；同批 miss 帧里 tag0 在
+        >=2 台相机的检出率是 15/15。位置来自 tag 中心多视图三角化（无短基线
+        问题），只有 0.42m 安装杠杆要乘 yaw 误差：冻结 yaw 陈旧 <=0.5s ⇒ ~1.5°
+        ⇒ ~11mm，远好于整帧丢定位。yaw 一律不发（None），由消费端保持自身值。
 
         Args:
             images: {序列号: BGR 图像}
             t: 时间戳。
-            min_tags: 最终拟合中最少 tag 块数。
+            min_tags: 首选路径中最少 tag 块数。
+            single_tag_fallback: 关掉即回到 2026-08-11 之前的纯与门行为。
 
         Returns:
-            CarLoc 或 None（无 tag 被 >=2 台相机检测到 / 参与拟合的
-            tag 数不足 min_tags）。
+            CarLoc 或 None（无 tag 被 >=2 台相机检测到 / 首选路径失败且退化
+            路径不可用）。
         """
         # 并行检测所有相机（复用线程池）
         all_dets = {}
@@ -475,16 +505,39 @@ class CarLocalizer:
                 if d.tag_id in self._tags:
                     tag_cameras.setdefault(d.tag_id, {})[sn] = d
 
-        if len(tag_cameras) < min_tags:
-            return None
+        # 无论走哪条路径，都至少要有一块 tag 能被三角化出中心
         if not any(len(cam_dets) >= 2 for cam_dets in tag_cameras.values()):
             return None
 
-        result = self.estimate_car_pose(tag_cameras, t)
-        if result is not None and len(result.tag_ids) < min_tags:
-            # 离群剔除后有 tag 整块出局（如仅剩单视图且被剔），不发布
+        if len(tag_cameras) >= min_tags:
+            result = self.estimate_car_pose(tag_cameras, t)
+            # 离群剔除后有 tag 整块出局（如仅剩单视图且被剔）也算首选路径失败
+            if result is not None and len(result.tag_ids) >= min_tags:
+                if result.yaw is not None and result.yaw_valid:
+                    self._hold_yaw = result.yaw
+                    self._hold_yaw_t = t
+                return result
+
+        if not single_tag_fallback:
             return None
+        yaw = self._fresh_hold_yaw(t)
+        if yaw is None:
+            # 还没锁定过 yaw（或已经太旧）：单 tag 的印面短基线 yaw 不足以撑住
+            # 0.42m 杠杆，宁可不发，别用一个说不清误差的位置污染下游。
+            return None
+        result = self.estimate_car_pose(tag_cameras, t, fixed_yaw=yaw)
+        if result is not None:
+            self.single_tag_frames += 1
         return result
+
+    def _fresh_hold_yaw(self, t: float) -> Optional[float]:
+        """最近一次可信 yaw，超过 _SINGLE_TAG_YAW_MAX_AGE_S 就作废。"""
+        if self._hold_yaw is None or self._hold_yaw_t is None:
+            return None
+        age = t - self._hold_yaw_t
+        if not (0.0 <= age <= _SINGLE_TAG_YAW_MAX_AGE_S):
+            return None
+        return self._hold_yaw
 
     # ── 内部方法 ──────────────────────────────────────────────────────
 
@@ -538,11 +591,18 @@ class CarLocalizer:
         self,
         initial_pose: np.ndarray,
         units: list[tuple[str, int, CarDetection]],
+        free_yaw: bool = True,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Huber Gauss-Newton 优化车位姿 [x_mm, y_mm, yaw_rad]。"""
+        """Huber Gauss-Newton 优化车位姿 [x_mm, y_mm, yaw_rad]。
+
+        free_yaw=False 时 yaw 冻结在初值上，只解 x/y（单 tag 退化用）：印面
+        0.161m 短基线解出的 yaw 会经 0.42m 安装杠杆放大成位置误差，宁可用
+        最近一次双 tag 的 yaw 冻住，把这一帧的自由度降到 2。
+        """
         pose = initial_pose.copy()
         eps = np.array([0.1, 0.1, 1e-4], dtype=np.float64)
         max_step = np.array([200.0, 200.0, 0.35], dtype=np.float64)
+        columns = (0, 1, 2) if free_yaw else (0, 1)
 
         for _ in range(10):
             residual = self._car_corner_residuals(pose, units)
@@ -552,21 +612,23 @@ class CarLocalizer:
             corner_weights[large] = _HUBER_DELTA_PX / corner_norms[large]
             row_weights = np.repeat(np.sqrt(corner_weights), 2)
 
-            jacobian = np.empty((residual.size, 3), dtype=np.float64)
-            for column in range(3):
+            jacobian = np.empty((residual.size, len(columns)), dtype=np.float64)
+            for slot, column in enumerate(columns):
                 plus = pose.copy()
                 minus = pose.copy()
                 plus[column] += eps[column]
                 minus[column] -= eps[column]
-                jacobian[:, column] = (
+                jacobian[:, slot] = (
                     self._car_corner_residuals(plus, units)
                     - self._car_corner_residuals(minus, units)
                 ) / (2.0 * eps[column])
 
-            step = solve_least_squares(
+            free_step = solve_least_squares(
                 jacobian * row_weights[:, None],
                 -residual * row_weights,
             )
+            step = np.zeros(3, dtype=np.float64)
+            step[list(columns)] = free_step
             step = np.clip(step, -max_step, max_step)
             current_cost = self._huber_cost(corner_norms)
             accepted = False
@@ -588,14 +650,32 @@ class CarLocalizer:
 
         return pose, self._car_corner_residuals(pose, units)
 
+    def _xy_from_centers(
+        self,
+        centers: dict[int, np.ndarray],
+        yaw: float,
+    ) -> np.ndarray:
+        """已知 yaw 时，由若干 tag 的三角化中心反解车心 xy（多块取平均）。"""
+        c = math.cos(yaw)
+        s = math.sin(yaw)
+        xy = np.zeros(2, dtype=np.float64)
+        for tag_id, center_w in centers.items():
+            a = self._tags[tag_id].center_car_mm[:2]
+            xy += center_w[:2] - np.array(
+                [c * a[0] - s * a[1], s * a[0] + c * a[1]]
+            )
+        return xy / len(centers)
+
     def _initial_pose(
         self,
         tag_detections: dict[int, dict[str, CarDetection]],
+        fixed_yaw: Optional[float] = None,
     ) -> Optional[np.ndarray]:
         """DLT 三角化生成车位姿初值 [x_mm, y_mm, yaw_rad]。
 
         双 tag（各 >=2 相机）：由两中心基线解 yaw；单 tag：由印面角点边
-        方向 + 安装旋转解 yaw。
+        方向 + 安装旋转解 yaw。fixed_yaw 给定时直接用它，不做任何 yaw 估计
+        （单 tag 退化路径：位置纯靠 tag 中心三角化 + 冻结 yaw 的安装杠杆）。
         """
         centers: dict[int, np.ndarray] = {}
         for tag_id, cam_dets in tag_detections.items():
@@ -609,7 +689,10 @@ class CarLocalizer:
         if not centers:
             return None
 
-        if len(centers) >= 2:
+        if fixed_yaw is not None:
+            yaw = float(fixed_yaw)
+            xy = self._xy_from_centers(centers, yaw)
+        elif len(centers) >= 2:
             tag_a, tag_b = sorted(centers)[:2]
             w_ab = centers[tag_b][:2] - centers[tag_a][:2]
             a_ab = (
@@ -619,15 +702,9 @@ class CarLocalizer:
             yaw = (
                 math.atan2(w_ab[1], w_ab[0]) - math.atan2(a_ab[1], a_ab[0])
             )
-            c = math.cos(yaw)
-            s = math.sin(yaw)
-            xy = np.zeros(2)
-            for tag_id in (tag_a, tag_b):
-                a = self._tags[tag_id].center_car_mm[:2]
-                xy += centers[tag_id][:2] - np.array(
-                    [c * a[0] - s * a[1], s * a[0] + c * a[1]]
-                )
-            xy *= 0.5
+            xy = self._xy_from_centers(
+                {tag_id: centers[tag_id] for tag_id in (tag_a, tag_b)}, yaw
+            )
         else:
             (tag_id, center_w), = centers.items()
             cam_dets = tag_detections[tag_id]
@@ -660,12 +737,7 @@ class CarLocalizer:
                 math.atan2(p_b[1] - p_a[1], p_b[0] - p_a[0])
                 - math.atan2(axis_car[1], axis_car[0])
             )
-            c = math.cos(yaw)
-            s = math.sin(yaw)
-            a = spec.center_car_mm[:2]
-            xy = center_w[:2] - np.array(
-                [c * a[0] - s * a[1], s * a[0] + c * a[1]]
-            )
+            xy = self._xy_from_centers({tag_id: center_w}, yaw)
 
         return np.array(
             [xy[0], xy[1], self._normalize_angle(yaw)], dtype=np.float64
