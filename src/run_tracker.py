@@ -50,7 +50,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import cv2
 import numpy as np
@@ -78,6 +78,7 @@ from src import (
     StationaryObjectFilter,
 )
 from src.ball_grabber import frame_bayer_roi_to_numpy
+from src.racket_swing import ContactSolver as RacketContactSolver, RacketSwingTracker
 from src.curve4 import (
     BallObservation,
     Curve4Tracker,
@@ -299,6 +300,36 @@ def _car_submit_latest(
                 continue
 
 
+# 时钟桥订阅哪条 RK topic：要高频、载荷时刻贴近发布时刻。/bot_state 是 100Hz 的车状态，
+# 载荷 t 就是这一帧状态的时刻，最合适。ball_world 之类不行——它的 t 是相机曝光时刻，
+# 中间隔着 ~56ms 视觉管线，会把桥整体推偏（虽然定窗够用，但没必要引入已知偏差）。
+_CLOCK_BRIDGE_TOPIC = "/bot_state"
+_PREDICT_HIT_TOPIC = "/predict_hit_pos"
+_BALL_WORLD_TOPIC = "/ball_world_topic"
+_RACKET_VZ_TOPIC = "/racket_vz"
+# 同一抛的 stage 0 会连着发几十条；间隔超过这个值才算新的一抛
+_STAGE0_BURST_GAP_S = 1.5
+
+
+def clock_bridge_stats(offsets: list[float], *, source: str) -> dict | None:
+    """(PC perf 轴 − RK 单调钟) 样本 → 中位数 + MAD。
+
+    取中位数而不是均值：偶发的网络重传/调度尖峰会把均值拖歪，中位数不受影响。
+    样本太少时返回 None——报告端拿不到桥会自己退到位姿形状锁，宁可没有也不要不准。
+    """
+    if len(offsets) < 20:
+        return None
+    ordered = sorted(offsets)
+    median = ordered[len(ordered) // 2]
+    deviations = sorted(abs(value - median) for value in ordered)
+    return {
+        "source": source,
+        "pc_minus_rk": median,
+        "mad": deviations[len(deviations) // 2],
+        "n": len(ordered),
+    }
+
+
 class NullRos2Sink:
     mode = "off"
 
@@ -306,6 +337,18 @@ class NullRos2Sink:
         return None
 
     def publish_predict_hit(self, payload: dict) -> None:
+        return None
+
+    def publish_racket_vz(self, payload: dict) -> None:
+        return None
+
+    def set_ball_world_callback(self, callback) -> None:
+        return None
+
+    def stage0_burst_start(self) -> float | None:
+        return None
+
+    def clock_bridge(self) -> dict | None:
         return None
 
     def close(self) -> None:
@@ -364,6 +407,18 @@ class UdpBridgeRos2Sink:
             self._sock_hit.sendto(json.dumps(payload).encode(), self._addr_hit)
         except OSError:
             pass
+
+    def publish_racket_vz(self, payload: dict) -> None:
+        return None
+
+    def set_ball_world_callback(self, callback) -> None:
+        return None
+
+    def stage0_burst_start(self) -> float | None:
+        return None
+
+    def clock_bridge(self) -> dict | None:
+        return None
 
     def close(self) -> None:
         self._sock_car.close()
@@ -451,10 +506,39 @@ class DirectRos2Sink:
         self._pub_lock = threading.Lock()
         self._car_count = 0
         self._spin_stop = threading.Event()
+        self._bridge_lock = threading.Lock()
+        self._bridge_offsets: list[float] = []
         self._rclpy.init(args=None)
         self._node = Node("ball_tracer_tracker")
         self._car_pub = self._node.create_publisher(
             String, "/pc_car_loc", make_best_effort_qos()
+        )
+        # PC↔RK 时钟桥：订阅一条 RK 高频 topic，只记 (本机 perf_counter 收到时刻 −
+        # 载荷里的 RK 单调钟时刻)。差值 = 两轴常量偏移 + 网络/载荷年龄（几 ms~几十 ms），
+        # 足够把报告的搜索窗收到 ±0.75s，再由 z 形状精锁做亚毫秒。
+        # 这是唯一不依赖「本场有没有球/有没有看到 tag」的对齐手段——没有它时报告只能靠
+        # 位姿形状 + 球 z 形状去猜，空场次/丢球场次就对不上（见 memory v03-rk-pc-report-align）。
+        self._bridge_sub = self._node.create_subscription(
+            String, _CLOCK_BRIDGE_TOPIC, self._on_bridge_msg, make_best_effort_qos()
+        )
+        # 挥拍测量的触球锚点：订 RK 的世界系球点，自己沿弹前抛物线反解触球时刻。
+        # 一开始用的是「首条 stage 0 + 固定偏移」，0811 那批场次实测滞后差 400ms 以上、
+        # 读到收拍段、逐场相关性翻负——锚点必须物理定义，不能依赖 bot_center 的发射时机。
+        # 顺带订 predict_hit_pos 只为把首条 stage 0 的时刻记进产物做对照。
+        self._ball_world_cb: Callable[[float, dict], None] | None = None
+        self._stage0_last_recv: float | None = None
+        self._stage0_first_recv: float | None = None
+        self._ball_sub = self._node.create_subscription(
+            String, _BALL_WORLD_TOPIC, self._on_ball_world_msg,
+            make_topic_qos(_BALL_WORLD_TOPIC, depth=10),
+        )
+        self._predict_sub = self._node.create_subscription(
+            String, _PREDICT_HIT_TOPIC, self._on_predict_msg,
+            make_topic_qos(_PREDICT_HIT_TOPIC, depth=10),
+        )
+        # 拍头竖直速度：每抛一条发给 bot_center（stage0 反弹预测用 vz 版 cor_xy）。
+        self._racket_vz_pub = self._node.create_publisher(
+            String, _RACKET_VZ_TOPIC, make_topic_qos(_RACKET_VZ_TOPIC, depth=4)
         )
         self._executor = self._executor_type()
         self._executor.add_node(self._node)
@@ -476,6 +560,58 @@ class DirectRos2Sink:
         while not self._spin_stop.is_set():
             self._executor.spin_once(timeout_sec=0.1)
 
+    def _on_bridge_msg(self, msg) -> None:
+        recv_pc = time.perf_counter()
+        try:
+            rk_t = json.loads(msg.data).get("t")
+        except Exception:
+            return
+        if not isinstance(rk_t, (int, float)) or not math.isfinite(rk_t):
+            return
+        with self._bridge_lock:
+            self._bridge_offsets.append(recv_pc - float(rk_t))
+
+    def set_ball_world_callback(self, callback) -> None:
+        self._ball_world_cb = callback
+
+    def stage0_burst_start(self) -> float | None:
+        """本抛第一条 stage 0 的收包时刻，只用于产物里和物理锚点做对照。"""
+        return self._stage0_first_recv
+
+    def _on_ball_world_msg(self, msg) -> None:
+        recv_pc = time.perf_counter()
+        cb = self._ball_world_cb
+        if cb is None:
+            return
+        try:
+            payload = json.loads(msg.data)
+        except Exception:
+            return
+        try:
+            cb(recv_pc, payload)
+        except Exception as exc:
+            print(f"  挥拍取数失败: {exc}", flush=True)
+
+    def _on_predict_msg(self, msg) -> None:
+        recv_pc = time.perf_counter()
+        try:
+            payload = json.loads(msg.data)
+        except Exception:
+            return
+        # bot_center 独有字段：本机自己发的 predict 载荷没有它
+        if "s0_gate" not in payload or payload.get("stage") != 0:
+            return
+        last = self._stage0_last_recv
+        if last is None or recv_pc - last > _STAGE0_BURST_GAP_S:
+            self._stage0_first_recv = recv_pc
+        self._stage0_last_recv = recv_pc
+
+    def clock_bridge(self) -> dict | None:
+        """`pc_minus_rk` 直接就是报告要的绝对轴偏移：PC perf ≈ RK t + pc_minus_rk。"""
+        with self._bridge_lock:
+            offsets = list(self._bridge_offsets)
+        return clock_bridge_stats(offsets, source=_CLOCK_BRIDGE_TOPIC)
+
     def _publish(self, publisher, payload: dict) -> None:
         msg = self._msg_type()
         msg.data = json.dumps(payload)
@@ -496,6 +632,9 @@ class DirectRos2Sink:
 
     def publish_predict_hit(self, payload: dict) -> None:
         return None
+
+    def publish_racket_vz(self, payload: dict) -> None:
+        self._publish(self._racket_vz_pub, payload)
 
     def close(self) -> None:
         self._spin_stop.set()
@@ -1608,6 +1747,12 @@ def main() -> int:
     search_hold_frames = tracker_cfg.get("search_hold_frames", 4)
     min_cameras_for_3d = tracker_cfg.get("min_cameras_for_3d", 2)
     max_reproj_error_px = tracker_cfg.get("max_reproj_error_px", 15.0)
+    # 多假设三角化（2026-08-11）：一台相机框到 2 颗球时不再整台丢弃，改按几何
+    # 一致性择优。ball_require_exactly_one=true 可整条回退到旧行为做 A/B。
+    ball_max_candidates_per_camera = int(
+        tracker_cfg.get("ball_max_candidates_per_camera", 2))
+    ball_require_exactly_one = bool(
+        tracker_cfg.get("ball_require_exactly_one", False))
     curve4_cfg = tracker_cfg.get("curve4", {})
     detection_cfg = tracker_cfg.get("detection_postprocess", {})
     detection_duplicate_iou_threshold = detection_cfg.get(
@@ -1626,6 +1771,8 @@ def main() -> int:
         for selector in tracker_cfg.get("ball_detection_disabled_serials", [])
         if str(selector).strip()
     ]
+    racket_swing_cfg = tracker_cfg.get("racket_swing", {})
+    racket_swing_enabled = racket_swing_cfg.get("enabled", False)
     car_loc_cfg = tracker_cfg.get("car_localizer", {})
     car_loc_enabled = car_loc_cfg.get("enabled", True)
     car_loc_sample_every_frames = max(
@@ -1690,6 +1837,25 @@ def main() -> int:
     calib_serials = list(localizer.serials)
     print(f"  标定相机: {calib_serials}")
 
+    # 球员挥拍竖直速度：四台各测一份全部记录进 tracker_*.json；同时把共识对
+    # （0405/0373，语料 LOSO 留出 +0.78 的配对）的均值经 /racket_vz 发给 bot_center，
+    # 供 stage0 反弹预测用 vz 版 cor_xy（两相机不一致时 trusted=false，RK 端不采用）。
+    racket_swings: dict[str, RacketSwingTracker] = {}
+    if racket_swing_enabled:
+        for _sn in racket_swing_cfg.get("serials", calib_serials):
+            if _sn not in calib_serials:
+                continue
+            _rs = RacketSwingTracker(racket_swing_cfg, args.calib_config, _sn)
+            racket_swings[_sn] = _rs
+            print(
+                f"  挥拍测量 {_sn}: box={_rs.player_box} m/px={_rs.m_per_px:.5f} "
+                f"球员完整可见={_rs.player_fully_visible}"
+            )
+        if not racket_swings:
+            print("  挥拍测量: 无可用相机")
+    else:
+        print("  挥拍测量: disabled")
+
     print("[3/5] 初始化 Curve4Tracker...")
     tracker = Curve4Tracker(**curve4_cfg)
     print(f"  ideal_hit_z={tracker.ideal_hit_z:.3f}m, cor={tracker.cor}, "
@@ -1730,6 +1896,72 @@ def main() -> int:
 
     # ── ROS2 边车子进程（rosbag 录制 / 发送 sink）──
     _ros2_sink = _create_ros2_sink(args.ros2_mode)
+
+    # RK 的世界系球点 → 反解球员触球时刻 → 回看挥拍缓冲取一次拍头竖直速度。
+    # t0 由主循环第一帧填；在那之前收到的（tracker 刚起、场上已经在打）直接丢。
+    # 同时记 stage0 首条的收包时刻，用来在产物里对照两种锚点的差。
+    racket_swing_log: list[dict] = []
+    _swing_t0: list[float | None] = [None]
+    _contact_solver = RacketContactSolver(racket_swing_cfg) if racket_swing_enabled else None
+    # /racket_vz 的共识对与门限；ContactSolver 在球轨迹断段后会对同一抛重新点火
+    # （实测同一 contact 双条），发布端 1.2s 内只发第一条。
+    _consensus_pair = list(racket_swing_cfg.get(
+        "consensus_serials", ["DB0260405", "DB0260373"]))
+    _consensus_dv_max = float(racket_swing_cfg.get("consensus_dv_max", 0.6))
+    _last_racket_pub = [float("-inf")]
+
+    def _on_ball_world(recv_pc: float, payload: dict) -> None:
+        if _contact_solver is None or not racket_swings or _swing_t0[0] is None:
+            return
+        contact_pc = _contact_solver.add(payload, recv_pc)
+        if contact_pc is None:
+            return
+        contact = contact_pc - _swing_t0[0]
+        s0 = _ros2_sink.stage0_burst_start()
+        entry = {
+            "contact_elapsed_s": round(contact, 4),
+            "stage0_elapsed_s": None if s0 is None else round(s0 - _swing_t0[0], 4),
+            "cams": {},
+        }
+        for _sn, _swing in racket_swings.items():
+            reading = _swing.read(contact)
+            if reading is not None:
+                entry["cams"][_sn] = reading
+        racket_swing_log.append(entry)
+        # 发给 bot_center：**只发高置信**（0813 用户定）——两台共识相机都在测且
+        # |Δvz| 过门才发，单相机/不一致整条不发（RK 端一抛只认领一条并整抛锁存，
+        # 发一条可疑的比不发更糟）。全部原始读数照旧留在 session json 里供离线复盘。
+        vals = [entry["cams"][sn]["vz"] for sn in _consensus_pair if sn in entry["cams"]]
+        dv = abs(vals[0] - vals[1]) if len(vals) == 2 else None
+        published = ""
+        if dv is not None and dv <= _consensus_dv_max:
+            if contact_pc - _last_racket_pub[0] > 1.2:
+                _last_racket_pub[0] = contact_pc
+                vz_payload = {
+                    "vz": round(sum(vals) / len(vals), 3),
+                    "n_cams": len(vals),
+                    "dv": round(dv, 3),
+                    "trusted": True,
+                    "contact_elapsed_s": entry["contact_elapsed_s"],
+                    "t": round(recv_pc, 4),
+                }
+                _ros2_sink.publish_racket_vz(vz_payload)
+                entry["published"] = vz_payload
+                published = f"  → /racket_vz vz={vz_payload['vz']:+.2f}"
+        elif vals:
+            entry["publish_suppressed"] = (
+                "single_cam" if dv is None else f"dv={dv:.2f}")
+            published = "  (共识不足，不发)"
+        summary = ", ".join(
+            f"{sn[-4:]}={r['label']}({r['vz']:+.2f})" for sn, r in entry["cams"].items()
+        )
+        print(
+            f"  挥拍 #{len(racket_swing_log)} 触球@{contact:.3f}s  "
+            f"{summary or '无读数'}{published}",
+            flush=True,
+        )
+
+    _ros2_sink.set_ball_world_callback(_on_ball_world)
     if save_logs:
         _rosbag_proc = RosbagRecorderProcess(bag_dir=output_dir / f"{run_id}_rosbag")
     else:
@@ -2029,6 +2261,11 @@ def main() -> int:
                         _full_decode_time_sum += time.perf_counter() - t0
                         _full_decode_count += 1
 
+                        for _sn, _swing in racket_swings.items():
+                            _img = images.get(_sn)
+                            if _img is not None:
+                                _swing.update(_img, job.elapsed_s)
+
                         if job.car_loc_sampled:
                             assert _car_job_queue is not None
                             stale = _car_submit_latest(
@@ -2119,6 +2356,7 @@ def main() -> int:
                 exposure_pc = sum(exp_starts) / len(exp_starts)
                 if first_frame_exposure_pc is None:
                     first_frame_exposure_pc = exposure_pc
+                    _swing_t0[0] = exposure_pc
                 frame_elapsed_s = exposure_pc - first_frame_exposure_pc
 
                 # ── 标记本帧是否需要后台车辆定位 ──
@@ -2218,38 +2456,36 @@ def main() -> int:
                 ball3d: Ball3D | None = None
                 tracker_result: TrackerResult
 
-                # 收集恰好检测到 1 个网球的相机
-                good_dets: dict[str, BallDetection] = {}
+                # 各相机的网球候选框（多球时不再整台丢弃，交给几何一致性择优，
+                # 见 BallLocalizer.select_and_triangulate）
+                ball_cands: dict[str, list[BallDetection]] = {}
                 for sn, dets in all_detections.items():
                     ball_dets = [det for det in dets if det.is_tennis_ball]
-                    if len(ball_dets) == 1:
-                        good_dets[sn] = ball_dets[0]
+                    if ball_dets:
+                        ball_cands[sn] = ball_dets
 
                 # 尝试三角测量并检查重投影误差
                 compute_done_t: Optional[float] = None
-                if len(good_dets) >= min_cameras_for_3d:
-                    candidate = localizer.triangulate(good_dets)
-                    if candidate.reprojection_error <= max_reproj_error_px:
-                        ball3d = candidate
-                        for sn, det in good_dets.items():
-                            tile_mgr.on_3d_located(
-                                sn, det.x, det.y, exposure_pc)
-                        tracker_result = tracker.update(BallObservation(
-                            x=ball3d.x, y=ball3d.y,
-                            z=ball3d.z, t=exposure_pc,
-                        ))
-                        # 在 tracker.update() 刚返回的时刻抓 perf_counter，作为本预测的
-                        # 算完时间。compute_latency = compute_done_t - ct 即算几 ms 延迟。
-                        compute_done_t = time.perf_counter()
-                    else:
-                        for sn in good_dets:
-                            tile_mgr.on_2d_detected(sn, frame_tiles[sn])
-                        tracker_result = TrackerResult(
-                            prediction=None,
-                            state=tracker.tracker_state,
-                        )
+                candidate = localizer.select_and_triangulate(
+                    ball_cands,
+                    min_cameras=min_cameras_for_3d,
+                    max_reproj_error_px=max_reproj_error_px,
+                    max_per_camera=ball_max_candidates_per_camera,
+                    require_exactly_one=ball_require_exactly_one,
+                )
+                if candidate is not None:
+                    ball3d = candidate
+                    for sn, (u, v) in candidate.pixels.items():
+                        tile_mgr.on_3d_located(sn, u, v, exposure_pc)
+                    tracker_result = tracker.update(BallObservation(
+                        x=ball3d.x, y=ball3d.y,
+                        z=ball3d.z, t=exposure_pc,
+                    ))
+                    # 在 tracker.update() 刚返回的时刻抓 perf_counter，作为本预测的
+                    # 算完时间。compute_latency = compute_done_t - ct 即算几 ms 延迟。
+                    compute_done_t = time.perf_counter()
                 else:
-                    for sn in good_dets:
+                    for sn in ball_cands:
                         tile_mgr.on_2d_detected(sn, frame_tiles[sn])
                     tracker_result = TrackerResult(
                         prediction=None,
@@ -2421,6 +2657,9 @@ def main() -> int:
                 if engine_batch > 0 else 0
             ),
             "ros2_mode": _ros2_sink.mode,
+            # PC↔RK 时钟桥（见 DirectRos2Sink.clock_bridge）。报告端拿它当第一优先的
+            # 搜索窗来源：不依赖本场有没有球、有没有看到 tag，空场次也能对上。
+            "rk_clock_bridge": _ros2_sink.clock_bridge(),
             "detection_postprocess": {
                 "duplicate_iou_threshold": detection_duplicate_iou_threshold,
                 "max_box_aspect_ratio": detection_max_box_aspect_ratio,
@@ -2546,6 +2785,7 @@ def main() -> int:
         },
         "observations": log_observations,
         "predictions": log_predictions,
+        "racket_swing": racket_swing_log,
         "car_locs": log_car_locs,
         "frames": log_frames,
         "video_frame_indices": written_frame_indices,

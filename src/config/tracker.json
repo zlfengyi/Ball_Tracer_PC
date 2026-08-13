@@ -6,6 +6,8 @@
     "min_cameras_for_3d": 2,
     "ball_detection_disabled_serials": ["029"],
     "max_reproj_error_px": 15.0,
+    "ball_max_candidates_per_camera": 1,
+    "ball_require_exactly_one": false,
     "detection_postprocess": {
         "duplicate_iou_threshold": 0.95,
         "max_box_aspect_ratio": 1.6
@@ -15,6 +17,25 @@
         "window_s": 15.0,
         "radius_px": 2.0,
         "min_occurrences": 6
+    },
+    "racket_swing": {
+        "enabled": true,
+        "player_box_world_m": {"x": [-2.5, 2.5], "y": [14.0, 20.0], "z": [0.0, 2.4]},
+        "roi_half_px": [95, 95],
+        "roi_offset_v_px": -15,
+        "top_k": 90,
+        "contact_height_m": 1.05,
+        "contact_min_points": 6,
+        "contact_min_approach_mps": 3.0,
+        "contact_cooldown_s": 1.5,
+        "read_delay_s": -0.025,
+        "read_half_s": 0.12,
+        "consensus_serials": ["DB0260405", "DB0260373"],
+        "consensus_dv_max": 0.6,
+        "lift_threshold_mps": 0.85,
+        "slice_threshold_mps": -0.35,
+        "buffer_seconds": 2.5,
+        "trace_half_s": 0.6
     },
     "car_localizer": {
         "enabled": true,
