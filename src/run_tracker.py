@@ -99,6 +99,12 @@ from src.ros2_support import (
 )
 from src.tile_manager import TileManager, TileRect
 
+# 车型 → src/config/ 下的车载 AprilTag 布局文件。启动必须显式选一个（见 --car）。
+CAR_LAYOUT_CONFIGS = {
+    "v03": "arm_poe_racket_center.json",
+    "v04": "vehicle_v04.json",
+}
+
 
 def _terminate_process_tree(proc: subprocess.Popen | None, *, timeout: float = 3.0) -> None:
     if proc is None or proc.poll() is not None:
@@ -1724,7 +1730,33 @@ def main() -> int:
         default=str(config_dir / "four_camera_calib.json"),
         help="相机标定与外参配置",
     )
+    # 车型必须显式选，**没有默认值**。两台车的 AprilTag 布局完全不同，选错了车
+    # 定位会整体偏几十 cm、yaw 还可能翻 180°，而 tracker 自己看不出来——刚性拟合
+    # 照样收敛，唯一的信号是 car_loc.reprojection_error 从 ~2px 涨到 40px+，
+    # 那要等出报告才发现（2026-08-15 就这么坏了一整场）。宁可启动失败。
+    parser.add_argument(
+        "--car",
+        choices=sorted(CAR_LAYOUT_CONFIGS),
+        default=None,
+        help="车型（必选）：" + " / ".join(
+            f"{k}={v}" for k, v in sorted(CAR_LAYOUT_CONFIGS.items())
+        ),
+    )
+    parser.add_argument(
+        "--car-config",
+        default=None,
+        help="直接指定车载 AprilTag 布局配置（vehicle_reference）文件；"
+             "给了就覆盖 --car。与 --car 二选一，都不给直接报错",
+    )
     args = parser.parse_args()
+    if args.car_config is None:
+        if args.car is None:
+            parser.error(
+                "必须指定车型：--car " + " / --car ".join(sorted(CAR_LAYOUT_CONFIGS))
+                + "（或用 --car-config 直接给布局文件）。"
+                "没有默认车型——选错车 AprilTag 布局对不上，车定位会静默偏掉几十 cm。"
+            )
+        args.car_config = str(config_dir / CAR_LAYOUT_CONFIGS[args.car])
     save_logs = not args.no_log
 
     output_root = Path(args.output_dir)
@@ -1879,11 +1911,15 @@ def main() -> int:
 
     print("[4/5] 初始化 CarLocalizer (AprilTag)...")
     car_localizer = (
-        CarLocalizer(calib_config_path=args.calib_config)
+        CarLocalizer(
+            calib_config_path=args.calib_config,
+            vehicle_config_path=args.car_config,
+        )
         if car_loc_enabled
         else None
     )
     if car_localizer is not None:
+        print(f"  车体配置: {args.car_config}")
         print(f"  相机: {car_localizer.serials}")
         for tag_id, center in sorted(car_localizer.tag_layout_m.items()):
             print(f"  车载 tag id{tag_id} 车体系中心: {_format_xyz_m(*center)}")
@@ -2635,6 +2671,7 @@ def main() -> int:
             "camera_settings": camera_settings,
             "camera_capture_overrides": capture_overrides,
             "calib_config_path": str(Path(args.calib_config).resolve()),
+            "car_config_path": str(Path(args.car_config).resolve()),
             "duration_s": processing_elapsed,
             "end_to_end_duration_s": total_elapsed,
             "fps": capture_fps,

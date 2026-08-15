@@ -1,0 +1,28 @@
+{
+  "config_role": "vehicle_v0.4_apriltag_layout",
+  "vehicle_reference": {
+    "car_base_definition": "car chassis center in world coordinates. In this project it is the same physical point as the robotic arm base used by the exported POE model.",
+    "p_car_definition": "car pose (x, y, yaw) is fitted jointly from the corners of all visible on-car AprilTags using the rigid layout below; car z = 0 (ground).",
+    "layout_axis_convention": "apriltags centers/rotations are expressed in the car body frame (x right, y forward, z up from ground, origin = joint_1 axis at ground = arm base).",
+    "layout_measurement": "中心 = 用户 2026-08-15 复测值（cm→m）：id0 左上/左前 (-43.55, 12.1, 31.65)、id1 右下/右后 (31.85, -42.9, 28.75)。贴法（法线方位 + 正/倒贴）由固定相机三角化四角点实测：两块印面『上』方向的世界 e2_z 都是 +1.00 ⇒ 都是正贴，inplane 一律 0；法线世界方位角 -88.7°/-85.2°，减去车 yaw ≈ +2.2° 后即车体系 -90° ⇒ 法线朝车后。",
+    "layout_status": "measured",
+    "layout_validation": "2026-08-15 07:03 静态实拍 8 帧（18F 四相机）：本布局角点重投影中位 2.07px、车心 (0.343, 3.641)、yaw +2.28°；tag 世界中心纯三角化 tag0 z=0.3168 / tag1 z=0.2838，与本文件 z 差 +0.3mm / -3.7mm。作废的 0815 早间建档值（id0/id1 中心对调 + id0 误标倒贴）同批数据重投影 44.1px、yaw 翻成 179.4°、车心偏 (-13.5, -32.1) cm。⚠ 两 tag 水平间距：本文件算得 0.9333m，实测 0.9419m，差 +8.6mm，属手测残差，若要再压 yaw 误差就重量一次中心距。",
+    "apriltag_black_edge_m": 0.161,
+    "apriltags": {
+      "0": {
+        "center_car_m": [-0.4355, 0.121, 0.3165],
+        "face_azimuth_deg": -90.0,
+        "inplane_rotation_deg": 0.0,
+        "position_note": "左上/左前。用户 2026-08-15 复测 (-43.55, 12.1, 31.65) cm",
+        "orientation_note": "实测：法线朝车后 (-y)、正贴。判据=三角化角点的印面上方向 e2_z=+0.997"
+      },
+      "1": {
+        "center_car_m": [0.3185, -0.429, 0.2875],
+        "face_azimuth_deg": -90.0,
+        "inplane_rotation_deg": 0.0,
+        "position_note": "右下/右后。用户 2026-08-15 复测 (31.85, -42.9, 28.75) cm",
+        "orientation_note": "实测：法线朝车后 (-y)、正贴。判据=三角化角点的印面上方向 e2_z=+1.000"
+      }
+    }
+  }
+}

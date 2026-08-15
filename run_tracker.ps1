@@ -19,6 +19,15 @@ param(
     [double]$ExposureUs = 0,
     [double]$GainDb = -1,
     [string]$CalibrationConfig = '',
+    # 车型必选，没有默认值：两台车的车载 AprilTag 布局完全不同，选错了车定位会静默
+    # 偏几十 cm、yaw 还可能翻 180°（拟合照样收敛，只有 car_loc 重投影会从 ~2px 涨到
+    # 40px+，要等出报告才看得见）。不传就在这里弹提示让你选，别猜。
+    # HelpMessage 保持 ASCII：本文件无 BOM，PS 5.1 按 ANSI 读，中文字面量会变乱码
+    [Parameter(Mandatory = $true, HelpMessage = "Pick the car: v03 (old car) or v04 (new car)")]
+    [ValidateSet('v03', 'v04')]
+    [string]$Car,
+    # 只在要跑非标布局文件时用；给了就覆盖 -Car 选出来的那份
+    [string]$CarConfig = '',
     [ValidateRange(0, 1)]
     [int]$CameraReverse180 = 1,
     [ValidateSet(16, 18)]
@@ -63,13 +72,15 @@ $ros2PixiRoot = 'C:\dev\ros2_jazzy\.pixi\envs\default'
 $ros2PixiLibraryBin = Join-Path $ros2PixiRoot 'Library\bin'
 $trackerPcIp = if ($Floor -eq 18) { '192.168.31.78' } else { '192.168.50.230' }
 $armRkIp = if ($Floor -eq 18) { '192.168.31.23' } else { '192.168.50.17' }
+# 18F = v0.4 车的底盘 RK；16F 仍是 v0.3 车
+$chassisRkIp = if ($Floor -eq 18) { '192.168.31.197' } else { '192.168.50.143' }
 $cycloneConfigName = if ($Floor -eq 18) { 'cyclonedds_18.xml' } else { 'cyclonedds.xml' }
 $cycloneXml = Join-Path $PSScriptRoot "ros2\$cycloneConfigName"
 $mvsMvImport = 'C:\Program Files (x86)\MVS\Development\Samples\Python\MvImport'
 
 $env:BALL_TRACER_PC_IP = $trackerPcIp
 $env:BALL_TRACER_ARM_RK_IP = $armRkIp
-$env:BALL_TRACER_CHASSIS_RK_IP = '192.168.50.143'
+$env:BALL_TRACER_CHASSIS_RK_IP = $chassisRkIp
 
 if (-not (Test-Path Env:MVS_MVIMPORT_DIR)) {
     $env:MVS_MVIMPORT_DIR = $mvsMvImport
@@ -245,6 +256,7 @@ if ($selection.Name -eq 'ros2') {
 
 Write-Host "Camera config: $CameraConfig"
 Write-Host "Calibration config: $CalibrationConfig"
+Write-Host "Car: $Car$(if (-not [string]::IsNullOrWhiteSpace($CarConfig)) { " (overridden by -CarConfig $CarConfig)" })"
 Write-Host "Tracker floor: ${Floor}F"
 Write-Host "Tracker PC IP: $trackerPcIp"
 Write-Host "CycloneDDS config: $cycloneXml"
@@ -280,8 +292,12 @@ $args = @(
     "--duration", $Duration.ToString(),
     "--ros2-mode", $Ros2Mode,
     "--camera-config", $CameraConfig,
-    "--calib-config", $CalibrationConfig
+    "--calib-config", $CalibrationConfig,
+    "--car", $Car
 )
+if (-not [string]::IsNullOrWhiteSpace($CarConfig)) {
+    $args += @("--car-config", $CarConfig)
+}
 if ($NoVideo) {
     $args += "--no-video"
 }
