@@ -5,8 +5,15 @@ import sys
 from pathlib import Path
 
 TRACKER_PC_IP = os.environ.get("BALL_TRACER_PC_IP", "192.168.50.230")
-ARM_RK_IP = os.environ.get("BALL_TRACER_ARM_RK_IP", "192.168.50.17")
-CHASSIS_RK_IP = os.environ.get("BALL_TRACER_CHASSIS_RK_IP", "192.168.50.143")
+# 一台车一个 RK IP（车上静态配置，换路由器/换楼层都不变，2026-08-18 定）。
+# 旧的 ARM_RK_IP/CHASSIS_RK_IP 两个字段其实是两台车各自的 IP，概念已废。
+CAR_RK_IPS = {
+    "v03": "192.168.50.143",
+    "v04": "192.168.50.68",
+}
+# run_tracker.ps1 按 -Car 设置；没设时列出两台车（本值只用于启动打印，
+# 实际 DDS 发现走 CYCLONEDDS_URI 指到的 xml 里的 Peers）
+RK_CAR_IP = os.environ.get("BALL_TRACER_RK_CAR_IP", "")
 DEFAULT_ROS_DOMAIN_ID = "2"
 
 ROS2_ROOT = Path(
@@ -26,10 +33,7 @@ ROS2_DLL_DIRS = (
 )
 _DLL_HANDLES = []
 
-ROS2_TRACKER_PEERS = (
-    ARM_RK_IP,
-    CHASSIS_RK_IP,
-)
+ROS2_TRACKER_PEERS = (RK_CAR_IP,) if RK_CAR_IP else tuple(CAR_RK_IPS.values())
 ROS2_BEST_EFFORT_DEPTH = 1
 ROS2_RELIABLE_TOPICS = frozenset(
     {

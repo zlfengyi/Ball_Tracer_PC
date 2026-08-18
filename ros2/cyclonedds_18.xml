@@ -3,7 +3,7 @@
   <Domain id="any">
     <General>
       <Interfaces>
-        <NetworkInterface address="192.168.31.78" multicast="false" />
+        <NetworkInterface address="192.168.50.230" multicast="false" />
       </Interfaces>
       <AllowMulticast>false</AllowMulticast>
     </General>
@@ -11,8 +11,9 @@
       <ParticipantIndex>auto</ParticipantIndex>
       <MaxAutoParticipantIndex>8</MaxAutoParticipantIndex>
       <Peers>
-        <Peer Address="192.168.31.23" />
+        <!-- 一台车一个 IP：v03 / v04，在场的那台会应答，另一台静默无害 -->
         <Peer Address="192.168.50.143" />
+        <Peer Address="192.168.50.68" />
       </Peers>
     </Discovery>
   </Domain>

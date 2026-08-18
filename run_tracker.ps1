@@ -28,10 +28,14 @@ param(
     [string]$Car,
     # 只在要跑非标布局文件时用；给了就覆盖 -Car 选出来的那份
     [string]$CarConfig = '',
-    [ValidateRange(0, 1)]
-    [int]$CameraReverse180 = 1,
-    [ValidateSet(16, 18)]
-    [int]$Floor = 16,
+    # -1 = 跟着 -Floor 的 profile 走（16F=1，18F=0）；显式给 0/1 才覆盖
+    [ValidateRange(-1, 1)]
+    [int]$CameraReverse180 = -1,
+    # auto = 按本机网卡 IP 反推场地。别再默认 16F：默认值猜错时
+    # CycloneDDS 直接 bind 不上（does not match an available interface），
+    # 而相机/标定还会静默用错另一层的那套。
+    [ValidateSet('auto', '16', '18')]
+    [string]$Floor = 'auto',
     [switch]$ProbeOnly
 )
 
@@ -50,19 +54,8 @@ try {
 } catch {
 }
 
-$env:BALL_TRACER_CAMERA_REVERSE_180 = $CameraReverse180.ToString()
-$env:BALL_TRACER_CAMERA_REVERSE_X = $CameraReverse180.ToString()
-$env:BALL_TRACER_CAMERA_REVERSE_Y = $CameraReverse180.ToString()
-$env:BALL_TRACER_SOFTWARE_ROTATE_180 = '0'
-
 $script = Join-Path $PSScriptRoot "src\run_tracker.py"
 $configDir = Join-Path $PSScriptRoot "src\config"
-if ([string]::IsNullOrWhiteSpace($CameraConfig)) {
-    $CameraConfig = Join-Path $configDir "camera.json"
-}
-if ([string]::IsNullOrWhiteSpace($CalibrationConfig)) {
-    $CalibrationConfig = Join-Path $configDir "four_camera_calib.json"
-}
 $cleanPython = Join-Path $PSScriptRoot ".venv_clean\Scripts\python.exe"
 $ros2Python = Join-Path $PSScriptRoot ".venv_ros2\Scripts\python.exe"
 $ros2Activate = Join-Path $PSScriptRoot ".venv_ros2\Scripts\Activate.ps1"
@@ -70,17 +63,108 @@ $ros2Setup = 'C:\dev\ros2_jazzy\local_setup.ps1'
 $ros2SitePackages = 'C:\dev\ros2_jazzy\Lib\site-packages'
 $ros2PixiRoot = 'C:\dev\ros2_jazzy\.pixi\envs\default'
 $ros2PixiLibraryBin = Join-Path $ros2PixiRoot 'Library\bin'
-$trackerPcIp = if ($Floor -eq 18) { '192.168.31.78' } else { '192.168.50.230' }
-$armRkIp = if ($Floor -eq 18) { '192.168.31.23' } else { '192.168.50.17' }
-# 18F = v0.4 车的底盘 RK；16F 仍是 v0.3 车
-$chassisRkIp = if ($Floor -eq 18) { '192.168.31.197' } else { '192.168.50.143' }
-$cycloneConfigName = if ($Floor -eq 18) { 'cyclonedds_18.xml' } else { 'cyclonedds.xml' }
-$cycloneXml = Join-Path $PSScriptRoot "ros2\$cycloneConfigName"
 $mvsMvImport = 'C:\Program Files (x86)\MVS\Development\Samples\Python\MvImport'
 
+# 两个场地是两整套硬件：相机机身都不是同一批（16F DA74xxx 硬触发 line /
+# 18F DB026xxx action 广播触发），标定不通用。混着跑不是报错就是
+# 静默错到出报告，所以一层一份 profile，全套一起选，别再逐项 -CameraConfig 手拼。
+# 车的 RK IP 不在楼层 profile 里：一台车一个 IP（车上静态配置），跟着 -Car 走，见 $carRkIps。
+$floorProfiles = [ordered]@{
+    '16' = @{
+        PcIp         = '192.168.50.230'
+        CycloneXml   = 'cyclonedds.xml'
+        CameraConfig = 'camera.json'
+        CalibConfig  = 'four_camera_calib.json'
+        Reverse180   = 1
+        Car          = 'v03'
+    }
+    '18' = @{
+        # 2026-08-18 换路由器后 18F 也是 50.x 网段：PC 走 Wi-Fi 的 192.168.50.230
+        # （路由器上做保留，Wi-Fi MAC 5C-B4-7E-C4-EA-D7），有线 USB 5GbE 口只留给相机
+        # （169.254.79.x 链路本地）。注意 16F/18F PcIp 相同后 -Floor auto 分不出层，
+        # 会直接 throw 让你显式选：18F 一律用 run_tracker_18.ps1（自带 -Floor 18）。
+        PcIp         = '192.168.50.230'
+        CycloneXml   = 'cyclonedds_18.xml'
+        CameraConfig = 'camera_18.json'
+        CalibConfig  = 'four_camera_calib_18.json'
+        Reverse180   = 0
+        Car          = 'v04'
+    }
+}
+
+function Get-LocalIPv4Addresses {
+    try {
+        return @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
+            Select-Object -ExpandProperty IPAddress)
+    } catch {
+        return @([System.Net.Dns]::GetHostAddresses([System.Net.Dns]::GetHostName()) |
+            Where-Object { $_.AddressFamily -eq 'InterNetwork' } |
+            ForEach-Object { $_.IPAddressToString })
+    }
+}
+
+# 一台车只有一个 RK IP（车上静态配置，换路由器/换楼层都不变，2026-08-18 定）。
+# 以前配置里的 ArmRkIp/ChassisRkIp 两个字段其实就是两台车各自的 IP，概念已废。
+$carRkIps = @{
+    'v03' = '192.168.50.143'
+    'v04' = '192.168.50.68'
+}
+
+$localIps = Get-LocalIPv4Addresses
+$knownFloorText = (@($floorProfiles.Keys) | ForEach-Object { "${_}F=$($floorProfiles[$_].PcIp)" }) -join ', '
+$floorSource = if ($Floor -eq 'auto') { 'auto-detected from local IP' } else { 'explicit -Floor' }
+
+if ($Floor -eq 'auto') {
+    $floorMatches = @(@($floorProfiles.Keys) | Where-Object { $localIps -contains $floorProfiles[$_].PcIp })
+    if ($floorMatches.Count -eq 1) {
+        $Floor = $floorMatches[0]
+    } elseif ($floorMatches.Count -gt 1) {
+        throw "Floor auto-detect is ambiguous: this PC holds $($floorMatches -join 'F and ')F addresses at once. Pass -Floor 16 or -Floor 18."
+    } else {
+        throw ("Floor auto-detect failed: no known tracker PC address is up on this machine.`n" +
+            "  known: $knownFloorText`n" +
+            "  local: $($localIps -join ', ')`n" +
+            "Check the cable / Wi-Fi (or pass -Floor explicitly to run without the matching network).")
+    }
+}
+
+$floorCfg = $floorProfiles[$Floor]
+$trackerPcIp = $floorCfg.PcIp
+$carRkIp = $carRkIps[$Car]
+$cycloneXml = Join-Path $PSScriptRoot ("ros2\" + $floorCfg.CycloneXml)
+
+# 拦住 "does not match an available interface"：CycloneDDS 里的 NetworkInterface
+# 是写死的本机地址，网卡没起来就只会在建 node 时炸，报错还不提是哪层选错了。
+if ($localIps -notcontains $trackerPcIp) {
+    $ipMsg = "Floor ${Floor}F expects this PC at $trackerPcIp, but that address is not up. local: $($localIps -join ', ')"
+    if ($Ros2Mode -eq 'off' -or $ProbeOnly) {
+        Write-Warning "$ipMsg (not creating a DDS node, continuing)"
+    } else {
+        throw "$ipMsg`nCycloneDDS would fail to bind ($($floorCfg.CycloneXml)). Fix the network, or use -Ros2Mode off to run offline."
+    }
+}
+
+if ($floorCfg.Car -ne $Car) {
+    Write-Warning "Floor ${Floor}F normally runs $($floorCfg.Car), but -Car $Car was given. Check the AprilTag layout is really $Car."
+}
+
+if ([string]::IsNullOrWhiteSpace($CameraConfig)) {
+    $CameraConfig = Join-Path $configDir $floorCfg.CameraConfig
+}
+if ([string]::IsNullOrWhiteSpace($CalibrationConfig)) {
+    $CalibrationConfig = Join-Path $configDir $floorCfg.CalibConfig
+}
+if ($CameraReverse180 -lt 0) {
+    $CameraReverse180 = $floorCfg.Reverse180
+}
+
+$env:BALL_TRACER_CAMERA_REVERSE_180 = $CameraReverse180.ToString()
+$env:BALL_TRACER_CAMERA_REVERSE_X = $CameraReverse180.ToString()
+$env:BALL_TRACER_CAMERA_REVERSE_Y = $CameraReverse180.ToString()
+$env:BALL_TRACER_SOFTWARE_ROTATE_180 = '0'
+
 $env:BALL_TRACER_PC_IP = $trackerPcIp
-$env:BALL_TRACER_ARM_RK_IP = $armRkIp
-$env:BALL_TRACER_CHASSIS_RK_IP = $chassisRkIp
+$env:BALL_TRACER_RK_CAR_IP = $carRkIp
 
 if (-not (Test-Path Env:MVS_MVIMPORT_DIR)) {
     $env:MVS_MVIMPORT_DIR = $mvsMvImport
@@ -254,10 +338,11 @@ if ($selection.Name -eq 'ros2') {
     Write-Host "Selected tracker env: clean (CPU fallback)"
 }
 
+Write-Host "Tracker floor: ${Floor}F ($floorSource)"
 Write-Host "Camera config: $CameraConfig"
 Write-Host "Calibration config: $CalibrationConfig"
 Write-Host "Car: $Car$(if (-not [string]::IsNullOrWhiteSpace($CarConfig)) { " (overridden by -CarConfig $CarConfig)" })"
-Write-Host "Tracker floor: ${Floor}F"
+Write-Host "Car RK IP: $carRkIp"
 Write-Host "Tracker PC IP: $trackerPcIp"
 Write-Host "CycloneDDS config: $cycloneXml"
 
