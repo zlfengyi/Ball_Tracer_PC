@@ -4,6 +4,11 @@
 必须在 ROS2 环境中运行（经 ros2/run_ros2.bat 启动），依赖 rosbag2_py。
 TCP 正解使用本文件内置的 FK，不依赖 tennis-man/arm_controller 源码路径。
 
+⚠ 车型（--car v03|v04）决定用哪条 FK 链，**没有默认值**：两台车的臂不同（v0.4 肩高 +11.1cm、
+拍长 +5.3cm），选错不会报错、只会让整场 TCP 偏几厘米。不给 --car 时从同目录的 tracker JSON
+（config.car_config_path，run_tracker 按启动的 --car 写入）推断，推不出来直接失败。
+选中的车型写进输出的 "car"/"car_source"/"fk_source"，报告端按它复算，绝不自己猜。
+
 输出供 test_src/generate_curve3_html.py 的 Arm tab 使用：
   states   — /joint_states 实际关节位置/速度/力矩 + FK TCP
   commands — /tennis/motor_command 目标（首个轨迹点）+ FK TCP
@@ -36,16 +41,27 @@ import re
 import statistics
 import sys
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, NamedTuple
 
 import numpy as np
 
 
-# Copied from arm_controller.compact_arm_kinematics at a266857.  Keep the
-# report extractor self-contained: generating an Arm JSON must not depend on a
-# neighbouring tennis-man checkout.
+# ── 车型运动学（v0.3 / v0.4 是两台不同的臂）────────────────────────────────────
+# 逐值抄自 arm_controller.compact_arm_kinematics：v03 = a266857（USD
+# tennis_arm_j5j6_7_6_world），v04 = origin/unify/car-config（URDF
+# 000-zongzhuang-02-urdf，该文件写死那组即 v0.4）。抄进来是为了报告端自洽——出 arm JSON
+# 不该依赖隔壁 tennis-man checkout；真值源仍是
+# tennis-man/arm_controller/cpp/arm_controller_cpp/config/cars/<car>.yaml 的 kinematics 段，
+# 两侧一致性由 test_src/test_arm_kinematics_cars.py 拿臂端导出的黄金向量守着。
+#
+# ⚠ 拿错车算 TCP **不会报错**，只会整场偏几厘米：v0.4 肩高 +11.1cm、拍长 +5.3cm，
+#   0816_081524 用 v0.3 链算 v0.4 的关节角，TCP−accepted 两列整场偏 (−5.4, −8.6)cm、
+#   FK 拍速低报 5%，而拍面 yaw/pitch 两车逐拍恒等（旋转链一致）——从角度列根本看不出来。
+#   故本模块**没有默认车型**：先 use_car()（或 car_for_tracker_json 推断）再调 fk()。
 SHORT_JOINT_NAMES = ("joint1", "joint2", "joint3", "joint4", "joint5", "joint6")
-ROOT_LINK = "/tennis_arm_j5j6_7_6/Geometry/base_link"
+_V03_ROOT_LINK = "/tennis_arm_j5j6_7_6/Geometry/base_link"
+_V04_ROOT_LINK = "base_link"
+ROOT_LINK = _V03_ROOT_LINK          # use_car() 重绑；留着是给老调用点的名字
 
 
 def _pose(pos, quat_wxyz) -> np.ndarray:
@@ -70,52 +86,52 @@ _AXIS = {
     "Z": np.array([0.0, 0.0, 1.0]),
 }
 
-# physics:localPos/localRot/axis copied verbatim from the USD PhysicsRevoluteJoints.
-JOINTS = (
+# ── v0.3：physics:localPos/localRot/axis copied verbatim from the USD PhysicsRevoluteJoints.
+_V03_JOINTS = (
     {
         "name": "J1_joint",
-        "parent": ROOT_LINK,
-        "child": ROOT_LINK + "/J1_Link",
+        "parent": _V03_ROOT_LINK,
+        "child": _V03_ROOT_LINK + "/J1_Link",
         "axis": _AXIS["Y"],
         "local0": _pose((0.0, 0.0, 0.4385), (-0.4999999, -0.5, 0.49999994, 0.5)),
         "local1": _pose((0.0, 0.0, 0.0), (1.0, 0.0, 0.0, 0.0)),
     },
     {
         "name": "J2_JOINT",
-        "parent": ROOT_LINK + "/J1_Link",
-        "child": ROOT_LINK + "/J1_Link/J2_Link",
+        "parent": _V03_ROOT_LINK + "/J1_Link",
+        "child": _V03_ROOT_LINK + "/J1_Link/J2_Link",
         "axis": _AXIS["Z"],
         "local0": _pose((5e-05, 0.1719001, -0.07355), (0.0, -1.0, 0.0, 0.0)),
         "local1": _pose((0.0, 0.0, 0.0), (0.0, -1.0, 0.0, 0.0)),
     },
     {
         "name": "J3_joint",
-        "parent": ROOT_LINK + "/J1_Link/J2_Link",
-        "child": ROOT_LINK + "/J1_Link/J2_Link/J3_Link",
+        "parent": _V03_ROOT_LINK + "/J1_Link/J2_Link",
+        "child": _V03_ROOT_LINK + "/J1_Link/J2_Link/J3_Link",
         "axis": _AXIS["Z"],
         "local0": _pose((-0.000125, 0.44997022, 0.02125), (0.0, -1.0, 0.0, 0.0)),
         "local1": _pose((0.0, 0.0, 0.0), (0.0, -1.0, 0.0, 0.0)),
     },
     {
         "name": "J4_JOINT",
-        "parent": ROOT_LINK + "/J1_Link/J2_Link/J3_Link",
-        "child": ROOT_LINK + "/J1_Link/J2_Link/J3_Link/J4_Link",
+        "parent": _V03_ROOT_LINK + "/J1_Link/J2_Link/J3_Link",
+        "child": _V03_ROOT_LINK + "/J1_Link/J2_Link/J3_Link/J4_Link",
         "axis": _AXIS["Y"],
         "local0": _pose((0.0, 0.3, 0.08575), (0.70710677, 0.70710677, 0.0, 0.0)),
         "local1": _pose((0.0, 0.0, 0.0), (0.0, 1.0, 0.0, 0.0)),
     },
     {
         "name": "J5_JOINT",
-        "parent": ROOT_LINK + "/J1_Link/J2_Link/J3_Link/J4_Link",
-        "child": ROOT_LINK + "/J1_Link/J2_Link/J3_Link/J4_Link/J5_Link",
+        "parent": _V03_ROOT_LINK + "/J1_Link/J2_Link/J3_Link/J4_Link",
+        "child": _V03_ROOT_LINK + "/J1_Link/J2_Link/J3_Link/J4_Link/J5_Link",
         "axis": _AXIS["Y"],
         "local0": _pose((0.0, 0.03973, 0.095), (0.4999999, 0.5, -0.49999994, -0.5)),
         "local1": _pose((0.0, 0.0, 0.0), (1.0, 0.0, 0.0, 0.0)),
     },
     {
         "name": "J6_JOINT",
-        "parent": ROOT_LINK + "/J1_Link/J2_Link/J3_Link/J4_Link/J5_Link",
-        "child": ROOT_LINK + "/J1_Link/J2_Link/J3_Link/J4_Link/J5_Link/J6_Link",
+        "parent": _V03_ROOT_LINK + "/J1_Link/J2_Link/J3_Link/J4_Link/J5_Link",
+        "child": _V03_ROOT_LINK + "/J1_Link/J2_Link/J3_Link/J4_Link/J5_Link/J6_Link",
         "axis": _AXIS["Z"],
         "local0": _pose(
             (0.00042069482, 0.047, 0.031753197),
@@ -124,8 +140,6 @@ JOINTS = (
         "local1": _pose((0.0, 0.0, 0.0), (1.0, 0.0, 0.0, 0.0)),
     },
 )
-
-TOOL_AXIS_IN_LINK6 = np.array([0.0, 0.0, 1.0])
 
 # USD base_link -> hit convention: rotate +90 deg about Z so -Y_base becomes +X.
 BASE_ROT = np.array(
@@ -136,6 +150,179 @@ BASE_ROT = np.array(
         [0.0, 0.0, 0.0, 1.0],
     ]
 )
+
+# ── v0.4：origin/unify/car-config 的 compact_arm_kinematics（URDF 000-zongzhuang-02）。
+# 原始 URDF 的 joint1..joint5 转向与控制器已验证的电机角相反，方向折进 axis（q 仍是控制器角）；
+# world_to_base 把 base_link 沿 Y 平移 −45mm，正好抵掉 joint1 的 +45mm 局部原点。
+_V04_JOINT_ANGLE_DIRECTIONS = (-1.0, -1.0, -1.0, -1.0, -1.0, 1.0)
+_V04_URDF_JOINTS = (
+    ("joint1", "base_link", "J1_Link",
+     (0.0, 0.0450000000000024, 0.508499999999985), (1.0, 0.0, 0.0, 0.0),
+     (0.0, 0.0, -1.0)),
+    ("joint2", "J1_Link", "J2_Link",
+     (0.00159154943091333, -0.0423500000000004, 0.212900100000015),
+     (1.0, 0.0, 0.0, 0.0), (0.0, -1.0, 0.0)),
+    ("joint3", "J2_Link", "J3_Link",
+     (-0.00137018988116389, 0.082450000000001, 0.440524801747144),
+     (1.0, 0.0, 0.0, 0.0), (0.0, -1.0, 0.0)),
+    ("joint4", "J3_Link", "J4_Link",
+     (0.0, -0.00232998088473323, 0.3), (1.0, 0.0, 0.0, 0.0),
+     (0.0, 1.0, 0.0)),
+    ("joint5", "J4_Link", "J5_Link",
+     (0.0, -0.0372576309598127, 0.0578865999999858), (1.0, 0.0, 0.0, 0.0),
+     (0.0, 0.0, -1.0)),
+    ("joint6", "J5_Link", "J6_Link",
+     (0.0215000000000001, 0.0, 0.10025), (1.0, 0.0, 0.0, 0.0),
+     (1.0, 0.0, 0.0)),
+)
+_IDENTITY_POSE = _pose((0.0, 0.0, 0.0), (1.0, 0.0, 0.0, 0.0))
+_V04_JOINTS = tuple(
+    {
+        "name": name,
+        "parent": parent,
+        "child": child,
+        "axis": np.asarray(axis, dtype=float) * direction,
+        "local0": _pose(origin, quat),
+        "local1": _IDENTITY_POSE,
+    }
+    for (name, parent, child, origin, quat, axis), direction
+    in zip(_V04_URDF_JOINTS, _V04_JOINT_ANGLE_DIRECTIONS)
+)
+_V04_WORLD_TO_BASE = _pose((0.0, -0.0450000000000024, 0.0), (1.0, 0.0, 0.0, 0.0))
+
+
+class CarModel(NamedTuple):
+    """一台车的整条 FK 链。tcp_distance = 拍甜点沿 link6 工具轴的距离（两车同为 0.62m，
+    但工具轴与 link6 系不同，所以拍心位置并不相同）。"""
+
+    car: str
+    source_model: str
+    root_link: str
+    base_transform: np.ndarray      # 世界 ← root_link
+    joints: tuple
+    tool_axis_in_link6: np.ndarray  # 拍柄方向
+    face_normal_in_link6: np.ndarray
+    tcp_distance: float
+
+
+CAR_MODELS = {
+    "v03": CarModel(
+        car="v03",
+        source_model="src/arm_controller/urdf/tennis_arm_j5j6_7_6_world.usd",
+        root_link=_V03_ROOT_LINK,
+        base_transform=BASE_ROT,
+        joints=_V03_JOINTS,
+        tool_axis_in_link6=np.array([0.0, 0.0, 1.0]),
+        face_normal_in_link6=np.array([1.0, 0.0, 0.0]),
+        tcp_distance=0.62,
+    ),
+    "v04": CarModel(
+        car="v04",
+        source_model="src/arm_controller/urdf/000-zongzhuang-02-urdf.urdf",
+        root_link=_V04_ROOT_LINK,
+        base_transform=_V04_WORLD_TO_BASE,
+        joints=_V04_JOINTS,
+        tool_axis_in_link6=np.array([1.0, 0.0, 0.0]),
+        face_normal_in_link6=np.array([0.0, 1.0, 0.0]),
+        tcp_distance=0.62,
+    ),
+}
+
+# tracker JSON 的 config.car_config_path 文件名 → 车型（src/run_tracker.py CAR_LAYOUT_CONFIGS 的逆）。
+CAR_BY_LAYOUT_CONFIG = {
+    "arm_poe_racket_center.json": "v03",
+    "vehicle_v04.json": "v04",
+}
+
+_ACTIVE: CarModel | None = None
+# use_car() 重绑的模块级别名（老调用点按名字取，故必须整组一起换）
+JOINTS: tuple = ()
+TOOL_AXIS_IN_LINK6 = CAR_MODELS["v03"].tool_axis_in_link6
+FACE_NORMAL_IN_LINK6 = CAR_MODELS["v03"].face_normal_in_link6
+
+
+def use_car(car: str) -> CarModel:
+    """选定车型；此后 fk()/JOINTS/ROOT_LINK 等全部按这台车。"""
+    global _ACTIVE, JOINTS, ROOT_LINK, TOOL_AXIS_IN_LINK6, FACE_NORMAL_IN_LINK6
+    if car not in CAR_MODELS:
+        raise ValueError(f"未知车型 {car!r}，可选：{'/'.join(sorted(CAR_MODELS))}")
+    _ACTIVE = CAR_MODELS[car]
+    JOINTS = _ACTIVE.joints
+    ROOT_LINK = _ACTIVE.root_link
+    TOOL_AXIS_IN_LINK6 = _ACTIVE.tool_axis_in_link6
+    FACE_NORMAL_IN_LINK6 = _ACTIVE.face_normal_in_link6
+    return _ACTIVE
+
+
+def active_car() -> CarModel:
+    if _ACTIVE is None:
+        raise RuntimeError(
+            "还没选车型：先调 extract_arm_bag.use_car('v03'|'v04')（或 car_for_tracker_json 推断）。"
+            "没有默认值是故意的——两台车的臂不同，选错只会静默偏几厘米，见文件头注释。"
+        )
+    return _ACTIVE
+
+
+def car_for_tracker_json(tracker_json: Path | str) -> tuple[str, str]:
+    """从一场 tracker JSON 推车型，返回 (car, 依据)。
+
+    判据 = config.car_config_path 的文件名（run_tracker 启动时按 --car 写进去的）。
+    2026-08-15 之前的场次没有这个字段——那时只有 v0.3 一台车，按 v03 处理并在依据里写明。
+    """
+    path = Path(tracker_json)
+    try:
+        with path.open(encoding="utf-8") as fh:
+            config = json.load(fh).get("config") or {}
+    except Exception as exc:
+        raise RuntimeError(f"读不了 {path} 的 config，无法推车型（{exc!r}）") from exc
+    raw = config.get("car_config_path")
+    if not raw:
+        return "v03", f"{path.name} 无 config.car_config_path（0815 之前只有 v0.3 一台车）"
+    name = Path(str(raw)).name
+    car = CAR_BY_LAYOUT_CONFIG.get(name)
+    if car is None:
+        raise RuntimeError(
+            f"{path.name} 的 car_config_path={name} 认不出车型；"
+            f"已知：{CAR_BY_LAYOUT_CONFIG}。新车型要同时在这里和 run_tracker.CAR_LAYOUT_CONFIGS 登记。"
+        )
+    return car, f"{path.name} config.car_config_path={name}"
+
+
+def car_for_session(arm: dict | None = None, tracker_json: Path | str | None = None,
+                    explicit: str | None = None) -> tuple[str, str]:
+    """一场数据用哪台车：显式 > arm JSON 自述 > tracker JSON 推断。三条都没有就抛。
+
+    报告/离线分析都走这一份，免得各家自己猜出不同的车。
+    """
+    if explicit:
+        if explicit not in CAR_MODELS:
+            raise ValueError(f"未知车型 {explicit!r}")
+        return explicit, "显式指定"
+    said = (arm or {}).get("car") if isinstance(arm, dict) else None
+    if said:
+        if said not in CAR_MODELS:
+            raise RuntimeError(f"arm JSON 自述车型 {said!r} 不认识")
+        return said, f"arm JSON 自述（{(arm or {}).get('car_source', '来源未记')}）"
+    if tracker_json:
+        return car_for_tracker_json(tracker_json)
+    raise RuntimeError("推不出车型：arm JSON 没有 car 字段，也没给 tracker JSON")
+
+
+def recompute_tcp(rows) -> int:
+    """就地把 rows[].tcp 按当前车型复算（关节残缺的置 None），返回改写了几行。
+
+    老 arm JSON 的 tcp 是当年写死的 v0.3 链算的；换车/换模型后不必重跑 rosbag 提取，
+    读进来复算一遍即可——position 才是原始记录，tcp 只是派生量。
+    """
+    n = 0
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        q = row.get("position")
+        ok = isinstance(q, list) and len(q) == 6 and all(isinstance(v, (int, float)) for v in q)
+        row["tcp"] = [round(float(v), 4) for v in fk(q)["tcp"]] if ok else None
+        n += 1
+    return n
 
 
 def _axis_rotation(axis: np.ndarray, angle: float) -> np.ndarray:
@@ -164,27 +351,37 @@ def _q6(q: Iterable[float]) -> np.ndarray:
     return q
 
 
-def fk(q: Iterable[float], *, tcp_distance: float = 0.62) -> dict[str, np.ndarray]:
-    """Exact forward kinematics from the USD physics joints, in hit convention."""
+def fk(q: Iterable[float], *, tcp_distance: float | None = None,
+       car: str | None = None) -> dict[str, np.ndarray]:
+    """当前车型的精确正解，输出击球系（+X 前、+Z 上）。q 为控制器关节角。
+
+    car 不给就用 use_car() 选定的那台；一次都没选过直接抛（没有默认车型，见文件头）。
+    """
+    model = CAR_MODELS[car] if car is not None else active_car()
     q = _q6(q)
-    link_transforms = {ROOT_LINK: BASE_ROT.copy()}
+    link_transforms = {model.root_link: model.base_transform.copy()}
     joint_frames = {}
 
-    for angle, joint in zip(q, JOINTS):
+    for angle, joint in zip(q, model.joints):
         joint_t = link_transforms[joint["parent"]] @ joint["local0"]
         child_t = joint_t @ _axis_rotation(joint["axis"], angle) @ np.linalg.inv(joint["local1"])
         joint_frames[joint["name"]] = joint_t
         link_transforms[joint["child"]] = child_t
 
-    link6 = link_transforms[JOINTS[-1]["child"]]
-    handle_axis = link6[:3, :3] @ TOOL_AXIS_IN_LINK6
+    link6 = link_transforms[model.joints[-1]["child"]]
+    handle_axis = link6[:3, :3] @ model.tool_axis_in_link6
     handle_axis = handle_axis / np.linalg.norm(handle_axis)
-    tcp = link6[:3, 3] + tcp_distance * handle_axis
+    face_normal = link6[:3, :3] @ model.face_normal_in_link6
+    tcp = link6[:3, 3] + (model.tcp_distance if tcp_distance is None else tcp_distance) * handle_axis
 
     return {
         "q": q,
+        "car": model.car,
         "tcp": tcp,
         "handle_axis": handle_axis,
+        "face_normal": face_normal / np.linalg.norm(face_normal),
+        "link6": link6,
+        "joints": model.joints,
         "joint_frames": joint_frames,
         "link_transforms": link_transforms,
     }
@@ -262,7 +459,28 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bag", type=Path, required=True, help="rosbag 目录（含 metadata.yaml）")
     parser.add_argument("--output", type=Path, required=True, help="输出 arm JSON 路径")
+    parser.add_argument(
+        "--car",
+        choices=sorted(CAR_MODELS),
+        help="车型（决定 FK 链）。不给就从同名 tracker JSON 的 config.car_config_path 推",
+    )
     args = parser.parse_args()
+
+    # 车型：显式 > tracker JSON 推断 > 失败。默认成另一台车比报错危险得多（静默偏几厘米）。
+    if args.car:
+        car, car_source = args.car, "--car 显式指定"
+    else:
+        tracker_json = args.bag.with_name(args.bag.name[:-len("_rosbag")] + ".json") \
+            if args.bag.name.endswith("_rosbag") else args.output.with_name(
+                args.output.name.replace("_arm.json", ".json"))
+        if not tracker_json.exists():
+            parser.error(
+                f"没给 --car，也找不到同场 tracker JSON（{tracker_json}）来推车型。"
+                f"请补 --car {'/'.join(sorted(CAR_MODELS))}。"
+            )
+        car, car_source = car_for_tracker_json(tracker_json)
+    model = use_car(car)
+    print(f"[extract_arm_bag] 车型 {car}（依据：{car_source}）；FK 源模型 {model.source_model}")
 
     import rosbag2_py  # noqa: E402
     from rclpy.serialization import deserialize_message  # noqa: E402
@@ -558,7 +776,11 @@ def main() -> int:
         },
         "clock_sync": clock_sync,
         "bag_dir": str(args.bag.resolve()),
-        "fk_source": "extract_arm_bag.fk",
+        # 车型三件套：报告端按 car 复算 FK，不猜；car_source 留着事后查是谁定的。
+        "car": car,
+        "car_source": car_source,
+        "kinematics_source_model": model.source_model,
+        "fk_source": f"extract_arm_bag.fk({car})",
         "start_ns": start_ns,
         "duration_sec": round((end_ns - start_ns) / 1e9, 4),
         "joint_names": list(joint_names),

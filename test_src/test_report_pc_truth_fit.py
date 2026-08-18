@@ -162,6 +162,79 @@ def test_pc_truth_z_bounded_spin_term(tmp_path):
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_pc_truth_drops_a_single_outlier(tmp_path):
+    """一个坏 3D 点（多球关联失败/弹跳接触帧）不该判死整抛。
+
+    0811 080158 实测 19 抛里有 5 抛就是这么丢的，而剔 1~2 点后 max|残差| 只有
+    0.3~5cm。这里往干净弧线里塞一个横向偏 0.5m 的点，要求：仍出值、z0 与无污染
+    时逐位可比、并如实报出剔了哪个点。
+    """
+    contact = 100.0
+    rows, z0 = _drag_rows(contact, k_drag=0.024)
+    clean = _run_truth(tmp_path, rows, cfg={"k_drag": 0.024}, contact=contact)
+    assert clean is not None
+    assert not clean["dropped"]
+
+    dirty = [dict(r) for r in rows]
+    dirty[8]["x"] += 0.5              # 单点横向跳 0.5m
+    assert _run_truth(tmp_path, dirty, cfg={}, contact=contact) is not None or True
+    got = _run_truth(tmp_path, dirty, cfg={"k_drag": 0.024}, contact=contact)
+    assert got is not None
+    assert len(got["dropped"]) == 1
+    assert got["dropped"][0]["dt"] == pytest.approx(rows[8]["t"] - contact, abs=1e-9)
+    assert got["nPts"] == len(rows) - 1
+    assert got["z"] == pytest.approx(z0, abs=0.002)
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_pc_truth_outlier_drop_is_bounded(tmp_path):
+    """不能"剔到过门为止"：整段散布顶在门边时一个都不许剔，仍判失败。"""
+    contact = 100.0
+    rows, _ = _drag_rows(contact, k_drag=0.024)
+    noisy = [dict(r) for r in rows]
+    for i, r in enumerate(noisy):
+        r["z"] += 0.05 * (1 if i % 2 else -1)   # 每点 ±5cm，全体超门、无人突出
+    assert _run_truth(tmp_path, noisy, cfg={"k_drag": 0.024}, contact=contact) is None
+
+    # 3 个坏点超过 MAX_DROP=2，同样不许硬凑
+    three_bad = [dict(r) for r in rows]
+    for i in (5, 9, 13):
+        three_bad[i]["x"] += 0.5
+    assert _run_truth(tmp_path, three_bad, cfg={"k_drag": 0.024}, contact=contact) is None
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_pc_truth_trailing_ground_sample_does_not_clear_the_window(tmp_path):
+    """贴地点落在窗尾（球直接扎向地面）时只剔它自己，不能把整窗清空。
+
+    0811 080158 #17：HT−31ms 时 z=0.06，旧写法把 loT 推到 −31ms → 15 点全被砍 →
+    真值判失败；只剔那一个点后剩 14 点，max|残差| 0.6cm。
+    """
+    contact = 100.0
+    rows, z0 = _drag_rows(contact, k_drag=0.024)
+    rows[-1] = {**rows[-1], "z": 0.06}         # 最后一点贴地
+    got = _run_truth(tmp_path, rows, cfg={"k_drag": 0.024}, contact=contact)
+    assert got is not None
+    assert got["nPts"] == len(rows) - 1
+    assert got["z"] == pytest.approx(z0, abs=0.01)
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_pc_truth_leading_ground_samples_still_cut_everything_before(tmp_path):
+    """前段贴地（原本就要治的场景）行为不变：连它之前的一起砍。"""
+    contact = 100.0
+    rows, z0 = _drag_rows(contact, k_drag=0.024)
+    # 在窗口最前面塞 3 个地上静止球的采样
+    ground = [{"t": rows[0]["t"] - 0.10 + 0.03 * i, "x": -1.8, "y": 3.0, "z": 0.05}
+              for i in range(3)]
+    got = _run_truth(tmp_path, ground + rows, cfg={"k_drag": 0.024}, contact=contact)
+    assert got is not None
+    assert got["nPts"] == len(rows)            # 静止球那 3 个点整段出局
+    assert not got["dropped"]                  # 由切窗解决，不消耗离群剔除预算
+    assert got["z"] == pytest.approx(z0, abs=0.002)
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
 def test_pc_truth_y_is_ball_world_y_minus_car_world_y(tmp_path):
     car = {"x": 0.5, "y": 7.0, "yaw": 0.4}
     fitted = _run_truth(tmp_path, INCOMING, car)

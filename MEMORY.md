@@ -59,7 +59,8 @@
     - 当前剩余主要开销约为：`decode ~11.6ms`，`yolo ~26.7ms`，后台写视频 `~35ms`
 
 - `2026-07-03`: HTML 报表新增 Arm tab（仿 tennis-man arm_controller 的 session_viewer）。
-  - `test_src/extract_arm_bag.py` 在 ROS2 环境（经 `ros2/run_ros2.bat`）读 `{run_id}_rosbag`，输出 `{run_id}_arm.json`：`/joint_states` 实际 + `/tennis/motor_command` 目标（首个轨迹点）+ status/arm_command/hit_pos/predict_hit_pos 事件；TCP 由 tennis-man 的 `arm_controller.compact_arm_kinematics.fk` 正解（`sys.path` 引用 `D:\tennis-man\arm_controller\src`，不在本项目重复实现）。
+  - `test_src/extract_arm_bag.py` 在 ROS2 环境（经 `ros2/run_ros2.bat`）读 `{run_id}_rosbag`，输出 `{run_id}_arm.json`：`/joint_states` 实际 + `/tennis/motor_command` 目标（首个轨迹点）+ status/arm_command/hit_pos/predict_hit_pos 事件；TCP 由本文件内置 FK 正解（逐值抄自 `arm_controller.compact_arm_kinematics`，不依赖隔壁 checkout）。
+    - `2026-08-16` 起 FK **按车型分链**：`--car v03|v04`（不给就从本场 tracker JSON 的 `config.car_config_path` 推），选中的车写进 `_arm.json` 的 `car/car_source/fk_source`，报告端 `_add_face_angles` 按它复算；老 `_arm.json` 车型不符时页面就地复算 TCP。⚠ 两台车的臂不同（v0.4 肩高 +11.1cm、拍长 +5.3cm），选错车只会静默偏几厘米：0816_081524 用 v0.3 链算 v0.4，TCP 两列整场偏 (−5.4, −8.6)cm、FK 拍速低报 5%，而拍面 yaw/pitch 两车逐拍恒等（旋转链一致）——角度列看不出来。合同见 `test_src/test_arm_kinematics_cars.py`（黄金向量取自臂端导出的 `assets/<car>/test_vectors.json`）。
   - `generate_curve3_html.py` 新增 `--arm-json`（缺省自动探测 `<input>_arm.json`），Arm tab 为单 plot 四层 subplot（Position/Velocity/Effort/TCP，target 实线 vs actual 虚线，事件竖线）。
   - `run_tracker.py` post_run 链：bag 存在时先 Extract arm rosbag 再生成 HTML。
   - 性能教训（本机 Chrome 的 WebGL 是软渲染）：4 个独立 scattergl plot（4 个 WebGL context）或单 context 全量 15 万点都会把渲染器卡死几十秒；最终方案 = SVG `scatter`（lines 模式一条 trace 一条 path）+ 窗口化抽稀（hit/predict 事件 ±[-2,+4]s 内全分辨率，窗口外 2Hz），实测秒开。全量数据仍在 `_arm.json`，抽稀只发生在绘图端。

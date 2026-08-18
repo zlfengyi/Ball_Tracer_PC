@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -32,7 +33,8 @@ def _run_node(tmp_path: Path, body: str):
     script = tmp_path / "prediction_contract_harness.js"
     script.write_text(body, encoding="utf-8")
     result = subprocess.run(
-        [NODE, str(script)], capture_output=True, text=True, timeout=30
+        # 显式 utf-8：夹具会吐中文（表头红条文案），按 Windows 默认 cp1252 解码会炸
+        [NODE, str(script)], capture_output=True, text=True, encoding="utf-8", timeout=30
     )
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout.strip().splitlines()[-1])
@@ -121,13 +123,14 @@ def test_accepted_is_matched_by_source_ct_only(tmp_path):
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
 def test_accepted_raw_message_match_rejects_adjacent_prediction(tmp_path):
+    """值键（兜底路径）：x/z 双 5e-4 + ht 30ms，两个自标定量都进算式。"""
     core = _core(
         "arm-prediction-match-core-begin",
         "arm-prediction-match-core-end",
     )
     harness = (
         f"{core}\n"
-        "// z 偏移是逐场自标定量（armConstCal）：本例复刻 0803 及以前的 −0.153\n"
+        "// 两个都是逐场自标定量（armConstCal）：本例复刻 0803 及以前的 z −0.153、x 无变换\n"
         "ARM_HIT_Z_OFFSET=-0.153;\n"
         "const acceptT=10.0, acceptX=1.0375, acceptZ=1.3362, duration=0.3216;\n"
         "const actual={rel_x:1.0375,rel_z:1.4892,relSrc:'target',ht:10.3216};\n"
@@ -135,11 +138,15 @@ def test_accepted_raw_message_match_rejects_adjacent_prediction(tmp_path):
         "// ht−(acc_t+dur) 的系统差 = 臂内提前量 − 发布开销（0802/0803晨 ~+9ms）：必须仍回配成功\n"
         "const servoLag={rel_x:1.0375,rel_z:1.4892,relSrc:'target',ht:10.3216+0.0092};\n"
         "const crossThrow={rel_x:1.0375,rel_z:1.4892,relSrc:'target',ht:10.3216+0.5};\n"
-        "console.log(JSON.stringify({"
-        "actual:armPredictionMatchesAccepted(actual,acceptT,acceptX,acceptZ,duration),"
-        "adjacent:armPredictionMatchesAccepted(adjacent,acceptT,acceptX,acceptZ,duration),"
-        "servoLag:armPredictionMatchesAccepted(servoLag,acceptT,acceptX,acceptZ,duration),"
-        "crossThrow:armPredictionMatchesAccepted(crossThrow,acceptT,acceptX,acceptZ,duration)}));\n"
+        "const call=p=>armPredictionMatchesAccepted(p,acceptT,acceptX,acceptZ,duration);\n"
+        "const before={actual:call(actual),adjacent:call(adjacent),"
+        "servoLag:call(servoLag),crossThrow:call(crossThrow)};\n"
+        "// 臂端 0811 起 x/=cos5°：x 比例也自标定进来后，同一条消息必须还认得出\n"
+        "ARM_HIT_X_SCALE=1/Math.cos(5*Math.PI/180);\n"
+        "const scaledAcceptX=Number((1.0375*ARM_HIT_X_SCALE).toFixed(4));\n"
+        "const scaled=armPredictionMatchesAccepted(actual,acceptT,scaledAcceptX,acceptZ,duration);\n"
+        "const stale=armPredictionMatchesAccepted(actual,acceptT,acceptX,acceptZ,duration);\n"
+        "console.log(JSON.stringify(Object.assign(before,{scaled,stale})));\n"
     )
     result = _run_node(tmp_path, harness)
     assert result == {
@@ -147,42 +154,55 @@ def test_accepted_raw_message_match_rejects_adjacent_prediction(tmp_path):
         "adjacent": False,
         "servoLag": True,
         "crossThrow": False,
+        "scaled": True,     # 按本场标定的 x 比例回配
+        "stale": False,     # 不标定就整场失配（0811 113734 场 115/115 全灭的机理）
     }
 
 
 def _const_cal_harness(events: list) -> str:
-    """臂端常量自标定夹具：喂事件流，吐出标定结果与被改写的两个常量。"""
-    core = _core("arm-const-cal-core-begin", "arm-const-cal-core-end")
+    """臂端常量自标定夹具：喂事件流，吐出序号对齐、标定结果与被改写的三个常量。"""
     return (
         "const isNum=v=>typeof v==='number'&&Number.isFinite(v);\n"
         "const RK={t0:0};\n"
-        "let ARM_HIT_Z_OFFSET=-0.164;\n"
         "let HIT_TIME_ADVANCE_SEC=0.0;\n"
         f"const ARM={{events:{json.dumps(events)}}};\n"
+        + _core("arm-prediction-match-core-begin", "arm-prediction-match-core-end") + "\n"
         "const armPreds=ARM.events.filter(e=>e.topic==='/predict_hit_pos').map(e=>{"
         "const p=JSON.parse(e.text);"
         "return {t:e.t,rel_x:p.rel_x,rel_z:p.rel_z,ht:p.ht,relSrc:p.rel_src};});\n"
-        f"{core}\n"
-        "console.log(JSON.stringify({cal:armConstCal,z:ARM_HIT_Z_OFFSET,adv:HIT_TIME_ADVANCE_SEC}));\n"
+        + _core("arm-pred-align-core-begin", "arm-pred-align-core-end") + "\n"
+        + _core("arm-const-cal-core-begin", "arm-const-cal-core-end") + "\n"
+        # 标定完再拿值键复核每条 accepted↔源消息：标定对了值键就该整场认得出
+        "const recheck=armHitStatuses.map(s=>{const m=armAcceptedHitRe.exec(s.text);"
+        "if(!m) return null; const dur=Number(m[3]); const p=armPredForStatus(s,dur);"
+        "if(!p) return null;"
+        "return armPredictionMatchesAccepted(p,s.t+RK.t0,Number(m[1]),Number(m[2]),dur);})"
+        ".filter(v=>v!==null);\n"
+        "console.log(JSON.stringify({cal:armConstCal,align:armPredAlign,z:ARM_HIT_Z_OFFSET,"
+        "x:ARM_HIT_X_SCALE,adv:HIT_TIME_ADVANCE_SEC,"
+        "recheck:{n:recheck.length,ok:recheck.filter(Boolean).length}}));\n"
     )
 
 
-def _cal_session(z_offset: float, advance: float, overhead: float = 0.001) -> list:
-    """造 4 拍：每拍 3 条预测（同 rel_x，rel_z 各异）+ 命中最后一条的 accepted。
+def _cal_session(z_offset: float, advance: float, overhead: float = 0.001,
+                 x_scale: float = 1.0, throws: int = 4, per_throw: int = 3) -> list:
+    """造 N 拍：每拍若干条预测（同 rel_x，rel_z 各异）+ 每条各回一条 accepted。
 
-    臂内：duration = ht − advance − now，accepted 打印 z = rel_z + z_offset，
-    状态发布比消息到达晚 overhead。
+    臂内：duration = ht − advance − now，accepted 打印 z = rel_z + z_offset、
+    x = rel_x × x_scale（0811 起 = 1/cos(kHitYawExtraRad)），状态发布比消息到达晚 overhead。
+    "收一条必回一条" 是 on_hit_pos 的结构合同，序号对齐就架在它上面。
+    per_throw=1 时同抛内没有相邻消息，每条 accepted 只投一票——用来单测 δ 的认票门槛。
     """
     events = []
-    for k in range(4):
+    for k in range(throws):
         base = 10.0 * (k + 1)
-        for j in range(3):
+        for j in range(per_throw):
             t = base + 0.03 * j
             ht = base + 0.40 + 0.001 * j
             rel_z = 1.30 + 0.01 * j
             events.append(_pred_event(t, ht, rel_x=1.0375, rel_z=rel_z))
             dur = round(ht - advance - t, 3)
-            text = (f"accepted hit x=1.0375 z={rel_z + z_offset:.4f} "
+            text = (f"accepted hit x={1.0375 * x_scale:.4f} z={rel_z + z_offset:.4f} "
                     f"duration={dur:.4f} hit_time=0.2500")
             events.append(_status_event(t + overhead, text))
     return events
@@ -191,48 +211,96 @@ def _cal_session(z_offset: float, advance: float, overhead: float = 0.001) -> li
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
 @pytest.mark.parametrize("z_offset,advance", [(-0.164, 0.0), (-0.153, 0.010), (-0.153, 0.015)])
 def test_arm_constants_are_calibrated_per_session(tmp_path, z_offset, advance):
-    """z 偏移与臂内提前量随 arm_controller config.py 改版跳变，必须逐场标定回来。
+    """z 偏移与臂内提前量随 arm_controller 改版跳变，必须逐场标定回来。
 
     写死时 0804 场（−0.164/0ms）用老常数（−0.153/10ms）回配命中 0/80，
-    整张北极星表的 accepted 系列列全变 —。同一抛内相邻消息会投错票，靠众数压掉。
+    整张北极星表的 accepted 系列列全变 —。样本由序号对齐给出，故不含同抛相邻消息的错票。
     """
     result = _run_node(tmp_path, _const_cal_harness(_cal_session(z_offset, advance)))
 
+    assert result["align"]["delta"] == 0     # hit_pos 派生状态与预测消息一对一保序
+    assert result["align"]["n"] == 12
     assert result["cal"]["zOff"] == pytest.approx(z_offset, abs=1e-9)
     assert result["cal"]["n"] == 12          # 正确 z 的票数
-    assert result["cal"]["total"] == 24      # 含同抛相邻消息的错票
+    assert result["cal"]["total"] == 12      # 序号对齐后不再有同抛相邻消息的错票
     assert result["z"] == pytest.approx(z_offset, abs=1e-9)
     assert result["adv"] == pytest.approx(advance, abs=1e-9)
+    assert result["recheck"] == {"n": 12, "ok": 12}
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_arm_target_x_transform_is_calibrated_not_fatal(tmp_path):
+    """臂端对目标 x 做单点变换（0811 kHitYawExtraRad=5° → x/=cos5°）不许打死回配。
+
+    这正是 0811 113734 场：115 条 accepted 全部回配失败、armConstCal 一票、
+    accepted 目标/击球真值/TCP 各列整列 —。回配主键改成序号键后，x 比例只是个被标定出来的量。
+    """
+    scale = 1 / math.cos(math.radians(5.0))
+    result = _run_node(tmp_path, _const_cal_harness(
+        _cal_session(-0.164, 0.0, x_scale=scale)))
+
+    assert result["align"]["delta"] == 0
+    assert result["cal"]["zOff"] == pytest.approx(-0.164, abs=1e-9)
+    assert result["cal"]["xScale"] == pytest.approx(scale, abs=2e-4)
+    assert result["x"] == pytest.approx(scale, abs=2e-4)
+    assert result["adv"] == pytest.approx(0.0, abs=1e-9)
+    assert result["recheck"] == {"n": 12, "ok": 12}     # 标定回来后值键也认得出
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_arm_alignment_rejected_when_one_to_one_broken(tmp_path):
+    """bag 少收状态 → 序号差中途跳变：δ 众数不过 6 成就整场退回值键，不许硬套。
+
+    0719 100823 那场（少 11 条状态）δ=−7 只拿 4/9 票，却能骗过逐条弱键自校验，
+    把 9 条回配打成 4 条、z 标定带歪 13mm。
+    """
+    events = _cal_session(-0.164, 0.0, throws=8, per_throw=1)
+    # 第 4 拍丢一条状态：其后所有状态的序号整体前移一格，票数分成 3(δ=0) : 4(δ=−1)
+    drop = next(i for i, e in enumerate(events)
+                if e["topic"] == "/tennis/status" and e["t"] > 39.0)
+    events.pop(drop)
+    result = _run_node(tmp_path, _const_cal_harness(events))
+
+    assert result["align"]["delta"] is None      # 4/7 不足 6 成，不认
+    assert result["align"]["n"] == 4             # 众数票数够 3，但只占 4/7
+    assert result["cal"]["zOff"] == pytest.approx(-0.164, abs=1e-9)   # 值键自举兜底
+    assert result["z"] == pytest.approx(-0.164, abs=1e-9)
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
 def test_arm_constants_keep_defaults_when_votes_too_few(tmp_path):
-    """票数 <3 时不拿噪声改合同：两个常量保持缺省（页面注记提示去查这里）。"""
+    """票数 <3 时不拿噪声改合同：三个常量保持缺省（页面红条提示去查这里）。"""
     events = _cal_session(-0.153, 0.010)[:2]   # 只留 1 条预测 + 1 条 accepted
     result = _run_node(tmp_path, _const_cal_harness(events))
 
+    assert result["align"]["delta"] is None
     assert result["cal"]["zOff"] is None
     assert result["cal"]["n"] == 1
     assert result["z"] == pytest.approx(-0.164)
+    assert result["x"] == pytest.approx(1.0)
     assert result["adv"] == pytest.approx(0.0)
+
+
+def _arm_hit_harness(events: str, tail: str) -> str:
+    """整条回配链路（序号对齐 + 逐场自标定 + 值键复核 + 重定相重建）的 node 夹具。"""
+    return (
+        "const isNum=v=>typeof v==='number'&&Number.isFinite(v);\n"
+        "const RK={t0:0};\n"
+        "let HIT_TIME_ADVANCE_SEC=0.010;\n"
+        "const SWING_HT_UPDATE_LEAD_SEC=0.100;\n"
+        "const SWING_HT_UPDATE_MIN_REMAINING_SEC=0.060;\n"
+        f"const ARM={{events:{events}}};\n"
+        + _core("arm-prediction-match-core-begin", "arm-prediction-match-core-end") + "\n"
+        + _core("arm-swing-ht-core-begin", "arm-swing-ht-core-end") + "\n"
+        + tail
+    )
 
 
 def _swing_ht_harness(events: str) -> str:
     """挥拍中 ht 重定相重建段的 node 夹具：喂事件流，吐出 hit marks。"""
-    core = _core("arm-swing-ht-core-begin", "arm-swing-ht-core-end")
-    return (
-        "const isNum=v=>typeof v==='number'&&Number.isFinite(v);\n"
-        "const RK={t0:0};\n"
-        "const HIT_TIME_ADVANCE_SEC=0.010;\n"
-        "const SWING_HT_UPDATE_LEAD_SEC=0.100;\n"
-        "const SWING_HT_UPDATE_MIN_REMAINING_SEC=0.060;\n"
-        "const ARM_HIT_Z_OFFSET=-0.153;\n"
-        "const armPredictionMatchesAccepted=(p,acceptT,acceptX,acceptZ,acceptDuration)=>"
-        "Math.abs(p.rel_x-acceptX)<5e-4 && Math.abs(p.rel_z+ARM_HIT_Z_OFFSET-acceptZ)<5e-4"
-        " && Math.abs(p.ht-(acceptT+acceptDuration))<3e-2;\n"
-        f"const ARM={{events:{events}}};\n"
-        f"{core}\n"
-        "console.log(JSON.stringify(_armHit.marks.filter(h=>h.label==='hit')));\n"
+    return _arm_hit_harness(
+        events,
+        "console.log(JSON.stringify(_armHit.marks.filter(h=>h.label==='hit')));\n",
     )
 
 
@@ -261,7 +329,7 @@ def test_swing_ht_replan_consumes_last_late_saved(tmp_path):
     """
     events = [
         _pred_event(9.95, 10.510),
-        _status_event(10.000, "accepted hit x=1.0000 z=1.0470 duration=0.5000 hit_time=0.2500"),
+        _status_event(10.000, "accepted hit x=1.0000 z=1.0360 duration=0.5000 hit_time=0.2500"),
         _pred_event(10.26, 10.512), _status_event(10.300, "late ht saved: contact in 0.202s"),
         _pred_event(10.31, 10.514), _status_event(10.350, "late ht saved: contact in 0.154s"),
         _pred_event(10.35, 10.516), _status_event(10.390, "late ht saved: contact in 0.116s"),
@@ -290,7 +358,7 @@ def test_swing_ht_replan_skipped_when_remaining_too_short(tmp_path):
     """新触球距触发点 <60ms 时控制器放弃重定相：finalHt/finalDone 退回最后一条 accepted。"""
     events = [
         _pred_event(9.95, 10.510),
-        _status_event(10.000, "accepted hit x=1.0000 z=1.0470 duration=0.5000 hit_time=0.2500"),
+        _status_event(10.000, "accepted hit x=1.0000 z=1.0360 duration=0.5000 hit_time=0.2500"),
         # 新触球 10.450（比老触球早 50ms）→ 距触发点 10.400 只剩 50ms
         _pred_event(10.35, 10.460), _status_event(10.390, "late ht saved: contact in 0.060s"),
     ]
@@ -308,7 +376,7 @@ def test_swing_without_late_update_reports_no_replan(tmp_path):
     """挥拍窗内没有新预测：reswing 为 null，最后更新时刻即最后一条 accepted。"""
     events = [
         _pred_event(9.95, 10.510),
-        _status_event(10.000, "accepted hit x=1.0000 z=1.0470 duration=0.5000 hit_time=0.2500"),
+        _status_event(10.000, "accepted hit x=1.0000 z=1.0360 duration=0.5000 hit_time=0.2500"),
     ]
     h = _run_node(tmp_path, _swing_ht_harness(json.dumps(events)))[0]
 
@@ -326,7 +394,7 @@ def test_late_ht_pairing_self_check_rejects_wrong_source(tmp_path):
     """
     events = [
         _pred_event(9.95, 10.510),
-        _status_event(10.000, "accepted hit x=1.0000 z=1.0470 duration=0.5000 hit_time=0.2500"),
+        _status_event(10.000, "accepted hit x=1.0000 z=1.0360 duration=0.5000 hit_time=0.2500"),
         # 这条预测的 ht 与状态自述的触球时刻差 100ms（模拟队列错位）
         _pred_event(10.35, 10.616), _status_event(10.390, "late ht saved: contact in 0.116s"),
     ]
@@ -336,6 +404,142 @@ def test_late_ht_pairing_self_check_rejects_wrong_source(tmp_path):
     assert h["reswing"]["newDone"] == pytest.approx(10.506)   # 退回 status t+duration
     assert h["finalHt"] == pytest.approx(10.510)              # 不采信失配的 ht
     assert h["finalCt"] == pytest.approx(9.95)                # ct 与 ht 同源一起退回
+
+
+def _dup_session(x_scale: float = 1.0, drop_status_after: float | None = None,
+                 dx: float = 0.0002, dz: float = 0.0002) -> list:
+    """造 4 拍，每拍两条预测：先到的被 accept，后到的落在挥拍窗里被 reject。
+
+    dx/dz = 后到那条与被消费那条的间距。缺省 0.2mm 是"值键分不开"的实况（0804/0808/0811
+    三场各实测到 1~2 条：就近搜会选中晚到 33ms 的那条）；给 3mm 则是同抛相邻消息的常态间距。
+    accepted 的 x 再乘 x_scale，复刻臂端 0811 起的 x/=cos5° 变换。
+    """
+    events = []
+    for k in range(4):
+        base = 10.0 * (k + 1)
+        events.append(_pred_event(base, base + 0.500, rel_x=1.0358, rel_z=1.2281))
+        events.append(_status_event(base + 0.048, (
+            f"accepted hit x={1.0358 * x_scale:.4f} z=1.0641 "
+            f"duration={0.500 - 0.048:.4f} hit_time=0.2500")))
+        events.append(_pred_event(base + 0.033, base + 0.504,
+                                  rel_x=1.0358 - dx, rel_z=1.2281 + dz))
+        events.append(_status_event(base + 0.081, "reject hit: hit phase in progress"))
+    if drop_status_after is not None:
+        drop = next(i for i, e in enumerate(events)
+                    if e["topic"] == "/tennis/status" and e["t"] > drop_status_after)
+        events.pop(drop)
+    return events
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+@pytest.mark.parametrize("x_scale", [1.0, 1 / math.cos(math.radians(5.0))])
+def test_accepted_matches_the_message_it_consumed_not_the_nearest(tmp_path, x_scale):
+    """回配必须落在臂真正消费的那条上：晚到 33ms 的那条 x/z 只差 0.2mm，值键分不开。
+
+    x_scale≠1 复刻 0811 kHitYawExtraRad：值键此时整场对不上，全靠序号键顶住。
+    """
+    result = _run_node(tmp_path, _arm_hit_harness(
+        json.dumps(_dup_session(x_scale=x_scale)),
+        "console.log(JSON.stringify({nAcc:_armHit.nAcc,nMatch:_armHit.nMatch,"
+        "delta:armPredAlign.delta,xScale:armConstCal.xScale,"
+        "wht:_armHit.marks.filter(h=>h.label==='hit').map(h=>h.wht)}));\n"))
+
+    assert result["delta"] == 0
+    assert (result["nAcc"], result["nMatch"]) == (4, 4)
+    assert result["xScale"] == pytest.approx(x_scale, abs=2e-4)
+    # 消费的是先到那条（ht=base+0.500），不是晚到的 base+0.504
+    assert result["wht"] == pytest.approx([10.5, 20.5, 30.5, 40.5])
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_value_keys_repair_alignment_when_a_status_is_missing(tmp_path):
+    """序号对齐被"少收一条状态"整体带偏一格时，本场自标定的值键要把它掰回来。
+
+    偏的那条同样过得了到达窗与时序键（相邻消息只差 33ms/4ms），弱键自校验看不出来；
+    但它的 x/z 与 accepted 差着常态间距，命中不了值键，而正确那条严丝合缝。
+    （间距退化到 0.2mm 时两条谁都对得上，此时错配代价 = 用了 33ms 前的同抛预测。）
+    """
+    result = _run_node(tmp_path, _arm_hit_harness(
+        json.dumps(_dup_session(drop_status_after=20.05, dx=0.003, dz=0.006)),
+        "console.log(JSON.stringify({nMatch:_armHit.nMatch,delta:armPredAlign.delta,"
+        "wht:_armHit.marks.filter(h=>h.label==='hit').map(h=>h.wht)}));\n"))
+
+    assert result["delta"] == -1        # 序号对齐被丢掉的那条状态带偏了一格
+    assert result["nMatch"] == 4
+    assert result["wht"] == pytest.approx([10.5, 20.5, 30.5, 40.5])
+
+
+def _warn_harness(n_acc: int, n_match: int, parse_bad: int = 0) -> str:
+    """表头红条夹具：喂回配统计，吐出 armDataWarnHtml。"""
+    return (
+        "const ARM={events:[]};\n"
+        f"let armPredParseBad={parse_bad}, armPredTotal=722;\n"
+        f"const _armHit={{nAcc:{n_acc},nMatch:{n_match}}};\n"
+        f"const armPredAlign={{delta:null,n:1,nAcc:{n_acc}}};\n"
+        "const armConstCal={xScale:null,zOff:null,adv:null};\n"
+        + _core("arm-data-warn-core-begin", "arm-data-warn-core-end") + "\n"
+        "console.log(JSON.stringify({html:armDataWarnHtml}));\n"
+    )
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_arm_data_failure_is_shown_as_a_banner_not_a_page_of_dashes(tmp_path):
+    """回配失败必须在表头喊出来：整表满屏 "—" 看上去像"这场没数据"而不是"报告读不了数据"。
+
+    0809 103849（载荷截断）与 0811 113734（臂端改了 x 变换）两次都是这么被埋掉的，
+    所以红条里要带上三把键各自的状态，下次一眼能定位是结构变了还是口径变了。
+    """
+    dead = _run_node(tmp_path, _warn_harness(115, 0))["html"]
+    assert "#e94560" in dead                      # 全灭 = 红条
+    assert "115 条 accepted hit 只回配上 0 条" in dead
+    assert "序号对齐 δ=" in dead and "本场自标定 x×" in dead
+
+    partial = _run_node(tmp_path, _warn_harness(115, 113))["html"]
+    assert "#e0a24a" in partial and "#e94560" not in partial   # 部分失配 = 橙条
+    assert "只回配上 113 条" in partial
+
+    assert _run_node(tmp_path, _warn_harness(115, 115))["html"] == ""   # 全中就不出条
+    truncated = _run_node(tmp_path, _warn_harness(115, 115, parse_bad=9))["html"]
+    assert "载荷解析失败 9/722 条" in truncated and "#e94560" in truncated
+
+
+def _plane_shift_harness(x_scale, tx: float, dy: float) -> str:
+    """触球平面前移量的 node 夹具：喂本场自标定 x 比例 + 该拍目标 x + 实测 dy。"""
+    return (
+        "const isNum=v=>typeof v==='number'&&Number.isFinite(v);\n"
+        "const cmFmt=(v,d=1)=>isNum(v)?(Number(v)*100).toFixed(d):'—';\n"
+        "const cmSigned=(v,d=1)=>isNum(v)?(v>=0?'+':'')+(Number(v)*100).toFixed(d):'—';\n"
+        "const tableSigned=v=>isNum(v)?(v>=0?'+':'')+Number(v).toFixed(1):'—';\n"
+        f"const armConstCal={{xScale:{'null' if x_scale is None else repr(x_scale)}}};\n"
+        f"const accepted={{tx:{tx}}};\n"
+        f"const gapFin={{dy:{dy}, vRel:-12.0}};\n"
+        "const finalHt=1.0;\n"
+        + _core("hit-plane-shift-core-begin", "hit-plane-shift-core-end") + "\n"
+        "console.log(JSON.stringify({deg:hitYawExtraRad*180/Math.PI,"
+        "shift:hitPlaneShift,note:hitPlaneNote}));\n"
+    )
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_hit_plane_shift_is_derived_from_the_self_calibrated_x_scale(tmp_path):
+    """臂端整体多转 δ 把触球平面搬离车 y 面 → 「球面y−车y」列的零点跟着搬。
+
+    列的口径不动（用户 0812 拍板），但零点必须在悬停里写出来：0811 113734 场 dy=+4cm
+    按老零点读是"球没够到、ht 偏早 3ms"，扣掉平面前移 9.1cm 后是"已穿过 5cm、ht 偏晚 4ms"，
+    符号相反。δ 由 x 比例反解（同一处臂端变换 x/=cosδ），臂端下场改 δ 报告自动跟上。
+    """
+    scale = 1 / math.cos(math.radians(5.0))
+    r = _run_node(tmp_path, _plane_shift_harness(scale, 1.0439, 0.040))
+    assert r["deg"] == pytest.approx(5.0, abs=0.02)
+    assert r["shift"] == pytest.approx(1.0439 * math.sin(math.radians(5.0)), abs=1e-6)
+    assert "零点是 +9.1cm，不是 0" in r["note"]
+    assert "扣掉后球面到拍面 -5.1cm" in r["note"]       # +4.0 − 9.1（cm，1位小数）
+    assert "等效时序 +4.2ms" in r["note"]                # 正=该 ht 比真实触球晚
+
+    # δ=0（臂端没这个变换 / 没标定出来）时整段不出现，与改前逐字相同
+    for x_scale in (None, 1.0):
+        off = _run_node(tmp_path, _plane_shift_harness(x_scale, 1.0439, 0.040))
+        assert (off["deg"], off["shift"], off["note"]) == (0, 0, "")
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
@@ -518,7 +722,8 @@ def test_rk300_table_includes_last_accepted_target_and_tcp_at_final_ht():
     headers = [
         "<th>车RUN末帧 目标−实际 dx/dy(cm)<br>(RK世界系)</th>",
         "<th>RK@≈300ms预测车@HT−RUN末实际 dx/dy(cm)<br>(RK世界系)</th>",
-        "<th>机械臂最后accepted目标 x/z(cm)</th>",
+        # 表头带悬停：本场回配成功率 + 自标定出来的臂端三个量（x 比例/z 偏移/提前量）
+        "机械臂最后accepted目标 x/z(cm)</th>",
         "<th>PC真值@HT300 x/y/z(cm)</th>",
         "PC真值@臂最后更新HT x/y/z(cm)</th>",
         "TCP−车心@臂最后更新HT x/y/z(cm,世界轴)</th>",
@@ -606,11 +811,13 @@ def test_rk300_table_includes_last_accepted_target_and_tcp_at_final_ht():
     assert source.count("<td>'+rkPredCarError+'</td>") == 2
 
 
-def test_add_face_angles_wiring_and_fk_properties():
+@pytest.mark.parametrize("car,fp0", [("v03", 15.42), ("v04", 15.42)])
+def test_add_face_angles_wiring_and_fk_properties(car, fp0):
     """拍面yaw,pitch,speed 三量的 Python 侧：_add_face_angles 正确附加 fy/fp/vt、跳过残缺关节；
     FK 性质：零位 fy=fp=0（拍面朝正前且不上仰）、J1 为垂直轴（Δfy=−Δq1 精确、fp 分毫不动
     ——这正是 pitch 列不需要减车 yaw 的依据）；vt 的解析 Jacobian 与数值差分一致，
-    且只有 J1 转时退化成 |q̇1|·r（r=hypot(tcp_x,tcp_y)），即 status speed= 的口径。"""
+    且只有 J1 转时退化成 |q̇1|·r（r=hypot(tcp_x,tcp_y)），即 status speed= 的口径。
+    两台车逐条都要成立：拍面角在两车下恒等（旋转链一致），位置/拍速则不同。"""
     pytest.importorskip("numpy")
     import math
     import sys
@@ -618,9 +825,11 @@ def test_add_face_angles_wiring_and_fk_properties():
     sys.path.insert(0, str(SRC.parent))
     try:
         from generate_curve3_html import _add_face_angles
-        from extract_arm_bag import fk
+        import extract_arm_bag as eab
     finally:
         sys.path.pop(0)
+    eab.use_car(car)
+    fk = eab.fk
 
     q = [0.1, -0.2, 0.3, 0.15, -0.4, 0.25]
     q1p = [0.3] + q[1:]
@@ -637,8 +846,9 @@ def test_add_face_angles_wiring_and_fk_properties():
         {"t": 1.8, "position": q, "velocity": [0.0] * 6},
         {"t": 1.9, "position": q, "velocity": [0.1, None, 0, 0, 0, 0]},  # 速度残缺
     ]}
-    _add_face_angles(arm)
+    _add_face_angles(arm, car=car)
     s = arm["states"]
+    assert arm["fk_car"] == car and arm["fk_source"].startswith(f"extract_arm_bag.fk({car})")
     assert isinstance(s[0].get("fy"), float)
     assert isinstance(s[0].get("fp"), float)
     assert all("fy" not in r and "fp" not in r for r in s[1:4])
@@ -648,7 +858,7 @@ def test_add_face_angles_wiring_and_fk_properties():
         -math.degrees(0.2), abs=0.02
     )
     assert s[5]["fp"] == s[0]["fp"]                            # 纯 z 转不动 n_z ⇒ pitch 不变
-    assert s[0]["fp"] == pytest.approx(15.42, abs=0.01)        # 该位形的拍面上仰角（回归锚）
+    assert s[0]["fp"] == pytest.approx(fp0, abs=0.01)          # 该位形的拍面上仰角（回归锚）
     # vt：只在有 6 个数值 velocity 的帧上出现
     assert "vt" not in s[0] and "vt" not in s[5] and "vt" not in s[9]
     # 解析 Jacobian ≡ 数值差分（沿 q̇ 方向前推一小步的位移速率）

@@ -295,8 +295,16 @@ def build_relative_frame_time_s(
 # 之上，073646 实测 12.2~12.4m/s 回球会被 12 门误切）切成连续段，按点数优先选首个
 # "真出向"段——静止球段 vy≈0 被拒，被拍/臂遮挡断档后仍能用遮挡后的真弧；
 # vz 由降转升突增判地面反弹截断；出弧 vy≤0.5、水平速<1m/s 或点数不足不认定回球。
+# 出弧另有三道防污染门（0813_083521 抛28 定案，入弧不加——入弧窗内可含真地面反弹）：
+# 1) 轨迹一致性切段（>20m/s 跳变门在长断档下放行的绝对位移随 dt 变大，抛28：138ms 断档
+#    +1.99m 跳到另一颗静止球=14.4m/s 贴线通过）；2) 段首前拟合 z 触地拒绝（整段在反弹之后，
+#    倒推跨反弹必错）；3) 三轴拟合 max|残差|>0.12m 拒绝出数（混轨垃圾；不剔点重拟合——
+#    高杠杆野点会把二次拟合弯过去反把真点顶成最大残差）。
 RETURN_MIN_Z = 0.12
 RETURN_MAX_STEP_MPS = 20.0
+RETURN_TRACK_DEV_M = 0.5     # 防污染门 1：末 3 点线性外推偏差上限
+RETURN_FIT_RESID_M = 0.12    # 防污染门 3：三轴拟合 max|残差| 上限
+RETURN_MIN_FIT_Z = 0.05      # 防污染门 2：[0,段首] 拟合 z（含重力）下限
 RETURN_OUT_WINDOW = (0.02, 0.40)
 RETURN_MAX_SEG_START = 0.30  # 出弧段首距触球上限（限制回推外推量）
 RETURN_HALF_G = 4.905
@@ -349,6 +357,29 @@ def _runs_in_window(
     return runs
 
 
+def _split_by_track_dev(
+    runs: list[list[tuple[float, float, float, float]]]
+) -> list[list[tuple[float, float, float, float]]]:
+    """防污染门 1：run 内已有 ≥3 点时由末 3 点线性外推到新点时刻，偏差 >0.5m 切段。
+    只用于出弧（入弧窗内可含真地面反弹）；切出的野点子段随后被点数/vy 门拒绝。"""
+    out: list[list[tuple[float, float, float, float]]] = []
+    for run in runs:
+        cur: list[tuple[float, float, float, float]] = []
+        for p in run:
+            if len(cur) >= 3:
+                a, b = cur[-3], cur[-1]
+                dv = max(1e-9, b[0] - a[0])
+                dt = p[0] - b[0]
+                pred = tuple(b[i] + (b[i] - a[i]) / dv * dt for i in (1, 2, 3))
+                if math.hypot(p[1] - pred[0], p[2] - pred[1], p[3] - pred[2]) > RETURN_TRACK_DEV_M:
+                    out.append(cur)
+                    cur = []
+            cur.append(p)
+        if cur:
+            out.append(cur)
+    return out
+
+
 def _pc_hit_time_at(rows: list[tuple[float, float, float, float]], t_approx: float) -> float | None:
     """入弧 [−380,−25]ms / 出弧 [+30,+330]ms y(t) 拟合交点；无有效交点返回 None。"""
     yin_run = next(
@@ -361,7 +392,10 @@ def _pc_hit_time_at(rows: list[tuple[float, float, float, float]], t_approx: flo
     fin = _quad_fit_u([(t, y) for t, x, y, z in yin_run], t_approx)
     if fin is None or fin["b"] > -1.0:
         return None
-    out_runs = [r for r in _runs_in_window(rows, t_approx + 0.03, t_approx + 0.33) if len(r) >= 4]
+    out_runs = [
+        r for r in _split_by_track_dev(_runs_in_window(rows, t_approx + 0.03, t_approx + 0.33))
+        if len(r) >= 4
+    ]
     out_runs.sort(key=len, reverse=True)
     for run in out_runs:
         fout = _quad_fit_u([(t, y) for t, x, y, z in run], t_approx)
@@ -468,9 +502,9 @@ def detect_return_events(observations: list[dict]) -> list[dict]:
         if events and t_hit < events[-1]["t_hit"] + 0.5:
             continue
         cand_runs = [
-            r for r in _runs_in_window(
+            r for r in _split_by_track_dev(_runs_in_window(
                 rows, t_hit + RETURN_OUT_WINDOW[0], t_hit + RETURN_OUT_WINDOW[1]
-            )
+            ))
             if len(r) >= 5 and r[0][0] - t_hit <= RETURN_MAX_SEG_START
         ]
         cand_runs.sort(key=len, reverse=True)
@@ -492,6 +526,28 @@ def detect_return_events(observations: list[dict]) -> list[dict]:
             vh = math.hypot(vx, vy)
             if vh < 1.0:
                 continue
+            fit_x = (fx["a"], fx["b"], fx["c"])
+            fit_y = (fy["a"], fy["b"], fy["c"])
+            fit_z = (fz["a"], fz["b"], fz["c"])
+            start = seg[0][0] - t_hit
+            # 防污染门 2：段首前拟合 z 触地即整段在反弹之后，倒推跨反弹必错
+            min_z = min(
+                _eval_fit(fit_z, start * i / 16.0) - RETURN_HALF_G * (start * i / 16.0) ** 2
+                for i in range(17)
+            )
+            if min_z < RETURN_MIN_FIT_Z:
+                continue
+            # 防污染门 3：混轨/乱拟合拒绝出数（不剔点重拟合）
+            max_res = max(
+                max(
+                    abs(p[1] - _eval_fit(fit_x, p[0] - t_hit)),
+                    abs(p[2] - _eval_fit(fit_y, p[0] - t_hit)),
+                    abs(p[3] + RETURN_HALF_G * (p[0] - t_hit) ** 2 - _eval_fit(fit_z, p[0] - t_hit)),
+                )
+                for p in seg
+            )
+            if max_res > RETURN_FIT_RESID_M:
+                continue
             events.append({
                 "t_hit": t_hit,
                 "t_end": t_hit + RETURN_OUT_WINDOW[1],
@@ -505,10 +561,11 @@ def detect_return_events(observations: list[dict]) -> list[dict]:
                 "n_points": len(seg),
                 "span_s": seg[-1][0] - seg[0][0],
                 "seg_start_s": seg[0][0] - t_hit,
+                "max_res_m": max_res,
                 "bounce_cut": bounce_cut,
-                "fit_x": (fx["a"], fx["b"], fx["c"]),
-                "fit_y": (fy["a"], fy["b"], fy["c"]),
-                "fit_z": (fz["a"], fz["b"], fz["c"]),
+                "fit_x": fit_x,
+                "fit_y": fit_y,
+                "fit_z": fit_z,
             })
             break
     return events
@@ -1377,6 +1434,11 @@ def main() -> None:
 
     serials = data["config"]["serials"]
     calib_config_path = data["config"]["calib_config_path"]
+    # 车体 AprilTag 布局跟着录制那场走：run_tracker 从 2026-08-15 起把 --car-config
+    # 记进 session json。更早的 session 没这个字段，那批全是 v0.3 车。
+    car_config_path = data["config"].get("car_config_path") or str(
+        _PROJECT_ROOT / "src" / "config" / "arm_poe_racket_center.json"
+    )
     n_cams = len(serials)
     frames_data = data["frames"]
     racket_enabled = not args.no_racket
@@ -1456,10 +1518,15 @@ def main() -> None:
         clear_racket_results(data)
 
     car_localizer = (
-        CarLocalizer(calib_config_path=calib_config_path)
+        CarLocalizer(
+            calib_config_path=calib_config_path,
+            vehicle_config_path=car_config_path,
+        )
         if car_enabled
         else None
     )
+    if car_localizer is not None:
+        print(f"车体配置: {car_config_path}")
 
     writer = None
     if not args.no_output_video:

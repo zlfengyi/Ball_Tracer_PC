@@ -35,11 +35,41 @@ def _synth(
     z_bias: float = 0.08,
     sparse_pc: bool = False,
     noise_amplitude: float = 0.01,
+    exact_pose_every: int | None = 1,
+    pose_unrelated: bool = False,
 ):
+    """合成一场。
+
+    ``exact_pose_every`` 控制 RK 侧位姿有多少行与 PC 值**逐位相同**（=精确值锚的来源）：
+    1 表示全部相同（老场景），N 表示每 N 行才留一条，None 表示一条都没有——真机上
+    bot_state 多数时候发的是 KF 传播过的位姿，实测 806 行里只有 33 行逐位相同。
+    ``pose_unrelated`` 让 RK 位姿变成一条与 PC 无关的信号，用来验证形状锁会自己弃权。
+    """
     starts = [10.0, 24.5, 40.5, 55.0, 71.0, 85.5]
     obs = []
     car = []
     rk = []
+    row_index = 0
+
+    def rk_pose(pose, t):
+        nonlocal row_index
+        row_index += 1
+        if pose_unrelated:
+            return {
+                "x": round(0.7 * math.sin(t * 0.11), 4),
+                "y": round(3.0 + 0.5 * math.cos(t * 0.07), 4),
+                "yaw": round(0.2 * math.sin(t * 0.05), 4),
+            }
+        if exact_pose_every is not None and row_index % exact_pose_every == 0:
+            return pose
+        # KF 传播后的等价位姿：值不再逐位相同，但形状仍是同一条曲线（mm 级差异）
+        drift = 0.0012
+        return {
+            "x": round(pose["x"] + drift, 6),
+            "y": round(pose["y"] - drift, 6),
+            "yaw": round(pose["yaw"] + drift * 0.5, 6),
+        }
+
     for index, start in enumerate(starts):
         duration = 1.08 + 0.04 * (index % 3)
         amplitude = 0.9 + 0.12 * index
@@ -67,7 +97,7 @@ def _synth(
                         z + z_bias + noise_amplitude * math.sin(sample * 1.7),
                         6,
                     ),
-                    pose,
+                    rk_pose(pose, t),
                 )
             )
 
@@ -84,7 +114,7 @@ def _synth(
             (
                 round((t - bias) / scale, 6),
                 0.25 + z_bias,
-                pose,
+                rk_pose(pose, t),
             )
         )
 
@@ -102,12 +132,28 @@ def _synth(
     }
 
 
-def _run_estimate(obs, car, rk_data, tmp_path: Path, expr: str = "estimateTimeMap()") -> dict:
+def _run_estimate(
+    obs,
+    car,
+    rk_data,
+    tmp_path: Path,
+    expr: str = "estimateTimeMap()",
+    *,
+    cfg: dict | None = None,
+) -> dict:
+    """在 node 里跑 align-core。
+
+    桩必须覆盖 align-core 声明的全部外部依赖（obs/car/RK/cfg/t0/isNum/relTime）；
+    ``t0`` 与 ``RK.t0`` 都取 0，于是时钟桥的 ``pc_minus_rk`` 就直接等于 rel 轴 bias。
+    """
+    rk_data = {**rk_data, "t0": 0}
     harness = (
         "const isNum = v => typeof v==='number' && isFinite(v);\n"
         f"const obs = {json.dumps(obs)};\n"
         f"const car = {json.dumps(car)};\n"
         "const relTime = v => v;\n"
+        "const t0 = 0;\n"
+        f"const cfg = {json.dumps(cfg or {})};\n"
         f"const RK = {json.dumps(rk_data)};\n"
         f"{_align_core_js()}\n"
         f"console.log(JSON.stringify({expr}));\n"
@@ -216,6 +262,106 @@ def test_estimate_time_map_survives_contaminated_pose_anchors(tmp_path):
     best = _run_estimate(obs, car, rk_data, tmp_path)
     assert best["err"] is not None and best["err"] < 0.05, best
     assert abs(best["bias"] - bias) <= 0.01, best
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_clock_bridge_beats_every_inferred_source(tmp_path):
+    """录制时量出来的 PC↔RK 时钟桥是唯一**不依赖本场有没有球**的粗定位手段，优先级最高。
+
+    tracker 订阅 /bot_state 记 median(perf 收到 − 载荷 RK 时刻)，写进 config.rk_clock_bridge。
+    这里把位姿也打乱（形状锁失效、精确值锚归零），验证光靠时钟桥仍能把 bias 锁到亚厘秒。
+    """
+    bias = -11.7505
+    obs, car, rk_data = _synth(
+        bias, noise_amplitude=0.0, exact_pose_every=None, pose_unrelated=True
+    )
+    cfg = {"rk_clock_bridge": {"pc_minus_rk": bias + 0.031, "mad": 0.004, "n": 4200}}
+
+    bridge = _run_estimate(obs, car, rk_data, tmp_path, expr="clockBridge", cfg=cfg)
+    assert bridge["bias"] is not None and abs(bridge["bias"] - bias) <= 0.05, bridge
+
+    best = _run_estimate(obs, car, rk_data, tmp_path, cfg=cfg)
+    assert best["windowSource"] == "bridge", best
+    assert abs(best["bias"] - bias) <= 0.01, best
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_clock_bridge_ignored_when_jittery_or_absent(tmp_path):
+    """桥抖动过大（那条 topic 当场断断续续）或场次太老没有该字段时必须弃用，
+    退回位姿形状锁——绝不能拿一个脏桥把窗定歪。"""
+    bias = -11.7505
+    obs, car, rk_data = _synth(bias, noise_amplitude=0.0)
+
+    jittery = {"rk_clock_bridge": {"pc_minus_rk": bias, "mad": 0.9, "n": 4200}}
+    assert _run_estimate(obs, car, rk_data, tmp_path, expr="clockBridge", cfg=jittery)["bias"] is None
+    assert _run_estimate(obs, car, rk_data, tmp_path, cfg=jittery)["windowSource"] != "bridge"
+
+    thin = {"rk_clock_bridge": {"pc_minus_rk": bias, "mad": 0.001, "n": 3}}
+    assert _run_estimate(obs, car, rk_data, tmp_path, expr="clockBridge", cfg=thin)["bias"] is None
+
+    absent = _run_estimate(obs, car, rk_data, tmp_path, expr="clockBridge")
+    assert absent["bias"] is None and absent["n"] == 0, absent
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_pose_shape_lock_works_when_exact_anchors_vanish(tmp_path):
+    """精确值锚归零时，位姿**形状**锁必须独自把搜索窗收住。
+
+    0812_052638 场的教训：精确值锚天生稀疏（bot_state 发的是传播过的位姿），场次间
+    从 87 条到 0 条乱跳，不能当唯一的粗定位手段。形状锁不要求数值相等，用的是全部
+    位姿行，且小车位姿全场不重复 → 免疫抛球周期混叠。
+    """
+    bias = -11.7505
+    obs, car, rk_data = _synth(bias, noise_amplitude=0.0, exact_pose_every=None)
+
+    anchor = _run_estimate(obs, car, rk_data, tmp_path, expr="clockAnchor")
+    assert anchor["bias"] is None and anchor["anchors"] < 8, anchor
+
+    lock = _run_estimate(obs, car, rk_data, tmp_path, expr="poseLock")
+    assert lock["usable"], lock
+    # 形状锁只负责粗定位：真机上它比 z 精锁早 0.1~0.29s（/pc_car_loc→bot_state 管线
+    # 延迟），窗开 ±1.0s 就够。精度由后面的 z 精锁负责，见最后一条断言。
+    assert abs(lock["bias"] - bias) <= 0.5, lock
+
+    best = _run_estimate(obs, car, rk_data, tmp_path)
+    assert best["windowSource"] == "pose", best
+    assert abs(best["bias"] - bias) <= 0.01, best
+    assert best["err"] is not None and best["err"] < 0.05, best
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_pose_shape_lock_abstains_when_the_two_streams_are_different_signals(tmp_path):
+    """老场次 RK 自算位姿 / 小车全程静止时，两条位姿不同源——形状锁必须自己弃权，
+    把窗让回全场扫描，而不是拿一个 0.5~6s 的错窗把 z 精锁带偏。"""
+    bias = 7.0
+    obs, car, rk_data = _synth(bias, noise_amplitude=0.0, pose_unrelated=True)
+
+    lock = _run_estimate(obs, car, rk_data, tmp_path, expr="poseLock")
+    assert not lock["usable"], lock
+
+    best = _run_estimate(obs, car, rk_data, tmp_path)
+    assert best["windowSource"] == "scan", best
+    assert abs(best["bias"] - bias) <= 0.01, best
+    # 全场扫描路径必须自报混叠余量（冠军 vs 2s 外次优），页面用它当质量门
+    assert best["margin"] is None or best["margin"] > 1.35, best
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_clock_anchor_keeps_bias_when_anchors_are_few_but_tight(tmp_path):
+    """锚少 ≠ 锚不准。
+
+    0812_052638 场只有 14 条锚（MAD 45ms，够把窗收到 ±0.75s），旧代码的 `<20` 硬门
+    把 bias 连同锚一起丢掉 → 搜索退回全场 ±130s → 锁到错的一抛（z 形状误差 0.289m）。
+    锚少时只是不做钟漂拟合（scale 记 1），bias 照给。
+    """
+    bias = -11.75
+    obs, car, rk_data = _synth(bias, noise_amplitude=0.0, exact_pose_every=30)
+
+    anchor = _run_estimate(obs, car, rk_data, tmp_path, expr="clockAnchor")
+    assert 8 <= anchor["anchors"] < 20, anchor
+    assert anchor["bias"] is not None, anchor
+    assert abs(anchor["bias"] - bias) <= 0.05, anchor
+    assert anchor["scale"] == 1, anchor
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")

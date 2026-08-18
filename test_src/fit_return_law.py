@@ -37,14 +37,16 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from extract_arm_bag import fk, JOINTS  # noqa: E402
+import extract_arm_bag as eab  # noqa: E402  车型在 main() 里选定后才有 fk/JOINTS
 
 G = 9.81
 HALF_G = 4.905
 K_DRAG = 0.024
 GROUND_Z = 0.033
 RETURN_MAX_STEP_MPS = 20.0
-LINK6 = JOINTS[-1]["child"]
+RETURN_TRACK_DEV_M = 0.5   # 出弧防污染门 1：末 3 点线性外推偏差上限（切段）
+RETURN_FIT_RESID_M = 0.12  # 出弧防污染门 3：三轴拟合 max|残差| 上限（拒绝出数）
+RETURN_MIN_FIT_Z = 0.05    # 出弧防污染门 2：[0,段首] 拟合 z（含重力）下限
 
 
 # ---------------- [[pc-return-core]] 复刻（generate_curve3_html.py 同口径） ----------------
@@ -89,6 +91,27 @@ class ReturnExtractor:
             runs.append(run)
         return runs
 
+    @staticmethod
+    def split_by_track_dev(runs):
+        """出弧防污染门 1：run 内已有 ≥3 点时由末 3 点线性外推，偏差 >0.5m 切段。
+        只用于出弧（入弧窗内可含真地面反弹，桥接断档会被误切）。"""
+        out = []
+        for run in runs:
+            cur = []
+            for p in run:
+                if len(cur) >= 3:
+                    a, b = cur[-3], cur[-1]
+                    dv = max(1e-9, b["t"] - a["t"])
+                    dt = p["t"] - b["t"]
+                    pred = [b[k] + (b[k] - a[k]) / dv * dt for k in ("x", "y", "z")]
+                    if math.dist((p["x"], p["y"], p["z"]), pred) > RETURN_TRACK_DEV_M:
+                        out.append(cur)
+                        cur = []
+                cur.append(p)
+            if cur:
+                out.append(cur)
+        return out
+
     def hit_time_at(self, t_approx):
         yin = None
         for r in reversed(self.runs(t_approx - 0.38, t_approx - 0.025)):
@@ -100,7 +123,8 @@ class ReturnExtractor:
         fin = quad_fit_u([(p["t"], p["y"]) for p in yin], t_approx)
         if not fin or fin["b"] > -1.0:
             return None
-        out_runs = [r for r in self.runs(t_approx + 0.03, t_approx + 0.33) if len(r) >= 4]
+        out_runs = [r for r in self.split_by_track_dev(self.runs(t_approx + 0.03, t_approx + 0.33))
+                    if len(r) >= 4]
         out_runs.sort(key=len, reverse=True)
         for run in out_runs:
             fout = quad_fit_u([(p["t"], p["y"]) for p in run], t_approx)
@@ -143,11 +167,15 @@ class ReturnExtractor:
                 return run[:i], True
         return run, False
 
+    @staticmethod
+    def _eval_fit(fit, u):
+        return fit["a"] + fit["b"] * u + fit["c"] * u * u
+
     def return_at(self, t_approx):
         t_hit = self.hit_time_near(t_approx)
         if t_hit is None:
             return None
-        cands = [r for r in self.runs(t_hit + 0.02, t_hit + 0.40)
+        cands = [r for r in self.split_by_track_dev(self.runs(t_hit + 0.02, t_hit + 0.40))
                  if len(r) >= 5 and r[0]["t"] - t_hit <= 0.30]
         cands.sort(key=len, reverse=True)
         for run in cands:
@@ -162,8 +190,22 @@ class ReturnExtractor:
             vx, vy, vz = fx["b"], fy["b"], fz["b"]
             if vy <= 0.5 or math.hypot(vx, vy) < 1.0:
                 continue
+            start = seg[0]["t"] - t_hit
+            # 防污染门 2：段首前拟合 z 触地即整段在反弹之后，倒推跨反弹必错
+            min_z = min(self._eval_fit(fz, start * i / 16.0) - HALF_G * (start * i / 16.0) ** 2
+                        for i in range(17))
+            if min_z < RETURN_MIN_FIT_Z:
+                continue
+            # 防污染门 3：混轨/乱拟合拒绝出数（不剔点重拟合——高杠杆野点会反把真点顶成最大残差）
+            max_res = max(
+                max(abs(p["x"] - self._eval_fit(fx, p["t"] - t_hit)),
+                    abs(p["y"] - self._eval_fit(fy, p["t"] - t_hit)),
+                    abs(p["z"] + HALF_G * (p["t"] - t_hit) ** 2 - self._eval_fit(fz, p["t"] - t_hit)))
+                for p in seg)
+            if max_res > RETURN_FIT_RESID_M:
+                continue
             return {"tHit": t_hit, "x0": fx["a"], "y0": fy["a"], "z0": fz["a"],
-                    "vx": vx, "vy": vy, "vz": vz, "bounceCut": cut,
+                    "vx": vx, "vy": vy, "vz": vz, "bounceCut": cut, "maxRes": max_res,
                     "speed": math.hypot(vx, vy, vz), "n": len(seg)}
         return None
 
@@ -352,8 +394,8 @@ def arm_at_contact(states, st_t, cl, bot_t, bot_ch, rk_t0):
         vel_c.append(float(sol[1] + 2 * sol[2] * (-0.006)))
     fps = []
     for s in win:
-        rot = fk(s["position"])["link_transforms"][LINK6]
-        n0, n1, n2 = float(rot[0, 0]), float(rot[1, 0]), float(rot[2, 0])
+        # 车型由 main() 的 use_car 定；face_normal 已是该车拍面法向在臂系的单位向量
+        n0, n1, n2 = (float(v) for v in eab.fk(s["position"])["face_normal"])
         if n1 < 0:
             n0, n1, n2 = -n0, -n1, -n2
         fps.append(math.degrees(math.asin(max(-1.0, min(1.0, n2)))))
@@ -387,6 +429,17 @@ def main():
     data = json.load(open(base + ".json", encoding="utf-8"))
     arm = json.load(open(base + "_arm.json", encoding="utf-8"))
     rk = json.load(open(base + "_rk_tracking.json", encoding="utf-8"))
+
+    # 车型决定臂 FK 链（v0.3/v0.4 是两台不同的臂，TCP 差几厘米）。老 arm JSON 的 tcp 是
+    # 按 v0.3 链算的，与本场车型不符就地复算——position 才是原始记录。
+    car, car_src = eab.car_for_session(arm, base + ".json")
+    eab.use_car(car)
+    if arm.get("car") != car:
+        n = eab.recompute_tcp(arm["states"]) + eab.recompute_tcp(arm.get("commands"))
+        print(f"[fit] 车型 {car}（{car_src}）：arm JSON 的 TCP 按 "
+              f"{arm.get('car') or '旧版（v03 链）'} 算的，已就地复算 {n} 行")
+    else:
+        print(f"[fit] 车型 {car}（{car_src}）")
 
     ex = ReturnExtractor(data["observations"])
     s1 = sorted([p for p in data["predictions"] if p["stage"] == 1], key=lambda p: p["ht"])
