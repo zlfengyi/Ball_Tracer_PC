@@ -15,6 +15,8 @@ import cv2
 import numpy as np
 
 _CANONICAL_PARITY_SIGN = 1.0
+MIN_PARITY_CONFIDENCE = 0.5
+DETECTION_QUALITY_METRIC = "homography_reprojection_raw_sb_v2"
 
 
 def _is_valid_corners(corners: np.ndarray | None, pattern: tuple[int, int]) -> bool:
@@ -50,7 +52,14 @@ def checker_parity_sign(gray: np.ndarray, corners: np.ndarray,
     upper_right = _sample_patch(gray, origin + scale * vx - scale * vy)
     lower_left = _sample_patch(gray, origin - scale * vx + scale * vy)
     lower_right = _sample_patch(gray, origin + scale * vx + scale * vy)
-    return (upper_left + lower_right) - (upper_right + lower_left)
+    samples = np.array(
+        [upper_left, upper_right, lower_left, lower_right], dtype=np.float64
+    )
+    contrast = float(np.ptp(samples))
+    if contrast < 1.0:
+        return 0.0
+    diagonal_difference = (upper_left + lower_right) - (upper_right + lower_left)
+    return diagonal_difference / (2.0 * contrast)
 
 
 def canonicalize_corner_order(gray: np.ndarray, corners: np.ndarray,
@@ -104,7 +113,10 @@ def detect_corners(gray: np.ndarray, pattern: tuple[int, int]) -> tuple[np.ndarr
     if hasattr(cv2, "findChessboardCornersSB"):
         sb_flag_sets = [
             0,
-            getattr(cv2, "CALIB_CB_EXHAUSTIVE", 0),
+            (
+                getattr(cv2, "CALIB_CB_EXHAUSTIVE", 0)
+                | getattr(cv2, "CALIB_CB_ACCURACY", 0)
+            ),
         ]
         for flags in sb_flag_sets:
             try:
@@ -115,6 +127,11 @@ def detect_corners(gray: np.ndarray, pattern: tuple[int, int]) -> tuple[np.ndarr
                 corners = cand.astype(np.float32)
                 method = "sb"
                 break
+
+    if corners is not None:
+        # findChessboardCornersSB is already sub-pixel accurate. A second
+        # cornerSubPix pass can pull small-board corners several pixels away.
+        return corners, method
 
     if corners is None:
         classic_flag_sets = [
@@ -136,39 +153,42 @@ def detect_corners(gray: np.ndarray, pattern: tuple[int, int]) -> tuple[np.ndarr
         100,
         0.0001,
     )
-    corners = cv2.cornerSubPix(gray, corners, (7, 7), (-1, -1), criteria)
+    corners = cv2.cornerSubPix(gray, corners, (5, 5), (-1, -1), criteria)
     return corners, method
 
 
 def grid_quality_score(corners: np.ndarray, cols: int, rows: int) -> float:
-    """Estimate how regular the detected corner grid is."""
+    """Score projective grid consistency without penalizing board tilt."""
     pts = corners.reshape(-1, 2)
     if len(pts) != rows * cols:
         return 0.0
 
     grid = pts.reshape(rows, cols, 2)
-
-    row_dists = []
-    for r in range(rows):
-        for c in range(cols - 1):
-            row_dists.append(np.linalg.norm(grid[r, c + 1] - grid[r, c]))
-
-    col_dists = []
-    for r in range(rows - 1):
-        for c in range(cols):
-            col_dists.append(np.linalg.norm(grid[r + 1, c] - grid[r, c]))
-
-    row_dists = np.array(row_dists, dtype=np.float64)
-    col_dists = np.array(col_dists, dtype=np.float64)
-    if row_dists.size == 0 or col_dists.size == 0:
-        return 0.0
-    if row_dists.mean() < 1e-6 or col_dists.mean() < 1e-6:
+    ideal = np.array(
+        [[col, row] for row in range(rows) for col in range(cols)],
+        dtype=np.float32,
+    )
+    homography, _ = cv2.findHomography(ideal, pts.astype(np.float32), method=0)
+    if homography is None:
         return 0.0
 
-    row_cv = row_dists.std() / row_dists.mean()
-    col_cv = col_dists.std() / col_dists.mean()
-    avg_cv = (row_cv + col_cv) / 2.0
-    return round(max(0.0, 1.0 - avg_cv * 5.0), 4)
+    projected = cv2.perspectiveTransform(
+        ideal.reshape(-1, 1, 2), homography
+    ).reshape(-1, 2)
+    homography_rms = float(
+        np.sqrt(np.mean(np.sum((projected - pts) ** 2, axis=1)))
+    )
+    neighbor_vectors = np.concatenate(
+        [
+            (grid[:, 1:] - grid[:, :-1]).reshape(-1, 2),
+            (grid[1:] - grid[:-1]).reshape(-1, 2),
+        ]
+    )
+    median_spacing = float(np.median(np.linalg.norm(neighbor_vectors, axis=1)))
+    if median_spacing < 1.0:
+        return 0.0
+    normalized_rms = homography_rms / median_spacing
+    return round(float(np.exp(-10.0 * normalized_rms)), 4)
 
 
 def process_image(
@@ -193,6 +213,9 @@ def process_image(
         corners, parity, reversed_to_canonical = canonicalize_corner_order(
             gray, corners, cols, rows
         )
+        if parity < MIN_PARITY_CONFIDENCE:
+            corners = None
+            method = f"{method}-ambiguous-parity"
 
     if det_dir is not None:
         vis = color.copy()
@@ -375,6 +398,8 @@ def main() -> None:
 
     output = {
         "board": {"inner_cols": args.inner_cols, "inner_rows": args.inner_rows},
+        "quality_metric": DETECTION_QUALITY_METRIC,
+        "min_parity_confidence": MIN_PARITY_CONFIDENCE,
         "cameras": results,
     }
     out_path = image_dir / "corner_detections.json"

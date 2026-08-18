@@ -13,6 +13,7 @@ import numpy as np
 
 from calibration.four_camera_calib_common import (
     CAMERA_CONFIG_PATH,
+    DEFAULT_CALIB_CANDIDATE_PATH,
     DEFAULT_INTRINSICS_CONFIG_PATH,
     load_camera_config,
     load_sync_serials,
@@ -42,9 +43,9 @@ def _print_results(result: MultiCalibResult) -> None:
     print(f"\n  Valid images: {result.num_images}")
     print(f"  Corner observations: {result.num_observations}")
 
-    print("\n  Extrinsics to reference:")
+    print("\n  Extrinsics from reference:")
     for sn, cam in result.cameras.items():
-        t = cam.t_to_ref.ravel()
+        t = cam.t_ref_to_camera.ravel()
         dist = np.linalg.norm(t)
         print(f"    {sn}: t=[{t[0]:.1f}, {t[1]:.1f}, {t[2]:.1f}] mm  dist={dist:.1f} mm")
 
@@ -91,14 +92,14 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=str,
-        default="src/config/multi_calib.json",
-        help="Output JSON path.",
+        default=str(DEFAULT_CALIB_CANDIDATE_PATH),
+        help="Output JSON path. Defaults to the 18-floor candidate config.",
     )
     parser.add_argument(
         "--intrinsics",
         type=str,
         default="",
-        help="Optional fixed intrinsics JSON path. Defaults to src/config/four_camera_intrinsics.json when present.",
+        help="Optional fixed intrinsics JSON path. Defaults to four_camera_intrinsics_18.json.",
     )
     parser.add_argument("--range-start", type=int, default=1)
     parser.add_argument("--range-end", type=int, default=500)
@@ -118,20 +119,19 @@ def main() -> None:
         action="store_false",
         help="Optimize intrinsics and extrinsics together.",
     )
-    parser.add_argument("--max-images", type=int, default=50)
+    parser.add_argument("--max-images", type=int, default=0)
     parser.add_argument("--min-cameras", type=int, default=2)
     parser.add_argument(
         "--score-threshold",
         type=float,
-        default=0.8,
+        default=0.95,
         help="Ignore cached corner detections whose score is below this threshold.",
     )
     args = parser.parse_args()
 
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
+        format="[%(levelname)s] %(message)s",
     )
 
     project_root = Path(__file__).resolve().parent.parent

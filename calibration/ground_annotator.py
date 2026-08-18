@@ -1,43 +1,38 @@
 # -*- coding: utf-8 -*-
 """
-地面标注器：在图片上按顺序标注像素点，输出标注图片和 JSON。
+地面标注器：选择像素点并输入对应球场坐标，输出标注图片和 JSON。
 
 用法：
-  python ground_annotator.py
+  python -m calibration.ground_annotator --image path/to/ground_636.png
 """
 
+import argparse
 import json
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 from pathlib import Path
 
 import cv2
 import numpy as np
 from PIL import Image, ImageTk
 
-# =====================================================================
-# 标注点配置：每个元素为 (x, y, z) 大地坐标系坐标（单位：米）
-# 标注时必须按顺序依次点击这些点在图片中的像素位置
-# =====================================================================
-GROUND_POINTS = [
-    (-1, 6, 0),
-    ( 0, 6, 0),
-    ( 1, 6, 0),
-    ( 0, 8.54, 0),
-]
+_MIN_GROUND_POINTS = 6
 
 
 class AnnotatorApp(tk.Tk):
-    def __init__(self):
+    def __init__(self, world_points: list[tuple[float, float, float]] | None = None):
         super().__init__()
         self.title("地面标注器")
         self.geometry("1400x800")
+        self.world_points = world_points or []
 
         # --- 状态 ---
         self.img_path: Path | None = None
         self.cv_img: np.ndarray | None = None
         self.pil_img: Image.Image | None = None
-        self.annotations: list[tuple[int, int]] = []
+        self.annotations: list[
+            dict[str, tuple[float, float, float] | tuple[int, int]]
+        ] = []
         self.annotating = False
 
         # 视图变换
@@ -87,22 +82,14 @@ class AnnotatorApp(tk.Tk):
 
         tk.Label(self.panel, text="标注点列表", font=("Arial", 11, "bold")).pack(
             pady=(8, 4))
-        tk.Label(self.panel, text=f"共 {len(GROUND_POINTS)} 个点",
-                 fg="#666").pack()
-
-        self._point_labels: list[tk.Label] = []
-        for i, (x, y, z) in enumerate(GROUND_POINTS):
-            n = i + 1
-            frame = tk.Frame(self.panel)
-            frame.pack(fill=tk.X, padx=8, pady=2)
-            lbl = tk.Label(
-                frame,
-                text=f"  #{n}  ({x}, {y}, {z})   --",
-                anchor=tk.W, font=("Consolas", 10),
-                fg="#888"
-            )
-            lbl.pack(fill=tk.X)
-            self._point_labels.append(lbl)
+        self.count_label = tk.Label(
+            self.panel,
+            text=self._count_text(),
+            fg="#666",
+        )
+        self.count_label.pack()
+        self.point_list = tk.Frame(self.panel)
+        self.point_list.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
         # 右侧：Canvas
         self.canvas = tk.Canvas(main_frame, bg="#2b2b2b", highlightthickness=0)
@@ -137,26 +124,26 @@ class AnnotatorApp(tk.Tk):
     # ----------------------------------------------------------------
     # 左侧面板更新
     # ----------------------------------------------------------------
+    def _required_points(self):
+        return len(self.world_points) if self.world_points else _MIN_GROUND_POINTS
+
+    def _count_text(self):
+        return f"已标注 {len(self.annotations)}/{self._required_points()} 个点"
+
     def _update_panel(self):
-        for i, (x, y, z) in enumerate(GROUND_POINTS):
-            n = i + 1
-            lbl = self._point_labels[i]
-            if i < len(self.annotations):
-                px, py = self.annotations[i]
-                lbl.config(
-                    text=f"  #{n}  ({x}, {y}, {z})   [{px}, {py}]",
-                    fg="#00aa00"
-                )
-            elif i == len(self.annotations):
-                lbl.config(
-                    text=f"> #{n}  ({x}, {y}, {z})   <-- 下一个",
-                    fg="#ff6600"
-                )
-            else:
-                lbl.config(
-                    text=f"  #{n}  ({x}, {y}, {z})   --",
-                    fg="#888"
-                )
+        for child in self.point_list.winfo_children():
+            child.destroy()
+        self.count_label.config(text=self._count_text())
+        for i, item in enumerate(self.annotations, start=1):
+            x, y, z = item["world"]
+            px, py = item["pixel"]
+            tk.Label(
+                self.point_list,
+                text=f"#{i} W=({x:g}, {y:g}, {z:g}) P=({px}, {py})",
+                anchor=tk.W,
+                font=("Consolas", 10),
+                fg="#00aa00",
+            ).pack(fill=tk.X, pady=2)
 
     # ----------------------------------------------------------------
     # 图片显示
@@ -168,6 +155,9 @@ class AnnotatorApp(tk.Tk):
         )
         if not path:
             return
+        self._load_image(Path(path))
+
+    def _load_image(self, path: Path):
         self.img_path = Path(path)
         self.cv_img = cv2.imread(str(self.img_path), cv2.IMREAD_COLOR)
         if self.cv_img is None:
@@ -184,17 +174,28 @@ class AnnotatorApp(tk.Tk):
         self.btn_annotate.config(text="开始标注", relief=tk.RAISED)
         self.canvas.config(cursor="")
 
-        # 适配窗口
+        self._fit_image_to_canvas()
+
+        self._update_panel()
+        self.title(f"地面标注器 - {self.img_path.parent.name}/{self.img_path.name}")
+        if self.world_points:
+            point = self.world_points[0]
+            self.status_label.config(
+                text=f"第 1 个点: ({point[0]:g}, {point[1]:g}, {point[2]:g})"
+            )
+        else:
+            iw, ih = self.pil_img.size
+            self.status_label.config(text=f"{self.img_path.name}  ({iw}x{ih})")
+
+    def _fit_image_to_canvas(self):
         cw = self.canvas.winfo_width()
         ch = self.canvas.winfo_height()
         iw, ih = self.pil_img.size
         self.scale = min(cw / iw, ch / ih, 1.0)
         self.offset_x = (cw - iw * self.scale) / 2
         self.offset_y = (ch - ih * self.scale) / 2
-
+        self._cached_scale = None
         self._full_redraw()
-        self._update_panel()
-        self.status_label.config(text=f"{self.img_path.name}  ({iw}x{ih})")
 
     def _render_scaled_image(self):
         """生成缩放后的 PhotoImage（仅在 scale 变化时调用）"""
@@ -220,7 +221,8 @@ class AnnotatorApp(tk.Tk):
             self.offset_x, self.offset_y, anchor=tk.NW, image=self._cached_tk_img
         )
 
-        for i, (px, py) in enumerate(self.annotations):
+        for i, item in enumerate(self.annotations):
+            px, py = item["pixel"]
             self._draw_marker(i + 1, px, py)
 
     def _draw_marker(self, number, px, py):
@@ -290,16 +292,14 @@ class AnnotatorApp(tk.Tk):
 
     def _deferred_resize(self):
         self._resize_pending = False
-        self._full_redraw()
+        self._fit_image_to_canvas()
 
     # ----------------------------------------------------------------
     # 标注
     # ----------------------------------------------------------------
     def _toggle_annotate(self):
-        if len(self.annotations) >= len(GROUND_POINTS):
-            messagebox.showinfo("提示",
-                                f"已标注全部 {len(GROUND_POINTS)} 个点，"
-                                f"无需继续标注")
+        if self.world_points and len(self.annotations) == len(self.world_points):
+            messagebox.showinfo("提示", "预设点已全部标注，请直接保存")
             return
         self.annotating = not self.annotating
         if self.annotating:
@@ -312,34 +312,56 @@ class AnnotatorApp(tk.Tk):
     def _on_click(self, event):
         if not self.annotating or self.pil_img is None:
             return
-        if len(self.annotations) >= len(GROUND_POINTS):
-            self.annotating = False
-            self.btn_annotate.config(text="开始标注", relief=tk.RAISED)
-            self.canvas.config(cursor="")
-            messagebox.showinfo("提示", "已标注全部点，可以保存了")
-            return
 
         px, py = self._canvas_to_pixel(event.x, event.y)
         iw, ih = self.pil_img.size
         if px < 0 or py < 0 or px >= iw or py >= ih:
             return
         px_int, py_int = int(round(px)), int(round(py))
-        self.annotations.append((px_int, py_int))
+        if self.world_points:
+            world = self.world_points[len(self.annotations)]
+        else:
+            world = self._ask_world_point(px_int, py_int)
+        if world is None:
+            return
+        self.annotations.append({"pixel": (px_int, py_int), "world": world})
         n = len(self.annotations)
         self._draw_marker(n, px_int, py_int)
 
-        gx, gy, gz = GROUND_POINTS[n - 1]
-        self.status_label.config(
-            text=f"标注 #{n}: pixel=({px_int}, {py_int})  "
-                 f"world=({gx}, {gy}, {gz})")
-        self._update_panel()
-
-        if len(self.annotations) >= len(GROUND_POINTS):
+        if self.world_points and n == len(self.world_points):
             self.annotating = False
             self.btn_annotate.config(text="开始标注", relief=tk.RAISED)
             self.canvas.config(cursor="")
+            self.status_label.config(text="预设点已全部标注，请检查后保存")
+        elif self.world_points:
+            next_point = self.world_points[n]
             self.status_label.config(
-                text=f"全部 {len(GROUND_POINTS)} 个点已标注完毕，请保存")
+                text=f"下一个点: ({next_point[0]:g}, {next_point[1]:g}, {next_point[2]:g})"
+            )
+        else:
+            self.status_label.config(
+                text=f"标注 #{n}: pixel=({px_int}, {py_int})  "
+                     f"world=({world[0]:g}, {world[1]:g}, {world[2]:g})")
+        self._update_panel()
+
+    def _ask_world_point(self, px: int, py: int) -> tuple[float, float, float] | None:
+        while True:
+            raw = simpledialog.askstring(
+                "输入球场坐标",
+                f"像素点 ({px}, {py}) 对应的球场坐标，单位米：\n"
+                "格式: x,y,z   例如: 0,6,0",
+                parent=self,
+            )
+            if raw is None:
+                return None
+            parts = raw.replace("，", ",").split(",")
+            if len(parts) != 3:
+                messagebox.showwarning("格式错误", "请输入 3 个数字，例如: 0,6,0")
+                continue
+            try:
+                return tuple(float(value.strip()) for value in parts)
+            except ValueError:
+                messagebox.showwarning("格式错误", "坐标必须是数字，例如: 0,6,0")
 
     def _delete_last(self):
         if not self.annotations:
@@ -351,7 +373,7 @@ class AnnotatorApp(tk.Tk):
             self.canvas.delete(cid)
             self.canvas.delete(tid)
         n = len(self.annotations)
-        self.status_label.config(text=f"已删除，剩余 {n}/{len(GROUND_POINTS)} 个标注")
+        self.status_label.config(text=f"已删除，剩余 {n} 个标注")
         self._update_panel()
 
     # ----------------------------------------------------------------
@@ -361,11 +383,13 @@ class AnnotatorApp(tk.Tk):
         if self.cv_img is None:
             messagebox.showwarning("提示", "请先打开图片")
             return
-        if len(self.annotations) != len(GROUND_POINTS):
+        required_points = self._required_points()
+        if len(self.annotations) < required_points:
             messagebox.showwarning(
                 "提示",
-                f"需要标注 {len(GROUND_POINTS)} 个点，"
-                f"当前已标注 {len(self.annotations)} 个")
+                f"需要 {required_points} 个点，"
+                f"当前已标注 {len(self.annotations)} 个",
+            )
             return
 
         stem = self.img_path.stem
@@ -373,7 +397,8 @@ class AnnotatorApp(tk.Tk):
 
         # --- 生成标注图片 ---
         annotated = self.cv_img.copy()
-        for i, (px, py) in enumerate(self.annotations):
+        for i, item in enumerate(self.annotations):
+            px, py = item["pixel"]
             number = i + 1
             label = str(number)
             font = cv2.FONT_HERSHEY_SIMPLEX
@@ -394,9 +419,10 @@ class AnnotatorApp(tk.Tk):
 
         # --- 生成 JSON ---
         data = {}
-        for i, (px, py) in enumerate(self.annotations):
-            gx, gy, gz = GROUND_POINTS[i]
-            data[str(i + 1)] = [[gx, gy, gz], [px, py]]
+        for i, item in enumerate(self.annotations):
+            x, y, z = item["world"]
+            px, py = item["pixel"]
+            data[str(i + 1)] = [[x, y, z], [px, py]]
 
         json_out = out_dir / f"{stem}_annotations.json"
         with open(json_out, "w", encoding="utf-8") as f:
@@ -407,6 +433,21 @@ class AnnotatorApp(tk.Tk):
                             f"标注图片: {img_out}\nJSON: {json_out}")
 
 
-if __name__ == "__main__":
-    app = AnnotatorApp()
+def main():
+    parser = argparse.ArgumentParser(description="地面坐标点标注器")
+    parser.add_argument("--image", type=Path, default=None)
+    parser.add_argument(
+        "--point", type=float, nargs=3, action="append", default=None,
+        metavar=("X", "Y", "Z"),
+    )
+    args = parser.parse_args()
+
+    world_points = [tuple(point) for point in args.point] if args.point else None
+    app = AnnotatorApp(world_points)
+    if args.image is not None:
+        app._load_image(args.image.resolve())
     app.mainloop()
+
+
+if __name__ == "__main__":
+    main()

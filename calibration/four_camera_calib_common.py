@@ -4,14 +4,14 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_ROOT = PROJECT_ROOT / "data"
 FOUR_CAMERA_CALIB_ROOT = DATA_ROOT / "four_camera_calibration"
-CAMERA_CONFIG_PATH = PROJECT_ROOT / "src" / "config" / "camera.json"
-DEFAULT_INTRINSICS_CONFIG_PATH = PROJECT_ROOT / "src" / "config" / "four_camera_intrinsics.json"
+CAMERA_CONFIG_PATH = PROJECT_ROOT / "src" / "config" / "camera_18.json"
+DEFAULT_INTRINSICS_CONFIG_PATH = PROJECT_ROOT / "src" / "config" / "four_camera_intrinsics_18.json"
+DEFAULT_CALIB_CANDIDATE_PATH = PROJECT_ROOT / "src" / "config" / "four_camera_calib_18_candidate.json"
 
 DEFAULT_BOARD_COLS = 9
 DEFAULT_BOARD_ROWS = 12
@@ -53,20 +53,28 @@ def sanitize_session_name(raw: str) -> str:
     return "".join(safe)
 
 
-def auto_session_dir(root: Path, content: str) -> Path:
+def create_session_dir(root: Path, content: str, requested_name: str = "") -> Path:
     root.mkdir(parents=True, exist_ok=True)
-    existing = []
-    for entry in sorted(root.iterdir()):
-        if not entry.is_dir():
-            continue
-        try:
-            existing.append(int(entry.name.split("_")[0]))
-        except (ValueError, IndexError):
-            pass
-    next_num = max(existing, default=0) + 1
-    timestamp = datetime.now().strftime("%m%d%H%M")
-    content_tag = sanitize_session_name(content) or "run"
-    return root / f"{next_num:03d}_{content_tag}_{timestamp}"
+    if requested_name:
+        session_name = sanitize_session_name(requested_name)
+        if not session_name:
+            raise ValueError("Session name must contain at least one valid character")
+    else:
+        existing = []
+        for entry in sorted(root.iterdir()):
+            if not entry.is_dir():
+                continue
+            try:
+                existing.append(int(entry.name.split("_")[0]))
+            except (ValueError, IndexError):
+                pass
+        next_num = max(existing, default=0) + 1
+        content_tag = sanitize_session_name(content) or "run"
+        session_name = f"{next_num:03d}_{content_tag}"
+
+    session_dir = root / session_name
+    session_dir.mkdir()
+    return session_dir
 
 
 def resolve_session_dir(raw: str) -> Path:
@@ -80,10 +88,18 @@ def resolve_session_dir(raw: str) -> Path:
 
 
 def latest_session_dir(root: Path = FOUR_CAMERA_CALIB_ROOT) -> Path:
-    sessions = [entry for entry in root.iterdir() if entry.is_dir()]
+    sessions = []
+    for entry in root.iterdir():
+        if not entry.is_dir():
+            continue
+        try:
+            number = int(entry.name.split("_", 1)[0])
+        except ValueError:
+            continue
+        sessions.append((number, entry))
     if not sessions:
-        raise FileNotFoundError(f"No calibration sessions found under {root}")
-    return max(sessions, key=lambda entry: entry.stat().st_mtime)
+        raise FileNotFoundError(f"No numbered calibration sessions found under {root}")
+    return max(sessions, key=lambda item: item[0])[1]
 
 
 def rel_or_abs(path: Path) -> str:

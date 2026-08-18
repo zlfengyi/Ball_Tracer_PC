@@ -6,7 +6,7 @@
   python calibration_capture.py [--count 100] [--duration 180] [--content checker]
   python calibration_capture.py --count 600 --duration 180 --exposure 8000 --gain 25 --content checker
 
-输出目录结构（自动命名 {编号}_{内容}_{月日时}）：
+输出目录结构（自动命名 {编号}_{内容}_{perf_counter_ns}）：
   calibration/images/
     001_checker_030318/
       DA8199243/
@@ -20,7 +20,6 @@
 import argparse
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 
 project_root = Path(__file__).resolve().parent.parent
@@ -32,7 +31,7 @@ from src import SyncCapture, frame_to_numpy
 
 
 def _auto_output_dir(images_root: Path, content: str) -> Path:
-    """自动生成输出目录：{编号}_{内容}_{月日时}"""
+    """自动生成输出目录：{编号}_{内容}_{perf_counter_ns}"""
     images_root.mkdir(parents=True, exist_ok=True)
     # 扫描现有目录，自动递增编号
     nums = []
@@ -44,8 +43,8 @@ def _auto_output_dir(images_root: Path, content: str) -> Path:
                 except (ValueError, IndexError):
                     pass
     next_num = max(nums, default=0) + 1
-    timestamp = datetime.now().strftime("%m%d%H")
-    return images_root / f"{next_num:03d}_{content}_{timestamp}"
+    run_id = time.perf_counter_ns()
+    return images_root / f"{next_num:03d}_{content}_{run_id}"
 
 
 def main():
@@ -63,6 +62,7 @@ def main():
         output_dir = calib_root / args.output
     else:
         output_dir = _auto_output_dir(images_root, args.content)
+    output_dir.mkdir(parents=True)
 
     interval = args.duration / args.count
 

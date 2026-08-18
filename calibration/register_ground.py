@@ -1,389 +1,793 @@
 # -*- coding: utf-8 -*-
-"""
-多目相机大地坐标系注册：基于人工标注的地面点，将相机外参校准到世界坐标系。
+"""Register the four-camera rig to a flat ground checkerboard."""
 
-优化每台相机的独立 6 DOF 世界位姿，同时添加配对一致性软约束
-（相邻相机间的相对位姿应与 BA 标定的 R_to_ref/t_to_ref 一致）。
+from __future__ import annotations
 
-用法：
-  python -m calibration.register_ground
-
-输入：
-  src/config/multi_calib.json                              — 多目标定结果
-  calibration/images/{serial}/ground_001_annotations.json  — 各相机标注
-
-输出：
-  更新 multi_calib.json 中每台相机的 R_world, t_world, pos_world
-"""
-
+import argparse
+import itertools
 import json
-import numpy as np
-import cv2
-from scipy.optimize import least_squares
+import time
 from pathlib import Path
-from datetime import datetime
+
+import cv2
+import numpy as np
+from scipy.optimize import least_squares
+
+from calibration.detect_corners_v2 import (
+    MIN_PARITY_CONFIDENCE,
+    canonicalize_corner_order,
+    detect_corners,
+)
+from calibration.four_camera_calib_common import (
+    DEFAULT_CALIB_CANDIDATE_PATH,
+    PROJECT_ROOT,
+)
+
+_SQUARE_COLS = 12
+_SQUARE_ROWS = 9
+_INNER_COLS = _SQUARE_COLS - 1
+_INNER_ROWS = _SQUARE_ROWS - 1
+_SQUARE_SIZE_MM = 45.0
+_MIN_STABLE_FRAMES = 3
+_MAX_FRAME_STABILITY_RMS_PX = 0.25
+_MAX_SINGLE_VIEW_RMS_PX = 0.5
+_MAX_GROUND_RMS_PX = 1.0
+_MAX_GROUND_VIEW_RMS_PX = 1.25
+_MAX_GROUND_P95_PX = 2.0
+_MAX_CONTROL_RMS_PX = 15.0
+_MAX_CONTROL_ERROR_PX = 20.0
+_MAX_CONTROL_BASELINE_RELATIVE_ERROR = 0.01
 
 
-def load_annotations(path):
-    """加载标注 JSON，返回 world_pts (Nx3) 和 img_pts (Nx2)"""
-    with open(path, encoding="utf-8") as f:
-        data = json.load(f)
-    world_pts = []
-    img_pts = []
-    for key in sorted(data.keys(), key=int):
-        world_xyz, pixel = data[key]
-        world_pts.append(world_xyz)
-        img_pts.append(pixel)
-    return np.array(world_pts, dtype=np.float64), np.array(img_pts, dtype=np.float64)
+def make_ground_checkerboard_points(outer_x_m: float, outer_y_m: float) -> np.ndarray:
+    """Return row-major inner corners in mm: columns +x, rows -y, z=0."""
+    outer_x_mm = float(outer_x_m) * 1000.0
+    outer_y_mm = float(outer_y_m) * 1000.0
+    return np.array(
+        [
+            [
+                outer_x_mm + (col + 1) * _SQUARE_SIZE_MM,
+                outer_y_mm - (row + 1) * _SQUARE_SIZE_MM,
+                0.0,
+            ]
+            for row in range(_INNER_ROWS)
+            for col in range(_INNER_COLS)
+        ],
+        dtype=np.float64,
+    )
 
 
-def reproj_rms(world, img_obs, rvec, tvec, K, D):
-    """计算重投影 RMS"""
-    proj, _ = cv2.projectPoints(world, rvec, tvec, K, D)
-    return np.sqrt(np.mean((proj.reshape(-1, 2) - img_obs) ** 2))
+def reproj_rms(world: np.ndarray, image: np.ndarray, rvec: np.ndarray,
+               tvec: np.ndarray, K: np.ndarray, D: np.ndarray) -> float:
+    projected, _ = cv2.projectPoints(world, rvec, tvec, K, D)
+    delta = projected.reshape(-1, 2) - image
+    return float(np.sqrt(np.mean(np.sum(delta * delta, axis=1))))
 
 
-def try_solvepnp(world, img, K, D, method, name):
-    """尝试一种 solvePnP 方法"""
-    try:
-        ok, rv, tv = cv2.solvePnP(world, img, K, D, flags=method)
-        if not ok:
-            return None
-        rms = reproj_rms(world, img, rv.flatten(), tv.flatten(), K, D)
-        print(f"    {name:20s}: RMS = {rms:.2f} px")
-        return rv.flatten(), tv.flatten(), rms
-    except Exception as e:
-        print(f"    {name:20s}: failed ({e})")
-        return None
+def aggregate_stable_corners(frames: list[np.ndarray]) -> tuple[np.ndarray, float]:
+    """Median repeated, parity-canonical corner observations."""
+    if len(frames) < _MIN_STABLE_FRAMES:
+        raise RuntimeError(
+            f"Need at least {_MIN_STABLE_FRAMES} stable checkerboard frames, got {len(frames)}"
+        )
+    stack = np.stack(frames).astype(np.float64)
+    median = np.median(stack, axis=0)
+    frame_rms = np.sqrt(np.mean(np.sum((stack - median) ** 2, axis=2), axis=1))
+    worst = float(np.max(frame_rms))
+    if worst > _MAX_FRAME_STABILITY_RMS_PX:
+        raise RuntimeError(
+            f"Checkerboard moved between captures: {worst:.3f}px > "
+            f"{_MAX_FRAME_STABILITY_RMS_PX:.3f}px"
+        )
+    return median, worst
 
 
-def _resolve_from_project(project_root: Path, raw_path: str) -> Path:
-    """Resolve a user-supplied path against project root first, then calibration/."""
+def _resolve_path(raw_path: str) -> Path:
     path = Path(raw_path)
-    if path.is_absolute():
-        return path
-    calib_root = project_root / "calibration"
-    candidates = [project_root / path, calib_root / path]
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    if path.parts and path.parts[0] in {"data", "src", "calibration"}:
-        return project_root / path
-    return calib_root / path
+    return path if path.is_absolute() else PROJECT_ROOT / path
 
 
-def _rel_to_project(path: Path, project_root: Path) -> str:
+def _relative_path(path: Path) -> str:
     try:
-        return str(path.resolve().relative_to(project_root.resolve())).replace("\\", "/")
-    except Exception:
+        return str(path.resolve().relative_to(PROJECT_ROOT.resolve())).replace("\\", "/")
+    except ValueError:
         return str(path.resolve())
 
 
-def _rt_to_mat(R: np.ndarray, t: np.ndarray) -> np.ndarray:
-    T = np.eye(4, dtype=np.float64)
-    T[:3, :3] = np.asarray(R, dtype=np.float64).reshape(3, 3)
-    T[:3, 3] = np.asarray(t, dtype=np.float64).reshape(3)
-    return T
+def _validate_session_board(session_dir: Path) -> None:
+    metadata_path = session_dir / "session.json"
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"Missing session metadata: {metadata_path}")
+    with open(metadata_path, encoding="utf-8") as inp:
+        board = json.load(inp).get("board", {})
+
+    square_dims = sorted([board.get("square_cols"), board.get("square_rows")])
+    inner_dims = sorted([board.get("inner_cols"), board.get("inner_rows")])
+    if square_dims != [_SQUARE_ROWS, _SQUARE_COLS]:
+        raise RuntimeError(
+            f"{session_dir.name}: expected {_SQUARE_ROWS}x{_SQUARE_COLS} squares, "
+            f"got {board.get('square_rows')}x{board.get('square_cols')}"
+        )
+    if inner_dims != [_INNER_ROWS, _INNER_COLS]:
+        raise RuntimeError(
+            f"{session_dir.name}: expected {_INNER_ROWS}x{_INNER_COLS} inner corners"
+        )
+    if float(board.get("square_size_mm", 0.0)) != _SQUARE_SIZE_MM:
+        raise RuntimeError(
+            f"{session_dir.name}: expected {_SQUARE_SIZE_MM:g}mm squares, "
+            f"got {board.get('square_size_mm')!r}"
+        )
 
 
-def _mat_to_rt(T: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    return T[:3, :3].copy(), T[:3, 3:4].copy()
+def _detect_session(
+    session_dir: Path,
+    serials: list[str],
+    world_mm: np.ndarray,
+) -> tuple[list[dict], dict]:
+    pattern = (_INNER_COLS, _INNER_ROWS)
+    observations = []
+    session_diagnostics = {"path": _relative_path(session_dir), "cameras": {}}
+
+    for serial in serials:
+        image_paths = sorted((session_dir / serial).glob("*.png"))
+        frames = []
+        for image_path in image_paths:
+            gray = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
+            if gray is None:
+                raise RuntimeError(f"Unreadable image: {image_path}")
+            corners, _ = detect_corners(gray, pattern)
+            if corners is None:
+                continue
+            canonical, parity, _ = canonicalize_corner_order(
+                gray, corners, _INNER_COLS, _INNER_ROWS
+            )
+            if parity < MIN_PARITY_CONFIDENCE:
+                continue
+            frames.append(canonical.reshape(-1, 2))
+
+        if not frames:
+            continue
+        if len(frames) < _MIN_STABLE_FRAMES:
+            raise RuntimeError(
+                f"{session_dir.name}/{serial}: only {len(frames)} reliable detections"
+            )
+        image, stability_rms = aggregate_stable_corners(frames)
+        observations.append(
+            {
+                "session": session_dir.name,
+                "serial": serial,
+                "world_mm": world_mm,
+                "image": image,
+            }
+        )
+        session_diagnostics["cameras"][serial] = {
+            "detected_frames": len(frames),
+            "captured_frames": len(image_paths),
+            "max_frame_stability_rms_px": stability_rms,
+        }
+
+    if len(observations) < 2:
+        raise RuntimeError(
+            f"{session_dir.name}: checkerboard must be reliably visible in at least two cameras"
+        )
+    return observations, session_diagnostics
 
 
-def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="多目相机大地坐标系注册")
-    parser.add_argument("--ground-index", type=int, default=1,
-                        help="地面图片编号 (默认: 1, 即 ground_001)")
-    parser.add_argument("--images", type=str, default="images",
-                        help="图片目录 (相对于 calibration/，默认: images)")
-    parser.add_argument("--calib", type=str, default="src/config/multi_calib.json",
-                        help="输入标定配置路径 (相对于项目根目录，默认: src/config/multi_calib.json)")
-    parser.add_argument("--output", type=str, default=None,
-                        help="输出标定配置路径 (默认: 覆盖 --calib)")
+def _load_ground_controls(
+    session_dir: Path, frame: str, serials: list[str]
+) -> tuple[list[dict], dict[str, str]]:
+    controls = []
+    annotation_paths = {}
+    for serial in serials:
+        path = session_dir / serial / f"{frame}_annotations.json"
+        if not path.exists():
+            raise FileNotFoundError(f"Missing ground control annotations: {path}")
+        with open(path, encoding="utf-8") as inp:
+            data = json.load(inp)
+        entries = [data[key] for key in sorted(data, key=int)]
+        world_m = np.asarray([entry[0] for entry in entries], dtype=np.float64)
+        image = np.asarray([entry[1] for entry in entries], dtype=np.float64)
+        if (world_m.ndim != 2 or world_m.shape[1:] != (3,)
+                or image.shape != (len(world_m), 2) or len(world_m) == 0
+                or not np.all(np.isfinite(world_m))
+                or not np.all(np.isfinite(image))
+                or not np.all(world_m[:, 2] == 0.0)):
+            raise RuntimeError(f"Invalid ground control annotations: {path}")
+        controls.append(
+            {
+                "serial": serial,
+                "world_mm": world_m * 1000.0,
+                "image": image,
+            }
+        )
+        annotation_paths[serial] = _relative_path(path)
+
+    unique_points = np.unique(
+        np.concatenate([item["world_mm"] for item in controls]), axis=0
+    )
+    if len(unique_points) < 2:
+        raise RuntimeError("Ground registration requires at least two control points")
+    return controls, annotation_paths
+
+
+def _camera_arrays(calib: dict) -> dict[str, dict[str, np.ndarray]]:
+    arrays = {}
+    for serial, camera in calib["cameras"].items():
+        arrays[serial] = {
+            "K": np.asarray(camera["K"], dtype=np.float64).reshape(3, 3),
+            "D": np.asarray(camera["D"], dtype=np.float64).ravel(),
+            "R_relative": np.asarray(
+                camera["R_ref_to_camera"], dtype=np.float64
+            ).reshape(3, 3),
+            "t_relative": np.asarray(
+                camera["t_ref_to_camera"], dtype=np.float64
+            ).reshape(3, 1),
+        }
+    return arrays
+
+
+def _calibrate_control_scale(calib: dict, controls: list[dict]) -> dict:
+    cameras = _camera_arrays(calib)
+    previous = (
+        calib.get("diagnostics", {})
+        .get("ground_registration", {})
+        .get("ground_controls", {})
+        .get("baseline_scale_calibration", {})
+    )
+    grouped: dict[tuple[float, float, float], list[tuple[str, np.ndarray]]] = {}
+    for control in controls:
+        for world_mm, pixel in zip(control["world_mm"], control["image"]):
+            key = tuple(float(value) for value in world_mm)
+            grouped.setdefault(key, []).append((control["serial"], pixel))
+
+    triangulated = []
+    for world_mm, observations in grouped.items():
+        if len(observations) < 2:
+            raise RuntimeError(
+                f"Ground control point {world_mm} is visible in fewer than two cameras"
+            )
+
+        dlt_rows = []
+        views = []
+        for serial, pixel in observations:
+            camera = cameras[serial]
+            normalized = cv2.undistortPoints(
+                np.asarray(pixel, dtype=np.float64).reshape(1, 1, 2),
+                camera["K"],
+                camera["D"],
+            ).reshape(2)
+            projection = np.concatenate(
+                [camera["R_relative"], camera["t_relative"]], axis=1
+            )
+            dlt_rows.extend(
+                [
+                    normalized[0] * projection[2] - projection[0],
+                    normalized[1] * projection[2] - projection[1],
+                ]
+            )
+            rvec, _ = cv2.Rodrigues(camera["R_relative"])
+            views.append((serial, np.asarray(pixel), camera, rvec))
+
+        _, _, vt = np.linalg.svd(np.asarray(dlt_rows, dtype=np.float64))
+        homogeneous = vt[-1]
+        if abs(float(homogeneous[3])) < 1e-12:
+            raise RuntimeError(f"Ground control triangulation failed: {world_mm}")
+        initial = homogeneous[:3] / homogeneous[3]
+
+        def residuals(point: np.ndarray) -> np.ndarray:
+            values = []
+            for _, pixel, camera, rvec in views:
+                projected, _ = cv2.projectPoints(
+                    point.reshape(1, 3),
+                    rvec,
+                    camera["t_relative"],
+                    camera["K"],
+                    camera["D"],
+                )
+                values.append(projected.reshape(2) - pixel)
+            return np.concatenate(values)
+
+        result = least_squares(residuals, initial, method="trf", max_nfev=500)
+        if not result.success or not np.all(np.isfinite(result.x)):
+            raise RuntimeError(f"Ground control triangulation failed: {world_mm}")
+        for serial, _, camera, _ in views:
+            depth = float(
+                (camera["R_relative"] @ result.x.reshape(3, 1)
+                 + camera["t_relative"])[2, 0]
+            )
+            if depth <= 0.0:
+                raise RuntimeError(
+                    f"Triangulated ground control is behind camera {serial}: {world_mm}"
+                )
+
+        pixel_errors = np.linalg.norm(residuals(result.x).reshape(-1, 2), axis=1)
+        triangulated.append(
+            {
+                "world_mm": np.asarray(world_mm, dtype=np.float64),
+                "reference_mm": result.x,
+                "cameras": [serial for serial, _, _, _ in views],
+                "reprojection_rms_px": float(
+                    np.sqrt(np.mean(pixel_errors * pixel_errors))
+                ),
+            }
+        )
+
+    first, second = max(
+        itertools.combinations(triangulated, 2),
+        key=lambda pair: np.linalg.norm(pair[1]["world_mm"] - pair[0]["world_mm"]),
+    )
+    expected_mm = float(np.linalg.norm(second["world_mm"] - first["world_mm"]))
+    measured_mm = float(np.linalg.norm(second["reference_mm"] - first["reference_mm"]))
+    error_before_scale_mm = measured_mm - expected_mm
+    relative_error = abs(error_before_scale_mm) / expected_mm
+    if relative_error > _MAX_CONTROL_BASELINE_RELATIVE_ERROR:
+        raise RuntimeError(
+            "Ground control triangulated distance failed: "
+            f"measured={measured_mm:.1f}mm, expected={expected_mm:.1f}mm, "
+            f"error={error_before_scale_mm:+.1f}mm "
+            f"({100.0 * relative_error:.3f}%)"
+        )
+
+    scale = expected_mm / measured_mm
+    for camera in calib["cameras"].values():
+        translation = np.asarray(
+            camera["t_ref_to_camera"], dtype=np.float64
+        ).reshape(3, 1)
+        camera["t_ref_to_camera"] = (translation * scale).tolist()
+    for pair in (
+        calib.get("diagnostics", {})
+        .get("epipolar_residual", {})
+        .get("pairs", {})
+        .values()
+    ):
+        pair["baseline_mm"] = float(pair["baseline_mm"]) * scale
+
+    corrected_mm = measured_mm * scale
+    initial_mm = float(previous.get("initial_triangulated_mm", measured_mm))
+    cumulative_scale = float(previous.get("cumulative_scale_factor", 1.0)) * scale
+    return {
+        "expected_mm": expected_mm,
+        "initial_triangulated_mm": initial_mm,
+        "initial_error_mm": initial_mm - expected_mm,
+        "input_triangulated_mm": measured_mm,
+        "input_error_mm": error_before_scale_mm,
+        "input_relative_error_pct": 100.0 * relative_error,
+        "applied_scale_factor": scale,
+        "cumulative_scale_factor": cumulative_scale,
+        "triangulated_mm": corrected_mm,
+        "error_mm": corrected_mm - expected_mm,
+        "max_initial_relative_error_pct": (
+            100.0 * _MAX_CONTROL_BASELINE_RELATIVE_ERROR
+        ),
+        "points": [
+            {
+                "world_m": (item["world_mm"] / 1000.0).tolist(),
+                "triangulated_reference_mm": (
+                    item["reference_mm"] * scale
+                ).tolist(),
+                "cameras": item["cameras"],
+                "reprojection_rms_px": item["reprojection_rms_px"],
+            }
+            for item in (first, second)
+        ],
+    }
+
+
+def _camera_pose(reference_pose: np.ndarray, camera: dict[str, np.ndarray]
+                 ) -> tuple[np.ndarray, np.ndarray]:
+    R_reference, _ = cv2.Rodrigues(reference_pose[:3])
+    t_reference = reference_pose[3:].reshape(3, 1)
+    R = camera["R_relative"] @ R_reference
+    t = camera["R_relative"] @ t_reference + camera["t_relative"]
+    return R, t
+
+
+def _oriented_image(observation: dict, flipped_sessions: dict[str, bool]) -> np.ndarray:
+    image = observation["image"]
+    return image[::-1] if flipped_sessions[observation["session"]] else image
+
+
+def _project(
+    reference_pose: np.ndarray,
+    observation: dict,
+    cameras: dict[str, dict[str, np.ndarray]],
+) -> tuple[np.ndarray, np.ndarray]:
+    camera = cameras[observation["serial"]]
+    R, t = _camera_pose(reference_pose, camera)
+    rvec, _ = cv2.Rodrigues(R)
+    projected, _ = cv2.projectPoints(
+        observation["world_mm"], rvec, t, camera["K"], camera["D"]
+    )
+    depths = (R @ observation["world_mm"].T + t)[2]
+    return projected.reshape(-1, 2), depths
+
+
+def _residuals(
+    reference_pose: np.ndarray,
+    observations: list[dict],
+    cameras: dict[str, dict[str, np.ndarray]],
+    flipped_sessions: dict[str, bool],
+    controls: list[dict],
+) -> np.ndarray:
+    residuals = []
+    for observation in observations:
+        projected, _ = _project(reference_pose, observation, cameras)
+        residuals.append(
+            (projected - _oriented_image(observation, flipped_sessions)).ravel()
+        )
+    for control in controls:
+        projected, _ = _project(reference_pose, control, cameras)
+        residuals.append((projected - control["image"]).ravel())
+    return np.concatenate(residuals)
+
+
+def _initial_reference_pose(
+    observation: dict,
+    camera: dict[str, np.ndarray],
+    flipped_sessions: dict[str, bool],
+) -> np.ndarray:
+    image = _oriented_image(observation, flipped_sessions)
+    ok, rvec, t = cv2.solvePnP(
+        observation["world_mm"], image, camera["K"], camera["D"],
+        flags=cv2.SOLVEPNP_ITERATIVE,
+    )
+    if not ok:
+        raise RuntimeError(
+            f"solvePnP failed: {observation['session']}/{observation['serial']}"
+        )
+    view_rms = reproj_rms(
+        observation["world_mm"], image, rvec, t, camera["K"], camera["D"]
+    )
+    if view_rms > _MAX_SINGLE_VIEW_RMS_PX:
+        raise RuntimeError(
+            f"Single-view checkerboard RMS too high for "
+            f"{observation['session']}/{observation['serial']}: {view_rms:.3f}px"
+        )
+
+    R_camera, _ = cv2.Rodrigues(rvec)
+    R_reference = camera["R_relative"].T @ R_camera
+    t_reference = camera["R_relative"].T @ (t - camera["t_relative"])
+    rvec_reference, _ = cv2.Rodrigues(R_reference)
+    return np.concatenate([rvec_reference.ravel(), t_reference.ravel()])
+
+
+def _solve_orientation(
+    observations: list[dict],
+    cameras: dict[str, dict[str, np.ndarray]],
+    flipped_sessions: dict[str, bool],
+    controls: list[dict],
+) -> tuple[float, np.ndarray]:
+    best = None
+    for observation in observations:
+        x0 = _initial_reference_pose(
+            observation, cameras[observation["serial"]], flipped_sessions
+        )
+        result = least_squares(
+            _residuals,
+            x0,
+            args=(observations, cameras, flipped_sessions, controls),
+            method="trf",
+            max_nfev=2000,
+            ftol=1e-12,
+            xtol=1e-12,
+            gtol=1e-12,
+        )
+        if not result.success or not np.all(np.isfinite(result.x)):
+            continue
+        point_errors = _residuals(
+            result.x, observations, cameras, flipped_sessions, []
+        ).reshape(-1, 2)
+        rms = float(np.sqrt(np.mean(np.sum(point_errors * point_errors, axis=1))))
+        if best is None or rms < best[0]:
+            best = (rms, result.x)
+    if best is None:
+        raise RuntimeError(f"Ground optimization failed for orientation {flipped_sessions}")
+    return best
+
+
+def solve_ground_pose(
+    calib: dict,
+    observations: list[dict],
+    session_names: list[str],
+    controls: list[dict],
+) -> tuple[np.ndarray, dict[str, bool], list[tuple[float, dict[str, bool]]]]:
+    cameras = _camera_arrays(calib)
+    candidates = []
+    for flags in itertools.product((False, True), repeat=len(session_names)):
+        flips = dict(zip(session_names, flags))
+        rms, pose = _solve_orientation(observations, cameras, flips, controls)
+        candidates.append((rms, flips, pose))
+
+    candidates.sort(key=lambda item: item[0])
+    passing = [item for item in candidates if item[0] <= _MAX_GROUND_RMS_PX]
+    if len(passing) != 1:
+        scores = ", ".join(
+            f"{item[1]}={item[0]:.3f}px" for item in candidates
+        )
+        raise RuntimeError(f"Ground corner orientation is not uniquely valid: {scores}")
+    selected = passing[0]
+    scores = [(item[0], item[1]) for item in candidates]
+    return selected[2], selected[1], scores
+
+
+def _validate_and_apply(
+    calib: dict,
+    reference_pose: np.ndarray,
+    observations: list[dict],
+    flipped_sessions: dict[str, bool],
+    controls: list[dict],
+) -> dict:
+    cameras = _camera_arrays(calib)
+    all_errors = []
+    camera_errors: dict[str, list[np.ndarray]] = {}
+    observation_metrics = {}
+
+    for observation in observations:
+        serial = observation["serial"]
+        projected, depths = _project(reference_pose, observation, cameras)
+        if np.any(depths <= 0.0):
+            raise RuntimeError(
+                f"Ground checkerboard has non-positive depth: "
+                f"{observation['session']}/{serial}"
+            )
+        delta = projected - _oriented_image(
+            observation, flipped_sessions
+        )
+        errors = np.linalg.norm(delta, axis=1)
+        rms = float(np.sqrt(np.mean(errors * errors)))
+        p95 = float(np.percentile(errors, 95))
+        if rms > _MAX_GROUND_VIEW_RMS_PX or p95 > _MAX_GROUND_P95_PX:
+            raise RuntimeError(
+                f"Ground reprojection failed for {observation['session']}/{serial}: "
+                f"RMS={rms:.3f}px, P95={p95:.3f}px"
+            )
+        key = f"{observation['session']}/{serial}"
+        observation_metrics[key] = {
+            "rms_px": rms,
+            "p95_px": p95,
+            "max_px": float(np.max(errors)),
+        }
+        all_errors.append(errors)
+        camera_errors.setdefault(serial, []).append(errors)
+
+    combined = np.concatenate(all_errors)
+    total_rms = float(np.sqrt(np.mean(combined * combined)))
+    total_p95 = float(np.percentile(combined, 95))
+    if total_rms > _MAX_GROUND_RMS_PX or total_p95 > _MAX_GROUND_P95_PX:
+        raise RuntimeError(
+            f"Ground reprojection failed: RMS={total_rms:.3f}px, P95={total_p95:.3f}px"
+        )
+
+    control_errors = []
+    control_metrics = {}
+    for control in controls:
+        projected, depths = _project(reference_pose, control, cameras)
+        if np.any(depths <= 0.0):
+            raise RuntimeError(
+                f"Ground control point has non-positive depth: {control['serial']}"
+            )
+        delta = projected - control["image"]
+        errors = np.linalg.norm(delta, axis=1)
+        control_errors.append(errors)
+        for index, error in enumerate(errors):
+            key = f"{control['serial']}/{index + 1}"
+            control_metrics[key] = {
+                "world_m": (control["world_mm"][index] / 1000.0).tolist(),
+                "observed_pixel": control["image"][index].tolist(),
+                "projected_pixel": projected[index].tolist(),
+                "error_px": float(error),
+            }
+
+    control_combined = np.concatenate(control_errors)
+    control_rms = float(np.sqrt(np.mean(control_combined * control_combined)))
+    control_max = float(np.max(control_combined))
+    if control_rms > _MAX_CONTROL_RMS_PX or control_max > _MAX_CONTROL_ERROR_PX:
+        raise RuntimeError(
+            f"Ground control reprojection failed: RMS={control_rms:.3f}px, "
+            f"max={control_max:.3f}px"
+        )
+
+    camera_metrics = {}
+    camera_positions = {}
+    for serial, camera in cameras.items():
+        R, t = _camera_pose(reference_pose, camera)
+        position = (-R.T @ t).ravel()
+        if not np.all(np.isfinite(position)) or position[2] <= 0.0:
+            raise RuntimeError(f"Invalid world pose for camera {serial}: {position.tolist()}")
+        calib["cameras"][serial]["R_world"] = R.tolist()
+        calib["cameras"][serial]["t_world"] = t.reshape(3, 1).tolist()
+        calib["cameras"][serial]["pos_world"] = position.reshape(3, 1).tolist()
+        camera_positions[serial] = position
+
+        if serial in camera_errors:
+            errors = np.concatenate(camera_errors[serial])
+            camera_metrics[serial] = {
+                "rms_px": float(np.sqrt(np.mean(errors * errors))),
+                "p95_px": float(np.percentile(errors, 95)),
+            }
+
+    return {
+        "total_rms_px": total_rms,
+        "total_p95_px": total_p95,
+        "per_camera": camera_metrics,
+        "per_observation": observation_metrics,
+        "controls": {
+            "rms_px": control_rms,
+            "p95_px": float(np.percentile(control_combined, 95)),
+            "max_px": control_max,
+            "per_point": control_metrics,
+        },
+        "camera_positions": camera_positions,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Register four cameras from two flat boards and ground controls."
+    )
+    parser.add_argument(
+        "--board",
+        action="append",
+        nargs=3,
+        required=True,
+        metavar=("SESSION", "OUTER_X_M", "OUTER_Y_M"),
+        help="Session path and the first square's outer top-left world coordinate.",
+    )
+    parser.add_argument(
+        "--ground-frame",
+        nargs=2,
+        required=True,
+        metavar=("SESSION", "FRAME"),
+        help="Session path and frame stem containing ground control annotations.",
+    )
+    parser.add_argument(
+        "--calib", default=str(DEFAULT_CALIB_CANDIDATE_PATH),
+        help="Input calibration candidate.",
+    )
+    parser.add_argument(
+        "--output", default=None, help="Output path; defaults to overwriting --calib."
+    )
     args = parser.parse_args()
 
-    ground_idx = f"{args.ground_index:03d}"
+    if len(args.board) != 2:
+        raise RuntimeError("Ground registration requires exactly two board sessions")
 
-    project_root = Path(__file__).resolve().parent.parent
-    calib_path = _resolve_from_project(project_root, args.calib)
-    output_path = calib_path if args.output is None else _resolve_from_project(project_root, args.output)
-    ann_dir = _resolve_from_project(project_root, args.images)
+    calib_path = _resolve_path(args.calib)
+    output_path = calib_path if args.output is None else _resolve_path(args.output)
+    with open(calib_path, encoding="utf-8") as inp:
+        calib = json.load(inp)
 
-    # --- 加载标定 ---
-    with open(calib_path, encoding="utf-8") as f:
-        calib = json.load(f)
+    serials = list(calib["cameras"])
+    observations = []
+    session_names = []
+    session_diagnostics = []
 
-    ref_serial = calib["reference_serial"]
-    cam_data = calib["cameras"]
-    serials = list(cam_data.keys())
-    n_cams = len(serials)
+    for raw_session, raw_x, raw_y in args.board:
+        session_dir = _resolve_path(raw_session)
+        if not session_dir.is_dir():
+            raise FileNotFoundError(f"Ground checkerboard session not found: {session_dir}")
+        if session_dir.name in session_names:
+            raise RuntimeError(f"Duplicate board session: {session_dir.name}")
+        try:
+            outer_x_m = float(raw_x)
+            outer_y_m = float(raw_y)
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid board coordinate: {raw_x}, {raw_y}") from exc
+        if not np.isfinite([outer_x_m, outer_y_m]).all():
+            raise RuntimeError(f"Non-finite board coordinate: {raw_x}, {raw_y}")
 
-    # 解析内参和相对外参
-    K = {}
-    D = {}
-    R_to_ref = {}
-    t_to_ref = {}
-    for sn, cd in cam_data.items():
-        K[sn] = np.array(cd["K"], dtype=np.float64).reshape(3, 3)
-        D[sn] = np.array(cd["D"], dtype=np.float64).ravel()
-        R_to_ref[sn] = np.array(cd["R_to_ref"], dtype=np.float64).reshape(3, 3)
-        t_to_ref[sn] = np.array(cd["t_to_ref"], dtype=np.float64).reshape(3, 1)
+        _validate_session_board(session_dir)
+        world_mm = make_ground_checkerboard_points(outer_x_m, outer_y_m)
+        detected, diagnostics = _detect_session(session_dir, serials, world_mm)
+        diagnostics.update(
+            {
+                "outer_square_top_left_m": [outer_x_m, outer_y_m, 0.0],
+                "first_inner_corner_m": [
+                    float(world_mm[0, 0] / 1000.0),
+                    float(world_mm[0, 1] / 1000.0),
+                    0.0,
+                ],
+            }
+        )
+        observations.extend(detected)
+        session_names.append(session_dir.name)
+        session_diagnostics.append(diagnostics)
 
-    # --- 加载各相机标注 ---
-    world_pts = {}  # {sn: Nx3}
-    img_pts = {}    # {sn: Nx2}
-    annotation_paths = {}
+    control_session = _resolve_path(args.ground_frame[0])
+    control_frame = args.ground_frame[1]
+    controls, control_annotation_paths = _load_ground_controls(
+        control_session, control_frame, serials
+    )
+    control_baseline = _calibrate_control_scale(calib, controls)
+    reference_pose, flipped_sessions, orientation_scores = solve_ground_pose(
+        calib, observations, session_names, controls
+    )
+    metrics = _validate_and_apply(
+        calib, reference_pose, observations, flipped_sessions, controls
+    )
 
-    print(f"=== Ground Registration ({n_cams} cameras) ===")
-    print(f"  Reference: {ref_serial}")
-    print(f"  Cameras: {serials}")
-    print()
-
-    for sn in serials:
-        ann_path = ann_dir / sn / f"ground_{ground_idx}_annotations.json"
-        if not ann_path.exists():
-            print(f"  WARNING: {sn} 标注文件不存在: {ann_path}")
-            continue
-        wp, ip = load_annotations(ann_path)
-        world_pts[sn] = wp
-        img_pts[sn] = ip
-        annotation_paths[sn] = ann_path
-        print(f"  {sn}: {len(wp)} 标注点")
-
-    if not world_pts:
-        print("ERROR: 无可用标注")
-        return
-
-    # 验证世界坐标一致性
-    ref_world = None
-    for sn in serials:
-        if sn not in world_pts:
-            continue
-        if ref_world is None:
-            ref_world = world_pts[sn]
-        else:
-            if not np.allclose(world_pts[sn], ref_world):
-                print(f"  WARNING: {sn} 的世界坐标与其他相机不一致")
-
-    # 标注坐标：米 → 毫米
-    world_mm = {}
-    for sn in world_pts:
-        world_mm[sn] = world_pts[sn] * 1000.0
-
-    # --- 每台相机独立 solvePnP 初始化 ---
-    print(f"\n--- Per-camera solvePnP ---")
-    methods = [
-        (cv2.SOLVEPNP_SQPNP, "SQPNP"),
-        (cv2.SOLVEPNP_ITERATIVE, "ITERATIVE"),
-    ]
-
-    init_rvecs = {}
-    init_tvecs = {}
-
-    for sn in serials:
-        if sn not in world_mm:
-            continue
-        print(f"\n  {sn}:")
-        best = None
-        for method, name in methods:
-            res = try_solvepnp(world_mm[sn], img_pts[sn], K[sn], D[sn], method, name)
-            if res is not None:
-                if best is None or res[2] < best[2]:
-                    best = res
-        if best:
-            init_rvecs[sn] = best[0]
-            init_tvecs[sn] = best[1]
-
-    annotated_serials = [sn for sn in serials if sn in init_rvecs]
-    if not annotated_serials:
-        print("ERROR: 所有相机 solvePnP 均失败")
-        return
-
-    # 也尝试从其他相机推导（利用相对外参）
-    print(f"\n--- Cross-camera inference ---")
-    for sn_from in annotated_serials:
-        for sn_to in serials:
-            if sn_to in init_rvecs or sn_to not in world_mm:
-                continue
-            # T_to_world = T_to_ref @ T_ref_world
-            # T_from 在世界坐标下: R_from, t_from
-            R_from, _ = cv2.Rodrigues(init_rvecs[sn_from])
-            t_from = init_tvecs[sn_from].reshape(3, 1)
-            # T_to_ref @ T_from^-1 = T_to_world @ T_from_world^-1
-            # => R_to = R_to_ref @ R_ref_from^-1 @ R_from
-            # 但更简单: T_to = T_to_ref @ inv(T_from_ref) @ T_from
-            R_from_ref = R_to_ref[sn_from]
-            t_from_ref = t_to_ref[sn_from]
-            R_to_ref_cam = R_to_ref[sn_to]
-            t_to_ref_cam = t_to_ref[sn_to]
-
-            # T_ref_world = inv(T_from_ref) @ T_from_world
-            R_ref = R_from_ref.T @ R_from
-            t_ref = R_from_ref.T @ (t_from - t_from_ref)
-
-            R_to = R_to_ref_cam @ R_ref
-            t_to = R_to_ref_cam @ t_ref + t_to_ref_cam
-
-            rv_to, _ = cv2.Rodrigues(R_to)
-            rms = reproj_rms(world_mm[sn_to], img_pts[sn_to],
-                             rv_to.flatten(), t_to.flatten(), K[sn_to], D[sn_to])
-            print(f"  {sn_from} → {sn_to}: RMS = {rms:.2f} px")
-            if sn_to not in init_rvecs or rms < reproj_rms(
-                    world_mm[sn_to], img_pts[sn_to],
-                    init_rvecs[sn_to], init_tvecs[sn_to], K[sn_to], D[sn_to]):
-                init_rvecs[sn_to] = rv_to.flatten()
-                init_tvecs[sn_to] = t_to.flatten()
-
-    annotated_serials = [sn for sn in serials if sn in init_rvecs and sn in world_mm]
-    if not annotated_serials:
-        print("ERROR: 无可用的地面标注相机初始化结果")
-        return
-    anchor_serial = ref_serial if ref_serial in annotated_serials else annotated_serials[0]
-
-    # --- 联合优化 ---
-    # 仅优化 1 台已标注相机的 6 DOF 世界位姿，其他相机由固定相对外参推导。
-    print(f"\n--- Joint optimization (anchor={anchor_serial}, ref={ref_serial}, 6 params, "
-          f"{sum(len(img_pts[sn]) for sn in annotated_serials)} points) ---")
-
-    def derive_pose_from_anchor(R_anchor_world, t_anchor_world, target_sn):
-        """从 anchor 相机世界位姿 + 固定相对外参，推导任意目标相机世界位姿。"""
-        if target_sn == anchor_serial:
-            return R_anchor_world, t_anchor_world
-        T_anchor_world = _rt_to_mat(R_anchor_world, t_anchor_world)
-        T_anchor_ref = _rt_to_mat(R_to_ref[anchor_serial], t_to_ref[anchor_serial])
-        T_ref_world = np.linalg.inv(T_anchor_ref) @ T_anchor_world
-        T_target_ref = _rt_to_mat(R_to_ref[target_sn], t_to_ref[target_sn])
-        T_target_world = T_target_ref @ T_ref_world
-        return _mat_to_rt(T_target_world)
-
-    def make_residuals():
-        def fn(params):
-            rv_anchor = params[:3]
-            tv_anchor = params[3:6].reshape(3, 1)
-            R_anchor, _ = cv2.Rodrigues(rv_anchor)
-            residuals = []
-            for sn in annotated_serials:
-                if sn == anchor_serial:
-                    rv, tv = rv_anchor, tv_anchor
-                else:
-                    R_s, t_s = derive_pose_from_anchor(R_anchor, tv_anchor, sn)
-                    rv_s, _ = cv2.Rodrigues(R_s)
-                    rv, tv = rv_s.ravel(), t_s
-                proj, _ = cv2.projectPoints(world_mm[sn], rv, tv, K[sn], D[sn])
-                res = (proj.reshape(-1, 2) - img_pts[sn]).flatten()
-                residuals.append(res)
-            return np.concatenate(residuals)
-        return fn
-
-    # 初始参数：anchor 相机的 solvePnP 结果
-    x0 = np.concatenate([init_rvecs[anchor_serial], init_tvecs[anchor_serial]])
-
-    residuals_fn = make_residuals()
-    result = least_squares(residuals_fn, x0, method='lm')
-
-    # --- 提取结果 ---
-    print(f"\n=== Results ===")
-    rv_anchor = result.x[:3]
-    tv_anchor = result.x[3:6].reshape(3, 1)
-    R_anchor_world, _ = cv2.Rodrigues(rv_anchor)
-
-    total_errs = []
-    cam_poses = {}  # {sn: (R, t, pos)}
-    per_camera_rms = {}
-
-    for sn in serials:
-        R, t = derive_pose_from_anchor(R_anchor_world, tv_anchor, sn)
-        rv_sn, _ = cv2.Rodrigues(R)
-        pos = (-R.T @ t).flatten()
-        cam_poses[sn] = (R, t, pos)
-
-        if sn in world_mm:
-            rms = reproj_rms(world_mm[sn], img_pts[sn], rv_sn.ravel(), t, K[sn], D[sn])
-            total_errs.append(rms)
-            per_camera_rms[sn] = float(rms)
-            rms_text = f"{rms:.2f}px"
-        else:
-            rms_text = "n/a (no ground points)"
-
-        print(f"  {sn}: RMS={rms_text}  pos=[{pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f}]mm  "
-              f"height={pos[2]:.0f}mm={pos[2]/1000:.2f}m")
-
-        # 更新 calib
-        cam_data[sn]["R_world"] = R.tolist()
-        cam_data[sn]["t_world"] = t.reshape(3, 1).tolist()
-        cam_data[sn]["pos_world"] = pos.reshape(3, 1).tolist()
-
-    err_total = np.sqrt(np.mean(np.array(total_errs) ** 2))
-    print(f"\n  Total RMS: {err_total:.2f} px")
-
-    # 配对基线检查
-    print(f"\n--- Pairwise baselines ---")
-    registered_list = list(cam_poses.keys())
-    for i, sn_i in enumerate(registered_list):
-        pos_i = cam_poses[sn_i][2]
-        for j, sn_j in enumerate(registered_list):
-            if j <= i:
-                continue
-            pos_j = cam_poses[sn_j][2]
-            dist = np.linalg.norm(pos_i - pos_j)
-            print(f"  {sn_i} <-> {sn_j}: {dist:.0f}mm = {dist/1000:.2f}m")
-
-    # 逐点重投影
-    print(f"\n--- Per-point reprojection ---")
-    for sn in annotated_serials:
-        R, t, _ = cam_poses[sn]
-        rv_sn, _ = cv2.Rodrigues(R)
-        proj, _ = cv2.projectPoints(world_mm[sn], rv_sn.ravel(), t, K[sn], D[sn])
-        proj = proj.reshape(-1, 2)
-        print(f"  {sn}:")
-        for k in range(len(img_pts[sn])):
-            e = np.linalg.norm(proj[k] - img_pts[sn][k])
-            wx, wy, wz = world_pts[sn][k]
-            print(f"    #{k+1} ({wx:.1f},{wy:.2f},{wz})m: "
-                  f"err={e:.2f}px  proj=[{proj[k,0]:.0f},{proj[k,1]:.0f}] "
-                  f"vs [{img_pts[sn][k,0]:.0f},{img_pts[sn][k,1]:.0f}]")
-
-    # --- 保存 ---
-    if "diagnostics" not in calib:
-        calib["diagnostics"] = {}
-    calib["diagnostics"]["ground_reproj_error"] = float(err_total)
-    calib["diagnostics"]["ground_registration"] = {
-        "registered_at": datetime.now().isoformat(timespec="seconds"),
-        "ground_index": int(args.ground_index),
-        "images_dir": _rel_to_project(ann_dir, project_root),
-        "reference_serial": ref_serial,
-        "anchor_serial": anchor_serial,
-        "num_cameras_annotated": len(annotated_serials),
-        "num_cameras_registered": len(serials),
-        "missing_ground_annotations": [sn for sn in serials if sn not in annotation_paths],
-        "total_rms_px": float(err_total),
-        "per_camera_rms_px": per_camera_rms,
+    registered_perf_counter_s = time.perf_counter()
+    diagnostics = calib.setdefault("diagnostics", {})
+    diagnostics["ground_reproj_error"] = metrics["total_rms_px"]
+    diagnostics["ground_registration"] = {
+        "method": "two_flat_checkerboards_plus_ground_controls",
+        "registered_perf_counter_s": registered_perf_counter_s,
+        "reference_serial": calib["reference_serial"],
+        "board": {
+            "square_cols": _SQUARE_COLS,
+            "square_rows": _SQUARE_ROWS,
+            "inner_cols": _INNER_COLS,
+            "inner_rows": _INNER_ROWS,
+            "square_size_mm": _SQUARE_SIZE_MM,
+        },
+        "sessions": session_diagnostics,
+        "reversed_from_parity_canonical": flipped_sessions,
+        "orientation_candidate_rms_px": [
+            {"reversed": flips, "rms_px": rms}
+            for rms, flips in orientation_scores
+        ],
+        "num_observed_cameras": len({item["serial"] for item in observations}),
+        "num_registered_cameras": len(serials),
+        "num_ground_corners": sum(len(item["world_mm"]) for item in observations),
+        "total_rms_px": metrics["total_rms_px"],
+        "total_p95_px": metrics["total_p95_px"],
+        "per_camera": metrics["per_camera"],
+        "per_observation": metrics["per_observation"],
+        "ground_controls": {
+            "session": _relative_path(control_session),
+            "frame": control_frame,
+            "annotation_files": control_annotation_paths,
+            "baseline_scale_calibration": control_baseline,
+            **metrics["controls"],
+        },
     }
-    calib["config_written_at"] = datetime.now().isoformat(timespec="seconds")
+    calib.pop("config_written_at", None)
+    calib["config_written_perf_counter_s"] = registered_perf_counter_s
 
     sources = calib.setdefault("sources", {})
-    ground_sources = sources.setdefault("ground_registration", {})
-    ground_sources.update({
-        "images_dir": _rel_to_project(ann_dir, project_root),
-        "ground_index": int(args.ground_index),
-        "annotation_files": {
-            sn: _rel_to_project(path, project_root) for sn, path in annotation_paths.items()
-        },
-        "registered_at": datetime.now().isoformat(timespec="seconds"),
-        "input_calib": _rel_to_project(calib_path, project_root),
-    })
-
-    for sn in serials:
-        cam_sources = cam_data[sn].setdefault("sources", {})
-        if sn in annotation_paths:
-            cam_sources["ground_annotation"] = _rel_to_project(annotation_paths[sn], project_root)
+    sources["ground_registration"] = {
+        "method": "two_flat_checkerboards_plus_ground_controls",
+        "input_calib": _relative_path(calib_path),
+        "sessions": [item["path"] for item in session_diagnostics],
+        "ground_control_annotations": control_annotation_paths,
+        "relative_translation_scale_factor": control_baseline[
+            "cumulative_scale_factor"
+        ],
+        "registered_perf_counter_s": registered_perf_counter_s,
+    }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(calib, f, indent=4, ensure_ascii=False)
+    with open(output_path, "w", encoding="utf-8") as out:
+        json.dump(calib, out, indent=4, ensure_ascii=False)
 
-    print(f"\nUpdated: {output_path}")
+    print("Ground registration passed")
+    print(
+        f"  checkerboard: RMS={metrics['total_rms_px']:.3f}px, "
+        f"P95={metrics['total_p95_px']:.3f}px"
+    )
+    print(
+        f"  ground controls: RMS={metrics['controls']['rms_px']:.3f}px, "
+        f"P95={metrics['controls']['p95_px']:.3f}px, "
+        f"max={metrics['controls']['max_px']:.3f}px"
+    )
+    print(
+        f"  triangulated baseline before scale: "
+        f"{control_baseline['input_triangulated_mm']:.1f}mm "
+        f"(expected {control_baseline['expected_mm']:.1f}mm, "
+        f"error {control_baseline['input_error_mm']:+.1f}mm)"
+    )
+    print(
+        f"  relative translation scale: "
+        f"applied={control_baseline['applied_scale_factor']:.9f}, "
+        f"cumulative={control_baseline['cumulative_scale_factor']:.9f}"
+    )
+    print(f"  selected corner reversal: {flipped_sessions}")
+    for serial, position in metrics["camera_positions"].items():
+        print(
+            f"  {serial}: position=({position[0]:.1f}, {position[1]:.1f}, "
+            f"{position[2]:.1f})mm"
+        )
+    print(f"  output: {output_path}")
 
 
 if __name__ == "__main__":

@@ -207,7 +207,7 @@ def simple_ba(detections, ref_serial, slave_serials, K, D,
         R, _ = cv2.Rodrigues(rv)
         cam_ext[sn] = (R, tv.reshape(3, 1))
         dist = np.linalg.norm(tv)
-        print(f"  {sn} → ref: t=[{tv[0]:.1f}, {tv[1]:.1f}, {tv[2]:.1f}] "
+        print(f"  ref → {sn}: t=[{tv[0]:.1f}, {tv[1]:.1f}, {tv[2]:.1f}] "
               f"dist={dist:.0f}mm")
 
         # 每从相机 RMS
@@ -298,12 +298,12 @@ def main():
             "image_size": list(image_sizes[sn]),
         }
         if sn == ref:
-            cam["R_to_ref"] = np.eye(3).tolist()
-            cam["t_to_ref"] = np.zeros((3, 1)).tolist()
+            cam["R_ref_to_camera"] = np.eye(3).tolist()
+            cam["t_ref_to_camera"] = np.zeros((3, 1)).tolist()
         else:
             R, t = cam_ext[sn]
-            cam["R_to_ref"] = R.tolist()
-            cam["t_to_ref"] = t.tolist()
+            cam["R_ref_to_camera"] = R.tolist()
+            cam["t_ref_to_camera"] = t.tolist()
         cameras[sn] = cam
 
     # 配对基线

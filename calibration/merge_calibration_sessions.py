@@ -8,7 +8,7 @@ import json
 import os
 import shutil
 import sys
-from datetime import datetime
+import time
 from pathlib import Path
 
 project_root = Path(__file__).resolve().parent.parent
@@ -36,14 +36,80 @@ def _image_indices(cam_dir: Path) -> list[int]:
 def _load_detection_cache(session_dir: Path) -> dict:
     cache_path = session_dir / "corner_detections.json"
     if not cache_path.exists():
-        return {}
+        raise FileNotFoundError(f"Missing corner detection cache: {cache_path}")
     with open(cache_path, encoding="utf-8") as inp:
         return json.load(inp)
 
 
+def _validate_detection_caches(
+    sessions: list[Path],
+    serials: list[str],
+) -> list[dict]:
+    if not sessions:
+        raise ValueError("At least one calibration session is required")
+
+    expected_serials = set(serials)
+    expected_metadata = None
+    caches = []
+
+    for session_dir in sessions:
+        cache = _load_detection_cache(session_dir)
+        for key in ("board", "quality_metric", "min_parity_confidence", "cameras"):
+            if key not in cache:
+                raise ValueError(f"{session_dir}: cache is missing {key!r}")
+
+        board = cache["board"]
+        if not isinstance(board, dict):
+            raise ValueError(f"{session_dir}: cache board must be an object")
+        try:
+            inner_cols = board["inner_cols"]
+            inner_rows = board["inner_rows"]
+        except KeyError as exc:
+            raise ValueError(f"{session_dir}: cache board is missing {exc.args[0]!r}") from exc
+        if (not isinstance(inner_cols, int) or isinstance(inner_cols, bool)
+                or not isinstance(inner_rows, int) or isinstance(inner_rows, bool)
+                or inner_cols <= 0 or inner_rows <= 0):
+            raise ValueError(f"{session_dir}: board dimensions must be positive integers")
+
+        cameras = cache["cameras"]
+        if not isinstance(cameras, dict):
+            raise ValueError(f"{session_dir}: cache cameras must be an object")
+        cache_serials = set(cameras)
+        if cache_serials != expected_serials:
+            raise ValueError(
+                f"{session_dir}: cache camera serials {sorted(cache_serials)} "
+                f"do not match requested serials {sorted(expected_serials)}"
+            )
+
+        metadata = {
+            "board": board,
+            "quality_metric": cache["quality_metric"],
+            "min_parity_confidence": cache["min_parity_confidence"],
+        }
+        if expected_metadata is None:
+            expected_metadata = metadata
+        elif metadata != expected_metadata:
+            raise ValueError(f"{session_dir}: cache metadata does not match the first session")
+
+        expected_corner_count = inner_cols * inner_rows
+        for sn, detections in cameras.items():
+            if not isinstance(detections, dict):
+                raise ValueError(f"{session_dir}: detections for {sn} must be an object")
+            for frame_idx, detection in detections.items():
+                corners = detection.get("corners") if isinstance(detection, dict) else None
+                if not isinstance(corners, list) or len(corners) != expected_corner_count:
+                    actual = len(corners) if isinstance(corners, list) else "missing"
+                    raise ValueError(
+                        f"{session_dir}: {sn} frame {frame_idx} has {actual} corners; "
+                        f"expected {expected_corner_count}"
+                    )
+
+        caches.append(cache)
+
+    return caches
+
+
 def _link_or_copy(src: Path, dst: Path, use_copy: bool) -> None:
-    if dst.exists():
-        dst.unlink()
     if use_copy:
         shutil.copy2(src, dst)
         return
@@ -54,14 +120,24 @@ def _link_or_copy(src: Path, dst: Path, use_copy: bool) -> None:
 
 
 def _session_frame_indices(session_dir: Path, serials: list[str]) -> list[int]:
-    common: set[int] | None = None
+    expected: set[int] | None = None
+    expected_serial = None
     for sn in serials:
         cam_dir = session_dir / sn
         if not cam_dir.exists():
             raise FileNotFoundError(f"Missing camera directory: {cam_dir}")
         indices = set(_image_indices(cam_dir))
-        common = indices if common is None else (common & indices)
-    return sorted(common or [])
+        if expected is None:
+            expected = indices
+            expected_serial = sn
+        elif indices != expected:
+            raise ValueError(
+                f"{session_dir}: image frame sets differ between "
+                f"{expected_serial} and {sn}"
+            )
+    if not expected:
+        raise ValueError(f"{session_dir}: no calibration images found")
+    return sorted(expected)
 
 
 def merge_sessions(
@@ -70,22 +146,27 @@ def merge_sessions(
     serials: list[str],
     use_copy: bool,
 ) -> Path:
+    started_perf_counter_s = time.perf_counter()
+    if output_dir.exists():
+        if not output_dir.is_dir() or any(output_dir.iterdir()):
+            raise FileExistsError(f"Output directory already exists and is not empty: {output_dir}")
+
+    session_caches = _validate_detection_caches(sessions, serials)
+
     output_dir.mkdir(parents=True, exist_ok=True)
     for sn in serials:
         (output_dir / sn).mkdir(parents=True, exist_ok=True)
 
     merged_cache = {
-        "board": {},
+        "board": session_caches[0]["board"],
+        "quality_metric": session_caches[0]["quality_metric"],
+        "min_parity_confidence": session_caches[0]["min_parity_confidence"],
         "cameras": {sn: {} for sn in serials},
     }
     mapping: list[dict] = []
     next_idx = 1
 
-    for session_dir in sessions:
-        session_cache = _load_detection_cache(session_dir)
-        if not merged_cache["board"] and session_cache.get("board"):
-            merged_cache["board"] = session_cache["board"]
-
+    for session_dir, session_cache in zip(sessions, session_caches):
         frame_indices = _session_frame_indices(session_dir, serials)
         for src_idx in frame_indices:
             merged_idx = next_idx
@@ -114,10 +195,12 @@ def merge_sessions(
                     merged_cache["cameras"][sn][str(merged_idx)] = det
 
     mapping_path = output_dir / "session_sources.json"
+    completed_perf_counter_s = time.perf_counter()
     with open(mapping_path, "w", encoding="utf-8") as out:
         json.dump(
             {
-                "created_at": datetime.now().isoformat(timespec="seconds"),
+                "completed_perf_counter_s": completed_perf_counter_s,
+                "elapsed_s": completed_perf_counter_s - started_perf_counter_s,
                 "sessions": [rel_or_abs(path) for path in sessions],
                 "total_frames": len(mapping),
                 "serials": serials,
@@ -128,10 +211,9 @@ def merge_sessions(
             ensure_ascii=False,
         )
 
-    if merged_cache["board"]:
-        cache_path = output_dir / "corner_detections.json"
-        with open(cache_path, "w", encoding="utf-8") as out:
-            json.dump(merged_cache, out, ensure_ascii=False)
+    cache_path = output_dir / "corner_detections.json"
+    with open(cache_path, "w", encoding="utf-8") as out:
+        json.dump(merged_cache, out, ensure_ascii=False)
 
     return output_dir
 

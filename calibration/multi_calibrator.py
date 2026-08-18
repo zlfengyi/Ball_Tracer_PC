@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 from dataclasses import dataclass, field
@@ -29,6 +30,13 @@ import numpy as np
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
 
+from calibration.detect_corners_v2 import (
+    DETECTION_QUALITY_METRIC,
+    MIN_PARITY_CONFIDENCE,
+    canonicalize_corner_order,
+    detect_corners,
+)
+
 log = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -36,6 +44,10 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _MIN_VALID_IMAGES = 5
 _PAIRWISE_TRANSLATION_TOL_MM = 100.0
 _PAIRWISE_ROTATION_TOL_DEG = 2.0
+_MAX_REPROJECTION_RMS_PX = 1.0
+_MIN_EPIPOLAR_PAIR_FRAMES = 10
+_MAX_EPIPOLAR_RMS_PX = 1.0
+_MAX_EPIPOLAR_P95_PX = 2.0
 
 
 # ================================================================
@@ -47,7 +59,7 @@ class BoardConfig:
     """棋盘格标定板参数。"""
     inner_cols: int = 8          # 内角点列数（方格数-1）
     inner_rows: int = 11         # 内角点行数（方格数-1）
-    square_size: float = 50.0    # 方格边长 mm
+    square_size: float = 45.0    # 方格边长 mm
 
 
 @dataclass
@@ -57,8 +69,8 @@ class CameraCalib:
     K: np.ndarray
     D: np.ndarray
     image_size: tuple[int, int]
-    R_to_ref: np.ndarray
-    t_to_ref: np.ndarray
+    R_ref_to_camera: np.ndarray
+    t_ref_to_camera: np.ndarray
     R_world: Optional[np.ndarray] = None
     t_world: Optional[np.ndarray] = None
     pos_world: Optional[np.ndarray] = None
@@ -74,6 +86,10 @@ class MultiCalibResult:
     per_camera_rms: dict[str, float] = field(default_factory=dict)
     num_images: int = 0
     num_observations: int = 0
+    optimizer_status: int = 0
+    optimizer_message: str = ""
+    optimizer_nfev: int = 0
+    epipolar_residual: dict = field(default_factory=dict)
 
     def save(self, path: Path) -> None:
         path = Path(path)
@@ -92,8 +108,8 @@ class MultiCalibResult:
                 "K": _c(cam.K),
                 "D": _c(cam.D),
                 "image_size": list(cam.image_size),
-                "R_to_ref": _c(cam.R_to_ref),
-                "t_to_ref": _c(cam.t_to_ref),
+                "R_ref_to_camera": _c(cam.R_ref_to_camera),
+                "t_ref_to_camera": _c(cam.t_ref_to_camera),
             }
             if cam.R_world is not None:
                 d["R_world"] = _c(cam.R_world)
@@ -109,6 +125,10 @@ class MultiCalibResult:
                 "per_camera_rms": self.per_camera_rms,
                 "num_images": self.num_images,
                 "num_observations": self.num_observations,
+                "optimizer_status": self.optimizer_status,
+                "optimizer_message": self.optimizer_message,
+                "optimizer_nfev": self.optimizer_nfev,
+                "epipolar_residual": self.epipolar_residual,
             },
             "board": {
                 "inner_cols": self.board_config.inner_cols,
@@ -139,8 +159,8 @@ class MultiCalibResult:
                 K=_a(cd["K"]).reshape(3, 3),
                 D=_a(cd["D"]).ravel(),
                 image_size=tuple(cd["image_size"]),
-                R_to_ref=_a(cd["R_to_ref"]).reshape(3, 3),
-                t_to_ref=_a(cd["t_to_ref"]).ravel(),
+                R_ref_to_camera=_a(cd["R_ref_to_camera"]).reshape(3, 3),
+                t_ref_to_camera=_a(cd["t_ref_to_camera"]).ravel(),
                 R_world=_a(cd.get("R_world")),
                 t_world=_a(cd.get("t_world")),
                 pos_world=_a(cd.get("pos_world")),
@@ -154,6 +174,10 @@ class MultiCalibResult:
             per_camera_rms=diag.get("per_camera_rms", {}),
             num_images=diag.get("num_images", 0),
             num_observations=diag.get("num_observations", 0),
+            optimizer_status=diag.get("optimizer_status", 0),
+            optimizer_message=diag.get("optimizer_message", ""),
+            optimizer_nfev=diag.get("optimizer_nfev", 0),
+            epipolar_residual=diag["epipolar_residual"],
         )
 
 
@@ -176,26 +200,16 @@ def _make_obj_points(board: BoardConfig) -> np.ndarray:
 
 def _detect_checkerboard(gray: np.ndarray, board: BoardConfig
                          ) -> Optional[np.ndarray]:
-    """
-    检测棋盘格内角点。
-
-    Returns:
-        (N, 1, 2) float32 亚像素精度角点，或 None
-    """
+    """检测棋盘格内角点并统一物理原点。"""
     pattern = (board.inner_cols, board.inner_rows)
-    flags = (cv2.CALIB_CB_ADAPTIVE_THRESH
-             | cv2.CALIB_CB_NORMALIZE_IMAGE
-             | cv2.CALIB_CB_FAST_CHECK)
-    ret, corners = cv2.findChessboardCorners(gray, pattern, None, flags)
-    if not ret:
+    corners, _ = detect_corners(gray, pattern)
+    if corners is None:
         return None
-    # 亚像素精化
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-    corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
-    from calibration.detect_corners_v2 import canonicalize_corner_order
-    corners, _, _ = canonicalize_corner_order(
+    corners, parity, _ = canonicalize_corner_order(
         gray, corners, board.inner_cols, board.inner_rows
     )
+    if parity < MIN_PARITY_CONFIDENCE:
+        return None
     return corners
 
 
@@ -257,6 +271,152 @@ def _transform_error(T: np.ndarray, T_ref: np.ndarray) -> tuple[float, float]:
     return trans_err, rot_err
 
 
+def _validate_epipolar_residual(
+    serials: list[str],
+    reference_serial: str,
+    detections: dict,
+    cameras: dict[str, CameraCalib],
+) -> dict:
+    """Validate final extrinsics using residuals across rectified epipolar lines."""
+    pair_results = {}
+    supported_adjacency = {serial: set() for serial in serials}
+    supported_residuals = []
+
+    for serial_a, serial_b in itertools.combinations(serials, 2):
+        camera_a = cameras[serial_a]
+        camera_b = cameras[serial_b]
+        if camera_a.image_size != camera_b.image_size:
+            raise RuntimeError(
+                "Epipolar validation requires equal image sizes: "
+                f"{serial_a}={camera_a.image_size}, "
+                f"{serial_b}={camera_b.image_size}"
+            )
+
+        common_indices = [
+            idx for idx, frame in sorted(detections.items())
+            if serial_a in frame and serial_b in frame
+        ]
+        if not common_indices:
+            continue
+
+        R_a = np.asarray(camera_a.R_ref_to_camera, dtype=np.float64)
+        t_a = np.asarray(camera_a.t_ref_to_camera, dtype=np.float64).reshape(3)
+        R_b = np.asarray(camera_b.R_ref_to_camera, dtype=np.float64)
+        t_b = np.asarray(camera_b.t_ref_to_camera, dtype=np.float64).reshape(3)
+        R_a_to_b = R_b @ R_a.T
+        t_a_to_b = t_b - R_a_to_b @ t_a
+        baseline_mm = float(np.linalg.norm(t_a_to_b))
+        if not np.isfinite(baseline_mm) or baseline_mm <= 0:
+            raise RuntimeError(
+                f"Invalid epipolar baseline for {serial_a}|{serial_b}: "
+                f"{baseline_mm}"
+            )
+
+        R_rect_a, R_rect_b, P_rect_a, P_rect_b, _, _, _ = cv2.stereoRectify(
+            camera_a.K,
+            camera_a.D,
+            camera_b.K,
+            camera_b.D,
+            camera_a.image_size,
+            R_a_to_b,
+            t_a_to_b,
+            flags=cv2.CALIB_ZERO_DISPARITY,
+            alpha=-1,
+        )
+        points_a = np.concatenate(
+            [detections[idx][serial_a].reshape(-1, 2) for idx in common_indices]
+        ).astype(np.float64)
+        points_b = np.concatenate(
+            [detections[idx][serial_b].reshape(-1, 2) for idx in common_indices]
+        ).astype(np.float64)
+        rectified_a = cv2.undistortPoints(
+            points_a, camera_a.K, camera_a.D, R=R_rect_a, P=P_rect_a
+        ).reshape(-1, 2)
+        rectified_b = cv2.undistortPoints(
+            points_b, camera_b.K, camera_b.D, R=R_rect_b, P=P_rect_b
+        ).reshape(-1, 2)
+        disparity_axis = int(np.argmax(np.abs(P_rect_b[:2, 3])))
+        residual_axis = 1 - disparity_axis
+        residual_axis_name = ("x", "y")[residual_axis]
+        residuals = rectified_a[:, residual_axis] - rectified_b[:, residual_axis]
+        if not np.all(np.isfinite(residuals)):
+            raise RuntimeError(
+                f"Non-finite epipolar residuals for {serial_a}|{serial_b}"
+            )
+
+        abs_residuals = np.abs(residuals)
+        rms_px = float(np.sqrt(np.mean(residuals ** 2)))
+        p95_abs_px = float(np.percentile(abs_residuals, 95))
+        supported = len(common_indices) >= _MIN_EPIPOLAR_PAIR_FRAMES
+        pair_key = f"{serial_a}|{serial_b}"
+        pair_results[pair_key] = {
+            "serials": [serial_a, serial_b],
+            "frames": len(common_indices),
+            "points": int(residuals.size),
+            "baseline_mm": baseline_mm,
+            "residual_axis": residual_axis_name,
+            "rms_px": rms_px,
+            "median_abs_px": float(np.median(abs_residuals)),
+            "p95_abs_px": p95_abs_px,
+            "max_abs_px": float(np.max(abs_residuals)),
+            "validated": supported,
+        }
+        status = "validated" if supported else "insufficient frames"
+        print(
+            f"  Epipolar {pair_key}: frames={len(common_indices)}, "
+            f"{residual_axis_name}_rms={rms_px:.3f}px, "
+            f"{residual_axis_name}_p95={p95_abs_px:.3f}px "
+            f"({status})"
+        )
+
+        if not supported:
+            continue
+        supported_adjacency[serial_a].add(serial_b)
+        supported_adjacency[serial_b].add(serial_a)
+        supported_residuals.append(residuals)
+        if (rms_px > _MAX_EPIPOLAR_RMS_PX
+                or p95_abs_px > _MAX_EPIPOLAR_P95_PX):
+            raise RuntimeError(
+                f"Epipolar {residual_axis_name} residual too high for {pair_key}: "
+                f"rms={rms_px:.3f}px (max {_MAX_EPIPOLAR_RMS_PX:.3f}px), "
+                f"p95={p95_abs_px:.3f}px "
+                f"(max {_MAX_EPIPOLAR_P95_PX:.3f}px)"
+            )
+
+    connected = {reference_serial}
+    queue = [reference_serial]
+    while queue:
+        serial = queue.pop(0)
+        for other in supported_adjacency[serial] - connected:
+            connected.add(other)
+            queue.append(other)
+    disconnected = [serial for serial in serials if serial not in connected]
+    if disconnected:
+        raise RuntimeError(
+            "Epipolar validation graph is disconnected; cameras without a "
+            f"supported path ({_MIN_EPIPOLAR_PAIR_FRAMES}+ common frames): "
+            f"{disconnected}"
+        )
+
+    all_supported = np.concatenate(supported_residuals)
+    global_abs_residuals = np.abs(all_supported)
+    diagnostics = {
+        "min_pair_frames": _MIN_EPIPOLAR_PAIR_FRAMES,
+        "max_pair_rms_px": _MAX_EPIPOLAR_RMS_PX,
+        "max_pair_p95_abs_px": _MAX_EPIPOLAR_P95_PX,
+        "global_rms_px": float(np.sqrt(np.mean(all_supported ** 2))),
+        "global_p95_abs_px": float(np.percentile(global_abs_residuals, 95)),
+        "validated_pairs": len(supported_residuals),
+        "pairs": pair_results,
+    }
+    print(
+        f"  Epipolar validated pairs={diagnostics['validated_pairs']}, "
+        f"global_rms={diagnostics['global_rms_px']:.3f}px, "
+        f"global_p95={diagnostics['global_p95_abs_px']:.3f}px"
+    )
+    return diagnostics
+
+
 # ================================================================
 #  MultiCalibrator
 # ================================================================
@@ -283,7 +443,7 @@ class MultiCalibrator:
         fix_intrinsics: bool = False,
         max_images: int = 0,
         min_cameras_per_board: int = 2,
-        detection_score_threshold: float = 0.8,
+        detection_score_threshold: float = 0.95,
         provided_intrinsics: Optional[dict[str, dict[str, np.ndarray | tuple[int, int]]]] = None,
     ):
         self._serials = serials
@@ -336,7 +496,7 @@ class MultiCalibrator:
         for sn in self._serials:
             if sn != self._ref_serial and sn in init_cam_poses:
                 rv, tv = _mat_to_rvec_tvec(init_cam_poses[sn])
-                print(f"  {sn} → ref: t=[{tv[0]:.1f}, {tv[1]:.1f}, {tv[2]:.1f}]mm")
+                print(f"  ref → {sn}: t=[{tv[0]:.1f}, {tv[1]:.1f}, {tv[2]:.1f}]mm")
 
         # ── 4. 全局 BA ──
         if self._fix_intrinsics:
@@ -369,7 +529,27 @@ class MultiCalibrator:
             with open(cache_path, encoding="utf-8") as f:
                 cache = json.load(f)
 
+            expected_board = {
+                "inner_cols": board.inner_cols,
+                "inner_rows": board.inner_rows,
+            }
+            if cache.get("board") != expected_board:
+                raise RuntimeError(
+                    f"角点缓存棋盘规格不匹配: {cache.get('board')} != {expected_board}"
+                )
+            if cache.get("quality_metric") != DETECTION_QUALITY_METRIC:
+                raise RuntimeError(
+                    "角点缓存质量指标已过期，请用当前检测器重新生成缓存"
+                )
+            if cache.get("min_parity_confidence") != MIN_PARITY_CONFIDENCE:
+                raise RuntimeError(
+                    "角点缓存方向置信度阈值不匹配，请用当前检测器重新生成缓存"
+                )
+
             cam_cache = cache.get("cameras", {})
+            missing_serials = [sn for sn in self._serials if sn not in cam_cache]
+            if missing_serials:
+                raise RuntimeError(f"角点缓存缺少相机: {missing_serials}")
             filtered_low_score = {sn: 0 for sn in self._serials}
             for sn in self._serials:
                 sn_data = cam_cache.get(sn, {})
@@ -377,17 +557,72 @@ class MultiCalibrator:
                     idx = int(idx_str)
                     if idx < start or idx > end:
                         continue
-                    score = float(det_data.get("score", 1.0))
+                    if not isinstance(det_data, dict):
+                        raise RuntimeError(f"角点缓存记录格式错误: {sn}/{idx_str}")
+                    required = {
+                        "corners", "image_size", "score", "parity_sign",
+                        "reversed_to_canonical",
+                    }
+                    missing = required.difference(det_data)
+                    if missing:
+                        raise RuntimeError(
+                            f"角点缓存字段不完整: {sn}/{idx_str} 缺少 {sorted(missing)}"
+                        )
+                    image_path = self._image_dir / sn / f"{idx:04d}.png"
+                    if not image_path.exists():
+                        image_path = self._image_dir / sn / f"{idx:03d}.png"
+                    if not image_path.exists():
+                        raise RuntimeError(f"角点缓存对应图片不存在: {sn}/{idx_str}")
+                    image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
+                    if image is None:
+                        raise RuntimeError(f"角点缓存对应图片无法读取: {sn}/{idx_str}")
+                    actual_size = (int(image.shape[1]), int(image.shape[0]))
+
+                    score = float(det_data["score"])
+                    parity = float(det_data["parity_sign"])
+                    if (not np.isfinite(score) or not 0.0 <= score <= 1.0
+                            or not np.isfinite(parity)):
+                        raise RuntimeError(f"角点缓存数值非法: {sn}/{idx_str}")
+                    if parity < MIN_PARITY_CONFIDENCE:
+                        raise RuntimeError(
+                            f"角点缓存未可靠规范方向: {sn}/{idx_str}, parity={parity:.3f}"
+                        )
+                    corners = np.array(det_data["corners"], dtype=np.float32)
+                    if corners.shape != (board.inner_cols * board.inner_rows, 2):
+                        raise RuntimeError(
+                            f"角点缓存数量错误: {sn}/{idx_str}, shape={corners.shape}"
+                        )
+                    if not np.all(np.isfinite(corners)):
+                        raise RuntimeError(f"角点缓存含非有限坐标: {sn}/{idx_str}")
+                    raw_image_size = det_data["image_size"]
+                    if (not isinstance(raw_image_size, list)
+                            or len(raw_image_size) != 2
+                            or any(isinstance(v, bool) or not isinstance(v, int) or v <= 0
+                                   for v in raw_image_size)):
+                        raise RuntimeError(f"角点缓存图像尺寸错误: {sn}/{idx_str}")
+                    image_size = tuple(raw_image_size)
+                    if image_size != actual_size:
+                        raise RuntimeError(
+                            f"角点缓存图像尺寸与原图不符: {sn}/{idx_str}, "
+                            f"cache={image_size}, image={actual_size}"
+                        )
+                    width, height = image_size
+                    if (np.any(corners[:, 0] < 0.0) or np.any(corners[:, 0] >= width)
+                            or np.any(corners[:, 1] < 0.0)
+                            or np.any(corners[:, 1] >= height)):
+                        raise RuntimeError(f"角点缓存坐标越界: {sn}/{idx_str}")
+                    if sn in image_sizes and image_sizes[sn] != image_size:
+                        raise RuntimeError(
+                            f"同一相机图像尺寸不一致: {sn}, "
+                            f"{image_sizes[sn]} != {image_size}"
+                        )
+                    image_sizes[sn] = image_size
                     if score < self._detection_score_threshold:
                         filtered_low_score[sn] += 1
                         continue
-                    corners = np.array(det_data["corners"],
-                                       dtype=np.float32).reshape(-1, 1, 2)
-                    if sn not in image_sizes:
-                        image_sizes[sn] = tuple(det_data["image_size"])
                     if idx not in detections:
                         detections[idx] = {}
-                    detections[idx][sn] = corners
+                    detections[idx][sn] = corners.reshape(-1, 1, 2)
 
             total = end - start + 1
             print(f"  缓存加载完成")
@@ -421,8 +656,13 @@ class MultiCalibrator:
                 if img is None:
                     continue
 
-                if sn not in image_sizes:
-                    image_sizes[sn] = (img.shape[1], img.shape[0])
+                image_size = (img.shape[1], img.shape[0])
+                if sn in image_sizes and image_sizes[sn] != image_size:
+                    raise RuntimeError(
+                        f"同一相机图像尺寸不一致: {sn}, "
+                        f"{image_sizes[sn]} != {image_size}"
+                    )
+                image_sizes[sn] = image_size
 
                 corners = _detect_checkerboard(img, board)
                 if corners is not None:
@@ -621,9 +861,10 @@ class MultiCalibrator:
         # 均匀抽样限制图片数量（加速 BA）
         if self._max_images > 0 and len(valid_images) > self._max_images:
             n = self._max_images
+            original_count = len(valid_images)
             step = len(valid_images) / n
             valid_images = [valid_images[int(i * step)] for i in range(n)]
-            log.info("抽样 %d/%d 帧用于 BA", n, len(valid_images))
+            log.info("抽样 %d/%d 帧用于 BA", n, original_count)
 
         # 计算相机间外参
         cam_poses = {ref: np.eye(4)}
@@ -644,7 +885,7 @@ class MultiCalibrator:
                 t_estimates.append(T_cam_ref[:3, 3])
 
             if not R_estimates:
-                raise RuntimeError(f"相机 {sn} 无法计算到参考相机的外参")
+                raise RuntimeError(f"无法计算参考相机到相机 {sn} 的外参")
 
             # 旋转取四元数平均
             quats = np.array([Rotation.from_matrix(R).as_quat()
@@ -662,7 +903,7 @@ class MultiCalibrator:
             T[:3, 3] = t_avg
             cam_poses[sn] = T
 
-            log.info("%s → ref: %d 帧, t=[%.1f, %.1f, %.1f]",
+            log.info("ref → %s: %d 帧, t=[%.1f, %.1f, %.1f]",
                      sn, len(R_estimates), t_avg[0], t_avg[1], t_avg[2])
 
         return cam_poses, board_poses, valid_images
@@ -764,6 +1005,10 @@ class MultiCalibrator:
                 dropped_observations,
             )
         cam_frame_poses = filtered_cam_frame_poses
+        for idx in detections:
+            for sn in list(detections[idx]):
+                if idx not in cam_frame_poses[sn]:
+                    del detections[idx][sn]
         candidate_images = sorted(
             idx for idx in detections
             if sum(1 for sn in self._serials if idx in cam_frame_poses[sn])
@@ -828,15 +1073,16 @@ class MultiCalibrator:
 
         if self._max_images > 0 and len(valid_images) > self._max_images:
             n = self._max_images
+            original_count = len(valid_images)
             step = len(valid_images) / n
             valid_images = [valid_images[int(i * step)] for i in range(n)]
-            log.info("抽样 %d/%d 帧用于 BA", n, len(valid_images))
+            log.info("抽样 %d/%d 帧用于 BA", n, original_count)
 
         for sn in self._serials:
             if sn == ref:
                 continue
             T = cam_poses[sn]
-            log.info("%s -> ref 初始化: t=[%.1f, %.1f, %.1f]",
+            log.info("ref -> %s 初始化: t=[%.1f, %.1f, %.1f]",
                      sn, T[0, 3], T[1, 3], T[2, 3])
 
         return cam_poses, board_poses, sorted(valid_images)
@@ -867,6 +1113,27 @@ class MultiCalibrator:
         n_boards = len(board_indices)
         board_idx_map = {idx: i for i, idx in enumerate(board_indices)}
         n_corners = board.inner_cols * board.inner_rows
+
+        adjacency = {sn: set() for sn in self._serials}
+        observed_cameras = set()
+        for idx in board_indices:
+            viewers = [sn for sn in self._serials if sn in detections[idx]]
+            observed_cameras.update(viewers)
+            for sn in viewers:
+                adjacency[sn].update(other for other in viewers if other != sn)
+        missing = [sn for sn in self._serials if sn not in observed_cameras]
+        if missing:
+            raise RuntimeError(f"BA 抽样后相机无观测: {missing}")
+        connected = {self._ref_serial}
+        queue = [self._ref_serial]
+        while queue:
+            sn = queue.pop(0)
+            for other in adjacency[sn] - connected:
+                connected.add(other)
+                queue.append(other)
+        disconnected = [sn for sn in self._serials if sn not in connected]
+        if disconnected:
+            raise RuntimeError(f"BA 抽样后相机重叠图不连通: {disconnected}")
 
         # ── 固定内参时，预计算 K/D 数组 ──
         if fix_intr:
@@ -999,19 +1266,48 @@ class MultiCalibrator:
         print(f"  残差: {n_res}")
         print(f"  优化中...")
 
-        result = least_squares(
+        linear_result = least_squares(
             residuals, x0,
             jac_sparsity=J_sp,
-            verbose=2,
+            verbose=0,
+            x_scale='jac',
+            loss='linear',
+            method='trf',
+            max_nfev=500,
+            xtol=1e-6,
+            ftol=1e-6,
+            gtol=1e-6,
+        )
+        if (not np.all(np.isfinite(linear_result.x))
+                or not np.all(np.isfinite(linear_result.fun))):
+            raise RuntimeError("BA 线性初始化包含非有限数值")
+        print(
+            f"  线性初始化: status={linear_result.status}, "
+            f"nfev={linear_result.nfev}"
+        )
+
+        result = least_squares(
+            residuals, linear_result.x,
+            jac_sparsity=J_sp,
+            verbose=1,
             x_scale='jac',
             loss='huber',
             f_scale=1.0,
             method='trf',
-            max_nfev=5000,
+            max_nfev=3000,
+            xtol=1e-6,
         )
 
+        if not result.success:
+            raise RuntimeError(
+                f"BA 未收敛: status={result.status}, message={result.message}"
+            )
+        if not np.all(np.isfinite(result.x)) or not np.all(np.isfinite(result.fun)):
+            raise RuntimeError("BA 结果包含非有限数值")
+
         x_opt = result.x
-        total_rms = np.sqrt(np.mean(result.fun ** 2))
+        residual_pairs = result.fun.reshape(-1, 2)
+        total_rms = np.sqrt(np.mean(np.sum(residual_pairs ** 2, axis=1)))
         print(f"\n  BA 收敛: cost={result.cost:.2f}, total_rms={total_rms:.3f}px")
 
         # ── 提取结果 ──
@@ -1021,19 +1317,22 @@ class MultiCalibrator:
         for ci, sn in enumerate(self._serials):
             K, D = _unpack_K_D(x_opt, ci)
             cam_rv, cam_tv = _unpack_ext(x_opt, ci)
+            if (not np.all(np.isfinite(K)) or not np.all(np.isfinite(D))
+                    or K[0, 0] <= 0 or K[1, 1] <= 0):
+                raise RuntimeError(f"BA 生成了无效内参: {sn}")
 
             if sn == self._ref_serial:
-                R_to_ref = np.eye(3)
-                t_to_ref = np.zeros(3)
+                R_ref_to_camera = np.eye(3)
+                t_ref_to_camera = np.zeros(3)
             else:
-                R_to_ref, _ = cv2.Rodrigues(cam_rv.astype(np.float64))
-                t_to_ref = cam_tv.copy()
+                R_ref_to_camera, _ = cv2.Rodrigues(cam_rv.astype(np.float64))
+                t_ref_to_camera = cam_tv.copy()
 
             cameras[sn] = CameraCalib(
                 serial=sn, K=K.copy(), D=D.copy(),
                 image_size=image_sizes[sn],
-                R_to_ref=R_to_ref,
-                t_to_ref=t_to_ref.reshape(3, 1),
+                R_ref_to_camera=R_ref_to_camera,
+                t_ref_to_camera=t_ref_to_camera.reshape(3, 1),
             )
 
             # 每台相机 RMS
@@ -1052,13 +1351,32 @@ class MultiCalibrator:
                     rvec_arr, _ = cv2.Rodrigues(R_tot)
                     rvec = rvec_arr.ravel()
                     tvec = t_tot
+                R_obs, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64))
+                depths = (R_obs @ obj_pts.T + np.asarray(tvec).reshape(3, 1))[2]
+                if np.any(depths <= 0):
+                    raise RuntimeError(f"BA 生成了相机后方的棋盘点: {sn}")
                 proj = _project(obj_pts, rvec, tvec, K, D)
                 cam_res.append(((proj - obs_2d) ** 2).sum(axis=1))
 
-            if cam_res:
-                rms = np.sqrt(np.mean(np.concatenate(cam_res)))
-                per_camera_rms[sn] = float(rms)
-                print(f"  {sn}: rms={rms:.3f}px")
+            if not cam_res:
+                raise RuntimeError(f"BA 结果缺少相机观测: {sn}")
+            rms = np.sqrt(np.mean(np.concatenate(cam_res)))
+            per_camera_rms[sn] = float(rms)
+            print(f"  {sn}: rms={rms:.3f}px")
+
+        worst_rms = max([float(total_rms), *per_camera_rms.values()])
+        if worst_rms > _MAX_REPROJECTION_RMS_PX:
+            raise RuntimeError(
+                f"BA 重投影误差过高: {worst_rms:.3f}px > "
+                f"{_MAX_REPROJECTION_RMS_PX:.3f}px"
+            )
+
+        epipolar_residual = _validate_epipolar_residual(
+            self._serials,
+            self._ref_serial,
+            detections,
+            cameras,
+        )
 
         return MultiCalibResult(
             reference_serial=self._ref_serial,
@@ -1068,4 +1386,8 @@ class MultiCalibrator:
             per_camera_rms=per_camera_rms,
             num_images=len(valid_images),
             num_observations=total_obs,
+            optimizer_status=int(result.status),
+            optimizer_message=str(result.message),
+            optimizer_nfev=int(linear_result.nfev + result.nfev),
+            epipolar_residual=epipolar_residual,
         )
