@@ -4,7 +4,9 @@
 
 车上刚性安装若干块布局已知的竖直 AprilTag（当前两块：id0 右后、id1 左前），
 布局（车体系中心 + 完整安装旋转）由 test_src/measure_car_tag_layout.py 实测，
-写入 src/config/arm_poe_racket_center.json 的 vehicle_reference.apriltags。
+写入车体配置的 vehicle_reference.apriltags。默认读 v0.4 车的
+src/config/vehicle_v04.json；v0.3 车的布局仍在 src/config/arm_poe_racket_center.json
+里，用 run_tracker.py --car-config 指过去即可回退。
 
 流程：
   1. 接收多台相机的同步 BGR 图像
@@ -53,7 +55,7 @@ from .cv_linalg import (
 
 _SRC_DIR = Path(__file__).resolve().parent
 _DEFAULT_CALIB_CONFIG = _SRC_DIR / "config" / "four_camera_calib.json"
-_DEFAULT_ARM_POE_CONFIG = _SRC_DIR / "config" / "arm_poe_racket_center.json"
+_DEFAULT_VEHICLE_CONFIG = _SRC_DIR / "config" / "vehicle_v04.json"
 _WORLD_SCALE_M_PER_MM = 1.0 / 1000.0
 _HUBER_DELTA_PX = 3.0
 _VIEW_OUTLIER_MIN_PX = 4.0
@@ -141,7 +143,7 @@ class CarLocalizer:
         config_path = calib_config_path or str(_DEFAULT_CALIB_CONFIG)
         self._load_calib(config_path)
         self._load_vehicle_reference(
-            vehicle_config_path or str(_DEFAULT_ARM_POE_CONFIG)
+            vehicle_config_path or str(_DEFAULT_VEHICLE_CONFIG)
         )
         self._init_aruco_detector()
         self._pool = ThreadPoolExecutor(max_workers=max(1, len(self._serials)))

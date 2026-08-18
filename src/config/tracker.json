@@ -4,7 +4,7 @@
     "track_timeout_s": 0.3,
     "search_hold_frames": 4,
     "min_cameras_for_3d": 2,
-    "ball_detection_disabled_serials": ["029"],
+    "ball_detection_disabled_serials": ["029", "405"],
     "max_reproj_error_px": 15.0,
     "ball_max_candidates_per_camera": 1,
     "ball_require_exactly_one": false,
@@ -39,7 +39,8 @@
     },
     "car_localizer": {
         "enabled": true,
-        "sample_every_frames": 2
+        "sample_every_frames": 2,
+        "disabled_serials": ["405"]
     },
     "video_output": {
         "codec": "avc1",
@@ -50,7 +51,8 @@
         "enabled": true,
         "generate_html": true,
         "generate_annotated_video": false,
-        "annotated_video_no_racket": true
+        "annotated_video_no_racket": true,
+        "measure_racket": false
     },
     "curve4": {
         "ideal_hit_z": 0.8,

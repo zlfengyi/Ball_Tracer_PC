@@ -706,9 +706,11 @@ def _generate_post_run_artifacts(
     *,
     json_path: Path,
     video_path: Path | None,
+    car: str | None,
     generate_html: bool,
     generate_annotated_video: bool,
     annotated_video_no_racket: bool,
+    measure_racket: bool = False,
 ) -> dict[str, Path]:
     generated: dict[str, Path] = {}
     python_exe = sys.executable
@@ -738,19 +740,48 @@ def _generate_post_run_artifacts(
             generated["rk_tracking_json"] = rk_candidate
 
         candidate = json_path.with_name(f"{json_path.stem}_arm.json")
+        # 车型决定臂 FK 链（两台车的臂不是同一台）。--car-config 直给布局文件时 args.car
+        # 为 None，那就让 extract_arm_bag 从本场 tracker JSON 的 car_config_path 推。
+        arm_command = [
+            str(_ROOT / "ros2" / "run_ros2.bat"),
+            str(_ROOT / "test_src" / "extract_arm_bag.py"),
+            "--bag",
+            str(bag_dir),
+            "--output",
+            str(candidate),
+        ]
+        if car:
+            arm_command.extend(["--car", car])
         if _run_postprocess_command(
             "Extract arm rosbag",
-            [
-                str(_ROOT / "ros2" / "run_ros2.bat"),
-                str(_ROOT / "test_src" / "extract_arm_bag.py"),
-                "--bag",
-                str(bag_dir),
-                "--output",
-                str(candidate),
-            ],
+            arm_command,
         ) and candidate.exists():
             arm_json_path = candidate
             generated["arm_json"] = candidate
+
+    # ── 四目实测拍心（供报告「视觉拍心−车心」列）──
+    # 逐帧过 ≥3相机 / 刚体长轴 / 相机对分歧三道门，只写通过的观测；耗时随场次长度 1~6min，
+    # 默认关闭。已有同名侧车文件时即便本次不量也会喂给报告（方便手工先跑一遍）。
+    racket_json_path: Path | None = None
+    racket_candidate = json_path.with_name(f"{json_path.stem}_racket.json")
+    if measure_racket and video_path is not None and video_path.exists():
+        if _run_postprocess_command(
+            "Measure racket at HT",
+            [
+                python_exe,
+                str(_ROOT / "test_src" / "racket_ht_measure.py"),
+                "--input",
+                str(json_path),
+                "--video",
+                str(video_path),
+                "--output",
+                str(racket_candidate),
+            ],
+            env=report_env,
+        ) and racket_candidate.exists():
+            generated["racket_json"] = racket_candidate
+    if racket_candidate.exists():
+        racket_json_path = racket_candidate
 
     if generate_html:
         html_path = json_path.with_suffix(".html")
@@ -766,6 +797,8 @@ def _generate_post_run_artifacts(
             html_command.extend(["--arm-json", str(arm_json_path)])
         if rk_tracking_json_path is not None:
             html_command.extend(["--rk-tracking-json", str(rk_tracking_json_path)])
+        if racket_json_path is not None:
+            html_command.extend(["--racket-json", str(racket_json_path)])
         if _run_postprocess_command("Generate HTML", html_command, env=report_env):
             generated["html"] = html_path
 
@@ -1811,6 +1844,16 @@ def main() -> int:
         int(car_loc_cfg.get("sample_every_frames", 3)),
         1,
     )
+    # 从车位姿刚体拟合里剔掉的相机（后缀选择器，与 ball_detection_disabled_serials 同款匹配）。
+    # 2026-08-15 加：DB0260405 外参偏 ~7px，带它的相机对射线交不到（12~19mm，其余 0.4~4.1mm），
+    # 18° 小视差下放大成 15~20cm 深度误差。刚体拟合的离群剔除虽然已经能把它挡住（实测带/不带
+    # 405 车心与 yaw 逐位相同），但球的三角化没有那层保护，所以两条路径一起摘干净。
+    # 见 memory/v04-fixed-camera-405-bad-calib.md。相机照常采集、照常进视频，只是不参与定位。
+    car_loc_disabled_serial_selectors = [
+        str(selector).strip()
+        for selector in car_loc_cfg.get("disabled_serials", [])
+        if str(selector).strip()
+    ]
     video_output_cfg = tracker_cfg.get("video_output", {})
     video_output_codec = _normalize_video_codec(
         video_output_cfg.get("codec", "avc1")
@@ -1829,6 +1872,9 @@ def main() -> int:
     post_run_annotated_video_no_racket = post_run_cfg.get(
         "annotated_video_no_racket", True
     )
+    # 四目实测拍心：默认关（要重跑一遍视频，1~6min）。开了报告北极星表就多一列
+    # 「视觉拍心−车心」，与 FK TCP 列同基准，两列相减即 FK 链偏差。
+    post_run_measure_racket = bool(post_run_cfg.get("measure_racket", False))
 
     # ── 初始化组件 ──────────────────────────────────────────────────────
     print("=" * 60)
@@ -2119,6 +2165,26 @@ def main() -> int:
             )
         print(f"  球检测相机: {ball_detect_serials}")
 
+        car_loc_disabled_serials = {
+            sn for sn in cam_serials
+            if any(
+                _serial_matches_selector(sn, selector)
+                for selector in car_loc_disabled_serial_selectors
+            )
+        }
+        car_loc_serials = [sn for sn in cam_serials if sn not in car_loc_disabled_serials]
+        if car_loc_enabled:
+            if len(car_loc_serials) < 2:
+                print("*** 错误: 可用于车定位的相机数量不足 ***")
+                print(f"  已禁用车定位: {sorted(car_loc_disabled_serials)}")
+                return 1
+            if car_loc_disabled_serials:
+                print(
+                    "  跳过车定位的相机: "
+                    f"{[sn[-3:] for sn in sorted(car_loc_disabled_serials)]}"
+                )
+            print(f"  车定位相机: {car_loc_serials}")
+
         print("  等待相机稳定 (1s)...")
         time.sleep(1.0)
 
@@ -2310,7 +2376,10 @@ def main() -> int:
                                     frame_idx=job.frame_idx,
                                     exposure_pc=job.exposure_pc,
                                     elapsed_s=job.elapsed_s,
-                                    images=images,
+                                    images={
+                                        sn: im for sn, im in images.items()
+                                        if sn not in car_loc_disabled_serials
+                                    },
                                 ),
                             )
                             if stale is not None:
@@ -2760,6 +2829,7 @@ def main() -> int:
                 "generate_html": post_run_generate_html,
                 "generate_annotated_video": post_run_generate_annotated_video,
                 "annotated_video_no_racket": post_run_annotated_video_no_racket,
+                "measure_racket": post_run_measure_racket,
             },
             "rosbag": {
                 "enabled": _rosbag_proc is not None and _rosbag_proc.was_started(),
@@ -2843,12 +2913,14 @@ def main() -> int:
         generated_artifacts = _generate_post_run_artifacts(
             json_path=json_path,
             video_path=post_run_video_path,
+            car=args.car,
             generate_html=post_run_generate_html,
             generate_annotated_video=(
                 post_run_generate_annotated_video
                 and post_run_video_path is not None
             ),
             annotated_video_no_racket=post_run_annotated_video_no_racket,
+            measure_racket=post_run_measure_racket,
         )
 
     # ── 最终统计 ────────────────────────────────────────────────────────

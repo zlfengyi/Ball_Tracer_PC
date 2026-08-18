@@ -24,6 +24,14 @@ MOVE_TOPICS = (
     "/chassis_can/wheels_pos_diff",
 )
 
+# 一次性配置公告（latched，每 topic 1 条，无 payload t）：RK 各节点自报 git 版本 +
+# 生效参数实值（2026-08-17 起；老 bag 没有 → config_announce 为空对象）。值 = 输出别名。
+CONFIG_TOPICS = {
+    "/chassis_can/motor_config": "chassis",
+    "/bot_center/config": "bot_center",
+    "/tennis/config": "arm",
+}
+
 
 def _finite(value) -> bool:
     return isinstance(value, (int, float)) and math.isfinite(value)
@@ -85,9 +93,18 @@ def main() -> int:
     rows: list[tuple[str, int, dict]] = []
     counts: dict[str, int] = {}
     t0_candidates: list[float] = []
+    config_announce: dict[str, dict] = {}
 
     while reader.has_next():
         topic, data, stamp_ns = reader.read_next()
+        if topic in CONFIG_TOPICS:
+            try:
+                payload = json.loads(deserialize_message(data, String).data)
+            except Exception:
+                continue
+            if isinstance(payload, dict):
+                config_announce[CONFIG_TOPICS[topic]] = payload
+            continue
         if topic not in MOVE_TOPICS:
             continue
         counts[_topic_key(topic)] = counts.get(_topic_key(topic), 0) + 1
@@ -279,16 +296,20 @@ def main() -> int:
                 ),
             )
         elif key == "chassis_can/wheels_pos_diff":
-            values = payload.get("pos_diff") or payload.get("position_diff")
+            # 载荷键是 raw（int16 裸 LSB ×4，[FL,BL,FR,BR]）+ cnt（物理帧序号）。
+            # 旧名 pos_diff/position_diff 早已废弃，留作读老 bag 的回退——只认旧名会让
+            # 这一路恒空（此前 value_avg 全场 None，轮速链离线完全不可见）。
+            values = payload.get("raw")
+            if not isinstance(values, list):
+                values = payload.get("pos_diff") or payload.get("position_diff")
             if not isinstance(values, list):
                 values = []
             _add(
                 wheels_pos_diff,
                 t,
-                value_avg=(
-                    sum(float(v) for v in values if _finite(v)) / len(values)
-                    if values else None
-                ),
+                # 不做 LSB→m 换算：与 RK 侧口径一致，量纲留给消费方（见 bot_state.hpp）。
+                raw=[float(v) for v in values] if values else None,
+                cnt=payload.get("cnt"),
             )
         elif key == "chassis_can/imu":
             _add(
@@ -297,6 +318,15 @@ def main() -> int:
                 yaw_speed=payload.get("yaw_speed"),
                 ax=payload.get("ax"),
                 ay=payload.get("ay"),
+                az=payload.get("az"),
+                # cnt/ovfl 是 2026-08-16 起才有的丢帧定位字段（老 bag 为 None）：
+                #   cnt 跳 ≥2        → 该消息 publish 之后丢的（DDS/录制），车上无影响
+                #   cnt +1 且 ovfl 涨 → socket 接收队列溢出，帧到了内核没读走
+                #   cnt +1 且 ovfl 平 → 帧根本没到内核（总线电气 / MCU 没发）
+                # 只看 t 的跳变无法区分这三者，别再据此下结论。
+                cnt=payload.get("cnt"),
+                ovfl=payload.get("ovfl"),
+                rate_hz=payload.get("rate_hz"),
             )
 
     output = {
@@ -304,6 +334,7 @@ def main() -> int:
         "bag_dir": str(args.bag.resolve()),
         "time_axis": "rk_payload_time_relative_s",
         "t0": t0,
+        "config_announce": config_announce,
         "counts": counts,
         "ball": ball,
         "world": world,
