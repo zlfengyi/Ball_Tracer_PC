@@ -905,6 +905,10 @@ const fallbackBias = isNum(auto.bias) ? auto.bias
       : (poseLock.usable ? poseLock.bias : null)));
 let rkBias=Math.round((presetBias!=null?presetBias:(isNum(fallbackBias)?fallbackBias:0))*10000)/10000;
 const rkToPc = t => isNum(Number(t)) ? rkScale*Number(t)+rkBias : null;
+// RK 轴是否真的对齐到了 PC（预置/精锁/时钟桥/位姿锁任一给出 bias）。全缺时 rkBias=0 只是
+// 「原样平移」，把 RK 数字标成 PC 是撒谎——显示侧须退回 RK 记法（0817 用户定：Car Move
+// 面板时间统一 PC 主显，逐帧侧栏仍保留 t(RK) 行供对 bag）。
+const rkAxisAligned = presetBias!=null || isNum(fallbackBias);
 const publishRkTimeMap = () => {
   window.__rkTimeMap={scale:rkScale,bias:rkBias};
 };
@@ -3157,20 +3161,14 @@ buildPlots[1] = () => {
   // react 切换移动段时旧范围粘住不更新）：按绘图区像素宽高取同一 m/px，居中放置。
   const MARGIN={l:60,r:20,t:40,b:50};
   const layout=()=>{
-    const xs=[], ys2=[];
-    seg.frames.forEach(r=>{
-      if(r.x!==null&&r.y!==null){xs.push(r.x); ys2.push(r.y);}
-      if(r.tx!==null&&r.ty!==null){xs.push(r.tx); ys2.push(r.ty);}   // 目标逐帧会移动，全部包进视野
-    });
-    if(!xs.length){ xs.push(0); ys2.push(0); }
-    const x0=Math.min(...xs), x1=Math.max(...xs), y0=Math.min(...ys2), y1=Math.max(...ys2);
-    const padOf=(a,b)=>Math.max(0.45,(b-a)*0.18);
-    const px=padOf(x0,x1), py=padOf(y0,y1);
+    // 0817 用户定：视口固定 x∈[-3,3]、y∈[2,6]（等比、按容器长边扩展），段间比例尺一致、
+    // 跨段可比；冲刺假目标/越界星标允许出视野——固定比例尺本来就是为了这个。
+    const x0=-3, x1=3, y0=2, y1=6;
     const div=document.getElementById('c1');
     const W=Math.max(200,((div&&div.clientWidth)||1100)-MARGIN.l-MARGIN.r);
     const H=Math.max(200,((div&&div.clientHeight)||680)-MARGIN.t-MARGIN.b);
     const cx=(x0+x1)/2, cy=(y0+y1)/2;
-    const mpp=Math.max((x1-x0+2*px)/W,(y1-y0+2*py)/H);   // meters per pixel，取大者兜住两轴
+    const mpp=Math.max((x1-x0)/W,(y1-y0)/H);   // meters per pixel，取大者兜住两轴
     const sx=mpp*W/2, sy=mpp*H/2;
     return {
       ...DL,
@@ -3220,7 +3218,9 @@ buildPlots[1] = () => {
   const render=()=>{
     const f=seg.frames[cur];
     slider.value=String(cur);
-    clock.textContent=`帧 ${cur+1}/${seg.frames.length} · t(RK)=${f.t.toFixed(2)}s · PC=${rkToPc(f.t).toFixed(2)}s`;
+    clock.textContent = rkAxisAligned
+      ? `帧 ${cur+1}/${seg.frames.length} · PC=${rkToPc(f.t).toFixed(2)}s`
+      : `帧 ${cur+1}/${seg.frames.length} · RK=${f.t.toFixed(2)}s（未对齐）`;
     setSide(f);
     const d=dyn(f);
     Plotly.restyle('c1',{
@@ -3296,7 +3296,10 @@ buildPlots[1] = () => {
     opt.value=String(m.k);
     const tgt=m.tx!==null?` 末目标(${m.tx.toFixed(2)}, ${m.ty.toFixed(2)})`:'';
     const rem=m.rem0!==null?` 计划${m.rem0.toFixed(2)}s`:'';
-    opt.textContent=`第 ${m.k+1} 次  RK ${m.runT0.toFixed(1)}→${m.runT1.toFixed(1)}s（PC ~${rkToPc(m.runT0).toFixed(1)}s）${tgt}${rem}`;
+    // 0817 用户定：时间统一 PC 主显（与北极星表/视频轴同轴，免心算）；未对齐场退回 RK 记法。
+    opt.textContent = rkAxisAligned
+      ? `第 ${m.k+1} 次  PC ${rkToPc(m.runT0).toFixed(1)}→${rkToPc(m.runT1).toFixed(1)}s${tgt}${rem}`
+      : `第 ${m.k+1} 次  RK ${m.runT0.toFixed(1)}→${m.runT1.toFixed(1)}s（未对齐）${tgt}${rem}`;
     sel.appendChild(opt);
   });
   sel.addEventListener('change',()=>setMovement(Number(sel.value)||0));
