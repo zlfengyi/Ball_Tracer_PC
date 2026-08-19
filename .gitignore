@@ -71,3 +71,4 @@ tmp_report_server_*.txt
 # ── 本地分析暂存与会话数据（不入库）──
 tmp/
 arm_controller_data/
+manual_triangulation/*

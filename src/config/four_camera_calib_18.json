@@ -60,41 +60,41 @@
             ],
             "R_world": [
                 [
-                    0.934742214758447,
-                    -0.35526850221527567,
-                    0.006425206781768028
+                    0.9332852575227863,
+                    -0.3589595239434953,
+                    0.011255587984922683
                 ],
                 [
-                    -0.10675135120224333,
-                    -0.2980274018903753,
-                    -0.9485693526247663
+                    -0.1047446209624418,
+                    -0.3020438830793063,
+                    -0.9475220615235347
                 ],
                 [
-                    0.3389117008380931,
-                    0.8859819180187525,
-                    -0.3165041863527929
+                    0.3435217496317541,
+                    0.883129408900323,
+                    -0.3194921824791726
                 ]
             ],
             "t_world": [
                 [
-                    2138.094601828877
+                    2165.70367723484
                 ],
                 [
-                    1331.4674209022799
+                    1366.9644002783452
                 ],
                 [
-                    5484.272501874885
+                    5421.958210130114
                 ]
             ],
             "pos_world": [
                 [
-                    -3715.115458683521
+                    -3740.597716924007
                 ],
                 [
-                    -3702.5548272091164
+                    -3598.007552720319
                 ],
                 [
-                    2985.046695493417
+                    3003.125920157971
                 ]
             ]
         },
@@ -157,41 +157,41 @@
             ],
             "R_world": [
                 [
-                    0.9999074947982177,
-                    -0.0018337886039987428,
-                    0.013477353809581191
+                    0.9998410070916056,
+                    -0.005758327016336329,
+                    0.016876083906447917
                 ],
                 [
-                    0.011577414238997063,
-                    -0.4053271282493739,
-                    -0.9140983987430753
+                    0.013036662827936474,
+                    -0.4096518527083033,
+                    -0.9121487844617047
                 ],
                 [
-                    0.007139000342586854,
-                    0.9141698727941495,
-                    -0.405268402851292
+                    0.012165770027221356,
+                    0.912223767089319,
+                    -0.40951165160104697
                 ]
             ],
             "t_world": [
                 [
-                    -1260.258113285432
+                    -1259.4061918548682
                 ],
                 [
-                    1581.9256716197006
+                    1625.1658606211793
                 ],
                 [
-                    4702.206316384578
+                    4638.685234606621
                 ]
             ],
             "pos_world": [
                 [
-                    1208.2578715551363
+                    1181.5860380442923
                 ],
                 [
-                    -3659.7290074858
+                    -3573.0187859918015
                 ],
                 [
-                    3368.67631156071
+                    3403.242560561459
                 ]
             ]
         },
@@ -254,41 +254,41 @@
             ],
             "R_world": [
                 [
-                    0.9926841049485791,
-                    -0.11888779782078798,
-                    0.021070341994414488
+                    0.9921234320024095,
+                    -0.12274570689821529,
+                    0.024991740832084774
                 ],
                 [
-                    -0.029802709191175863,
-                    -0.41037680598125414,
-                    -0.9114289196846291
+                    -0.028372113847924894,
+                    -0.41452388787733974,
+                    -0.9095960474490066
                 ],
                 [
-                    0.11700455678008592,
-                    0.9041330480863684,
-                    -0.4109177108019903
+                    0.12200868341048954,
+                    0.9017224838147891,
+                    -0.4147414174583085
                 ]
             ],
             "t_world": [
                 [
-                    710.3582578407041
+                    719.9480579063297
                 ],
                 [
-                    1538.2265913559743
+                    1581.7745593794132
                 ],
                 [
-                    4880.3437983300955
+                    4817.7580350849275
                 ]
             ],
             "pos_world": [
                 [
-                    -1230.3404946631695
+                    -1257.2073650440525
                 ],
                 [
-                    -3696.774669719005
+                    -3600.226868418309
                 ],
                 [
-                    3392.436410494978
+                    3418.9069283334284
                 ]
             ]
         },
@@ -351,41 +351,41 @@
             ],
             "R_world": [
                 [
-                    0.9249841922809081,
-                    0.37706657867925214,
-                    0.047170321957347855
+                    0.9263222247773246,
+                    0.37359165318257925,
+                    0.04854289397940667
                 ],
                 [
-                    0.15549857869279843,
-                    -0.2623145832587578,
-                    -0.9523713831454114
+                    0.15765752926477672,
+                    -0.26739545773947,
+                    -0.9506017949943213
                 ],
                 [
-                    -0.3467339557282442,
-                    0.8882633926110587,
-                    -0.301270159976285
+                    -0.3421567467546337,
+                    0.8882167223446129,
+                    -0.3065938923032856
                 ]
             ],
             "t_world": [
                 [
-                    -2164.9525624711287
+                    -2193.2757358625913
                 ],
                 [
-                    1316.2338875922276
+                    1349.3191982487758
                 ],
                 [
-                    5413.140025920535
+                    5349.827091909812
                 ]
             ],
             "pos_world": [
                 [
-                    3674.7938526742687
+                    3649.4291616765922
                 ],
                 [
-                    -3646.69552467421
+                    -3571.6145519880165
                 ],
                 [
-                    2986.482559046331
+                    3029.357514647364
                 ]
             ]
         }
@@ -503,318 +503,30 @@
                 }
             }
         },
-        "ground_reproj_error": 0.9109900520645748,
+        "ground_reproj_error": 2.237048455203712,
         "ground_registration": {
-            "method": "two_flat_checkerboards_plus_ground_controls",
-            "registered_perf_counter_s": 275382.9709147,
-            "reference_serial": "DB0260414",
-            "board": {
-                "square_cols": 12,
-                "square_rows": 9,
-                "inner_cols": 11,
-                "inner_rows": 8,
-                "square_size_mm": 45.0
-            },
-            "sessions": [
-                {
-                    "path": "data/four_camera_calibration/006_chessboard",
-                    "cameras": {
-                        "DB0260373": {
-                            "detected_frames": 10,
-                            "captured_frames": 10,
-                            "max_frame_stability_rms_px": 0.019285463695311658
-                        },
-                        "DB0260405": {
-                            "detected_frames": 10,
-                            "captured_frames": 10,
-                            "max_frame_stability_rms_px": 0.02076310658724167
-                        }
-                    },
-                    "outer_square_top_left_m": [
-                        -0.025,
-                        2.0,
-                        0.0
-                    ],
-                    "first_inner_corner_m": [
-                        0.02,
-                        1.955,
-                        0.0
-                    ]
-                },
-                {
-                    "path": "data/four_camera_calibration/007_chessboard",
-                    "cameras": {
-                        "DB0260373": {
-                            "detected_frames": 10,
-                            "captured_frames": 10,
-                            "max_frame_stability_rms_px": 0.04734708925740805
-                        },
-                        "DB0260405": {
-                            "detected_frames": 10,
-                            "captured_frames": 10,
-                            "max_frame_stability_rms_px": 0.03525600585602756
-                        }
-                    },
-                    "outer_square_top_left_m": [
-                        -0.025,
-                        3.0,
-                        0.0
-                    ],
-                    "first_inner_corner_m": [
-                        0.02,
-                        2.955,
-                        0.0
-                    ]
-                }
-            ],
-            "reversed_from_parity_canonical": {
-                "006_chessboard": true,
-                "007_chessboard": true
-            },
-            "orientation_candidate_rms_px": [
-                {
-                    "reversed": {
-                        "006_chessboard": true,
-                        "007_chessboard": true
-                    },
-                    "rms_px": 0.9109900520645748
-                },
-                {
-                    "reversed": {
-                        "006_chessboard": true,
-                        "007_chessboard": false
-                    },
-                    "rms_px": 67.97049536304627
-                },
-                {
-                    "reversed": {
-                        "006_chessboard": false,
-                        "007_chessboard": true
-                    },
-                    "rms_px": 78.66477938359483
-                },
-                {
-                    "reversed": {
-                        "006_chessboard": false,
-                        "007_chessboard": false
-                    },
-                    "rms_px": 191.94410919327808
-                }
-            ],
-            "num_observed_cameras": 2,
-            "num_registered_cameras": 4,
-            "num_ground_corners": 352,
-            "total_rms_px": 0.9109900520645748,
-            "total_p95_px": 1.2745214111608087,
+            "method": "ground_controls_only_fixed_relative_rig",
+            "control_session": "manual_triangulation/manual_point_20260819_154636",
+            "num_observations": 40,
+            "num_unique_world_points": 10,
+            "relative_camera_rotations_fixed": true,
+            "relative_camera_translations_fixed": true,
+            "relative_camera_scale_preserved": true,
+            "rms_px": 2.237048455203712,
+            "p95_px": 3.620564971631532,
+            "max_px": 4.071433134669069,
             "per_camera": {
+                "DB0260414": {
+                    "rms_px": 2.234252893407299
+                },
                 "DB0260373": {
-                    "rms_px": 0.86758314892117,
-                    "p95_px": 1.2648368986114618
+                    "rms_px": 2.0215983377579945
                 },
                 "DB0260405": {
-                    "rms_px": 0.9524207209155314,
-                    "p95_px": 1.2696018952305999
-                }
-            },
-            "per_observation": {
-                "006_chessboard/DB0260373": {
-                    "rms_px": 0.712428181043075,
-                    "p95_px": 0.9760553460611348,
-                    "max_px": 1.0470631107505681
+                    "rms_px": 1.9516062256503104
                 },
-                "006_chessboard/DB0260405": {
-                    "rms_px": 0.7709658403997142,
-                    "p95_px": 1.1008813380770226,
-                    "max_px": 1.136109584716488
-                },
-                "007_chessboard/DB0260373": {
-                    "rms_px": 0.9989229837377865,
-                    "p95_px": 1.3578121081067334,
-                    "max_px": 1.5070047914823756
-                },
-                "007_chessboard/DB0260405": {
-                    "rms_px": 1.104455581811819,
-                    "p95_px": 1.3552909976171943,
-                    "max_px": 1.5109726405723694
-                }
-            },
-            "ground_controls": {
-                "session": "data/four_camera_calibration/002_chessboard_08051746",
-                "frame": "0636",
-                "annotation_files": {
-                    "DB0260414": "data/four_camera_calibration/002_chessboard_08051746/DB0260414/0636_annotations.json",
-                    "DB0260373": "data/four_camera_calibration/002_chessboard_08051746/DB0260373/0636_annotations.json",
-                    "DB0260405": "data/four_camera_calibration/002_chessboard_08051746/DB0260405/0636_annotations.json",
-                    "DB0260378": "data/four_camera_calibration/002_chessboard_08051746/DB0260378/0636_annotations.json"
-                },
-                "baseline_scale_calibration": {
-                    "expected_mm": 8230.0,
-                    "initial_triangulated_mm": 8256.02945041408,
-                    "initial_error_mm": 26.029450414080202,
-                    "input_triangulated_mm": 8256.02945041408,
-                    "input_error_mm": 26.029450414080202,
-                    "input_relative_error_pct": 0.31627521766804617,
-                    "applied_scale_factor": 0.996847219287381,
-                    "cumulative_scale_factor": 0.996847219287381,
-                    "triangulated_mm": 8230.0,
-                    "error_mm": 0.0,
-                    "max_initial_relative_error_pct": 1.0,
-                    "points": [
-                        {
-                            "world_m": [
-                                -4.115,
-                                5.48,
-                                0.0
-                            ],
-                            "triangulated_reference_mm": [
-                                -3650.047861452889,
-                                117.4628734439084,
-                                8871.90270902011
-                            ],
-                            "cameras": [
-                                "DB0260414",
-                                "DB0260405",
-                                "DB0260378"
-                            ],
-                            "reprojection_rms_px": 3.5402977420168473
-                        },
-                        {
-                            "world_m": [
-                                4.115,
-                                5.48,
-                                0.0
-                            ],
-                            "triangulated_reference_mm": [
-                                4029.866900034392,
-                                -763.0687588956025,
-                                11696.167799400137
-                            ],
-                            "cameras": [
-                                "DB0260414",
-                                "DB0260373",
-                                "DB0260405",
-                                "DB0260378"
-                            ],
-                            "reprojection_rms_px": 2.7591894092651543
-                        }
-                    ]
-                },
-                "rms_px": 9.17086189962326,
-                "p95_px": 12.628042361101915,
-                "max_px": 12.912182399491485,
-                "per_point": {
-                    "DB0260414/1": {
-                        "world_m": [
-                            -4.115,
-                            5.48,
-                            0.0
-                        ],
-                        "observed_pixel": [
-                            61.0,
-                            821.0
-                        ],
-                        "projected_pixel": [
-                            67.21907932118722,
-                            828.8450823808195
-                        ],
-                        "error_px": 10.011107089880845
-                    },
-                    "DB0260414/2": {
-                        "world_m": [
-                            4.115,
-                            5.48,
-                            0.0
-                        ],
-                        "observed_pixel": [
-                            1854.0,
-                            641.0
-                        ],
-                        "projected_pixel": [
-                            1853.9183607038567,
-                            642.2471976819666
-                        ],
-                        "error_px": 1.2498668059347438
-                    },
-                    "DB0260373/1": {
-                        "world_m": [
-                            4.115,
-                            5.48,
-                            0.0
-                        ],
-                        "observed_pixel": [
-                            1693.0,
-                            674.0
-                        ],
-                        "projected_pixel": [
-                            1694.440405863037,
-                            679.2368886853961
-                        ],
-                        "error_px": 5.431369270589297
-                    },
-                    "DB0260405/1": {
-                        "world_m": [
-                            -4.115,
-                            5.48,
-                            0.0
-                        ],
-                        "observed_pixel": [
-                            18.0,
-                            687.0
-                        ],
-                        "projected_pixel": [
-                            29.63482131528076,
-                            692.5995881347851
-                        ],
-                        "error_px": 12.912182399491485
-                    },
-                    "DB0260405/2": {
-                        "world_m": [
-                            4.115,
-                            5.48,
-                            0.0
-                        ],
-                        "observed_pixel": [
-                            1997.0,
-                            641.0
-                        ],
-                        "projected_pixel": [
-                            1995.5033402058416,
-                            645.301064422024
-                        ],
-                        "error_px": 4.554025219720521
-                    },
-                    "DB0260378/1": {
-                        "world_m": [
-                            -4.115,
-                            5.48,
-                            0.0
-                        ],
-                        "observed_pixel": [
-                            237.0,
-                            671.0
-                        ],
-                        "projected_pixel": [
-                            248.9229349873466,
-                            672.0030041778866
-                        ],
-                        "error_px": 11.96504893819292
-                    },
-                    "DB0260378/2": {
-                        "world_m": [
-                            4.115,
-                            5.48,
-                            0.0
-                        ],
-                        "observed_pixel": [
-                            2022.0,
-                            954.0
-                        ],
-                        "projected_pixel": [
-                            2025.5064781774208,
-                            964.7017459417107
-                        ],
-                        "error_px": 11.2615609668309
-                    }
+                "DB0260378": {
+                    "rms_px": 2.6702116906334292
                 }
             }
         }
@@ -824,23 +536,12 @@
         "inner_rows": 11,
         "square_size": 45.0
     },
-    "config_written_perf_counter_s": 275382.9709147,
+    "config_written_perf_counter_s": 170738.445714,
     "sources": {
         "ground_registration": {
-            "method": "two_flat_checkerboards_plus_ground_controls",
-            "input_calib": "src/config/four_camera_calib_18_raw_sb_160_s0948_candidate.json",
-            "sessions": [
-                "data/four_camera_calibration/006_chessboard",
-                "data/four_camera_calibration/007_chessboard"
-            ],
-            "ground_control_annotations": {
-                "DB0260414": "data/four_camera_calibration/002_chessboard_08051746/DB0260414/0636_annotations.json",
-                "DB0260373": "data/four_camera_calibration/002_chessboard_08051746/DB0260373/0636_annotations.json",
-                "DB0260405": "data/four_camera_calibration/002_chessboard_08051746/DB0260405/0636_annotations.json",
-                "DB0260378": "data/four_camera_calibration/002_chessboard_08051746/DB0260378/0636_annotations.json"
-            },
-            "relative_translation_scale_factor": 0.996847219287381,
-            "registered_perf_counter_s": 275382.9709147
+            "method": "ground_controls_only_fixed_relative_rig",
+            "control_session": "manual_triangulation/manual_point_20260819_154636",
+            "relative_translation_scale_factor": 1.0
         }
     }
 }
