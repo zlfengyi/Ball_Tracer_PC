@@ -171,8 +171,8 @@ def test_all_cross_axis_rendering_uses_offset_only_time_map():
     source = SRC.read_text(encoding="utf-8")
     assert "const rkToPc = t => isNum(Number(t)) ? Number(t)+rkBias : null;" in source
     assert "const shifted = xs => xs.map(rkToPc);" in source
-    assert "const ctPc=rkToPc(th.ref300T);" in source
-    assert "const htPc=rkToPc(th.ref300Ht);" in source
+    assert "const targetPredHtPc=targetPred?rkToPc(targetPred.ht):null;" in source
+    assert "const truthAcc=finalHt!=null?pcTruthAt(rkToPc(finalHt)):null;" in source
     assert "armTcpRows.map(s=>rkToPc(s.t))" in source
     assert "rkScale" not in source
     assert "driftPpm" not in source

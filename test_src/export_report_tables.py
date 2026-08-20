@@ -32,7 +32,7 @@ _SNAPSHOT_JS = Path(__file__).resolve().parent / "report_page_snapshot.js"
 # 页面里各容器的中文名；没列到的按 id 原样输出
 _SECTION_TITLES = {
     "st": "概览",
-    "rk300Tbl": "北极星表（RK≈300ms 预测 / PC 真值 / 臂执行）",
+    "rk300Tbl": "北极星表（末次 Target 对应预测 / PC 真值 / 臂执行）",
     "armEv": "Arm Accepted（臂受理与触球）",
     "rkInfo": "RK Car Move 轴说明",
     "rkSigInfo": "RK Signals 轴说明",

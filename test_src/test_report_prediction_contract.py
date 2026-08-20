@@ -15,6 +15,7 @@ import pytest
 
 SRC = Path(__file__).resolve().parent / "generate_curve3_html.py"
 RK_EXTRACTOR = Path(__file__).resolve().parent / "extract_rk_tracking_bag.py"
+TABLE_EXPORTER = Path(__file__).resolve().parent / "export_report_tables.py"
 NODE = shutil.which("node")
 
 
@@ -70,6 +71,43 @@ def test_rk300_fields_come_from_one_s1_message(tmp_path):
     assert throw["lastS0T"] == pytest.approx(1.0)
     assert throw["lastS0Y"] == pytest.approx(3.6)
     assert throw["lastS0Idx"] == 1
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_last_target_change_matches_prediction_by_deadline_not_ct(tmp_path):
+    """末次坐标变化用 bot.t+remaining ↔ pred.ht 回配；更晚 ct 的 deadline-only 消息不能抢走。"""
+    run_core = _core("bot-run-end-core-begin", "bot-run-end-core-end")
+    pred_core = _core("last-target-pred-core-begin", "last-target-pred-core-end")
+    harness = (
+        "const isNum=v=>typeof v==='number'&&Number.isFinite(v);\n"
+        "const ts=s=>s.t; const ys=(s,k)=>s.y[k];\n"
+        "const th={ht:1.25,firstIdx:0,lastIdx:2}; const reportThrows=[th];\n"
+        "const rkPredStage=[1,1,1], rkPredNFit=[4,5,6];\n"
+        "const RK={"
+        "bot:{t:[1.00,1.05,1.10,1.15,1.20,1.25,1.26],y:{"
+        "phase:['RUN','RUN','RUN','RUN','RUN','RUN','BRAKE_IN_SWING'],"
+        "x:[0,0,0,0,0,2.25,2.25],y:[0,0,0,0,0,3.35,3.35],"
+        "target_x:[1,1,1,4,4,4,null],target_y:[2,3,3,3,3,3,null],"
+        "remaining:[1.00,.95,.90,.65,.69,.64,null]}},"
+        "pred:{t:[1.00,1.10,1.14],y:{"
+        "ht_rel:[2.00,1.80,1.89],x:[.50,.60,999],rel_x:[.70,.82,999],rel_z:[1.10,1.24,999],"
+        "car_pred_x:[2.00,2.20,999],car_pred_y:[3.00,3.30,999]}}};\n"
+        f"{run_core}\n{pred_core}\n"
+        "const end=botRunEndForThrow(th), p=lastTargetPredictionForThrow(th,end);\n"
+        "console.log(JSON.stringify({end,ref:p}));\n"
+    )
+    result = _run_node(tmp_path, harness)
+
+    assert result["end"]["targetChange"] == pytest.approx(
+        {"t": 1.15, "x": 4, "y": 3, "idx": 3, "deadline": 1.80}
+    )
+    assert result["ref"] == pytest.approx(
+        {
+            "idx": 1, "ct": 1.10, "ht": 1.80, "lead": .70, "htError": 0,
+            "stage": 1, "nFit": 5, "worldX": .60, "relX": .82, "relZ": 1.24,
+            "carX": 2.20, "carY": 3.30,
+        }
+    )
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
@@ -333,6 +371,8 @@ def test_swing_ht_replan_consumes_last_late_saved(tmp_path):
         _pred_event(10.26, 10.512), _status_event(10.300, "late ht saved: contact in 0.202s"),
         _pred_event(10.31, 10.514), _status_event(10.350, "late ht saved: contact in 0.154s"),
         _pred_event(10.35, 10.516), _status_event(10.390, "late ht saved: contact in 0.116s"),
+        # 无 sweep_w 的旧状态仍受老 done+50ms 归属窗约束，不得抢走最后消费时刻。
+        _pred_event(10.56, 10.700), _status_event(10.600, "late ht saved: contact in 0.090s"),
     ]
     marks = _run_node(tmp_path, _swing_ht_harness(json.dumps(events)))
 
@@ -351,6 +391,107 @@ def test_swing_ht_replan_consumes_last_late_saved(tmp_path):
     assert h["finalHt"] == pytest.approx(10.516)       # 原始 ht，不减 10ms
     assert h["finalCt"] == pytest.approx(10.35)        # 与 finalHt 同源那条的 ct
     assert h["wht"] == pytest.approx(10.510)           # accepted 那条保持不变
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_continuous_sweep_keeps_raw_last_saved_after_old_done(tmp_path):
+    """连续 sweep 的 raw last-saved 可晚于老 done+50ms，但 mode=2 不代表 profile 重解。"""
+    events = [
+        _pred_event(9.95, 10.510),
+        _status_event(10.000, "accepted hit x=1.0000 z=1.0360 duration=0.5000 hit_time=0.2500"),
+        _pred_event(10.35, 10.516),
+        _status_event(10.390, "late ht saved: contact in 0.116s sweep_w=8.50 mode=0"),
+        # 旧报告以 done+50ms=10.550 截断，会漏掉下面两条已被 update_ht() 消费的更新。
+        _pred_event(10.52, 10.710),
+        _status_event(10.580, "late ht saved: contact in 0.120s sweep_w=8.50 mode=2"),
+        # advance 整数 ms 自标定 + duration 毫秒打印会留下 −2.8ms gap；sweep 状态仍是强消费证据。
+        _pred_event(10.56, 10.7228),
+        _status_event(10.600, "late ht saved: contact in 0.110s sweep_w=8.50 mode=2"),
+    ]
+    h = _run_node(tmp_path, _swing_ht_harness(json.dumps(events)))[0]
+
+    assert h["reswing"]["continuousSweep"] is True
+    assert h["reswing"]["n"] == 3
+    assert h["reswing"]["nCoast"] == 2
+    assert h["sweepCoast"] is True
+    assert [late["mode"] for late in h["lates"]] == [0, 2, 2]
+    assert [late["ht"] for late in h["lates"]] == pytest.approx([10.516, 10.710, 10.7228])
+    assert h["lastUpdateT"] == pytest.approx(10.600)
+    assert h["finalDone"] == pytest.approx(10.7128)
+    assert h["finalHt"] == pytest.approx(10.7228)
+    assert h["finalCt"] == pytest.approx(10.56)
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_continuous_sweep_saved_bypasses_legacy_remaining_gate(tmp_path):
+    """带 sweep_w 的 raw HT 已写入 update_ht，不能再被旧版 60ms 一次性门否掉。"""
+    events = [
+        _pred_event(9.95, 10.510),
+        _status_event(10.000, "accepted hit x=1.0000 z=1.0360 duration=0.5000 hit_time=0.2500"),
+        # 内部触球 10.450，距旧触发点 10.400 仅 50ms；连续 sweep 仍已消费该 HT。
+        _pred_event(10.35, 10.460),
+        _status_event(10.390, "late ht saved: contact in 0.060s sweep_w=8.50 mode=0"),
+    ]
+    h = _run_node(tmp_path, _swing_ht_harness(json.dumps(events)))[0]
+
+    assert h["reswing"]["continuousSweep"] is True
+    assert h["reswing"]["nCoast"] == 0
+    assert h["sweepCoast"] is False
+    assert h["reswing"]["remain"] == pytest.approx(0.050)
+    assert h["reswing"]["ok"] is True
+    assert h["finalHt"] == pytest.approx(10.460)
+    assert h["finalCt"] == pytest.approx(10.35)
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_mode2_tcp_sample_uses_actual_plane_instead_of_raw_final_ht(tmp_path):
+    """mode=2 时五个 TCP 数整体取实际过面，不能混入随挥阶段的 raw finalHt。"""
+    script = (
+        "const isNum=v=>typeof v==='number'&&Number.isFinite(v);\n"
+        "const lerp=(a,b,f)=>a+(b-a)*f;\n"
+        "const RK={t0:0};\n"
+        "const armTcpRows=["
+        "{t:10.000,tcp:[0.9430,-0.0100,1.0300]},"
+        "{t:10.010,tcp:[0.9432, 0.0100,1.0440]},"
+        "{t:10.100,tcp:[0.7000, 0.0200,1.1000]},"
+        "{t:10.110,tcp:[0.7000,-0.0200,1.1000]}];\n"
+        + _core("arm-execution-contact-core-begin", "arm-execution-contact-core-end")
+        + "\nconst h={tx:0.9431,tz:1.0296,tgtYawExtraDeg:0,start:9.9,done:10.0,"
+          "finalHt:10.105,wht:10.0,hitT:0.25,"
+          "reswing:{continuousSweep:true,lastMode:2,nCoast:2}};\n"
+          "const exec=armExecutionContactAt(h);\n"
+          "const raw=[0,1,2].map(k=>lerp(armTcpRows[2].tcp[k],armTcpRows[3].tcp[k],0.5));\n"
+          "console.log(JSON.stringify({exec,raw,rawHt:h.finalHt}));\n"
+    )
+    result = _run_node(tmp_path, script)
+
+    assert result["exec"]["t"] == pytest.approx(10.005)
+    assert result["exec"]["t"] != pytest.approx(result["rawHt"])
+    assert result["exec"]["tcp"] == pytest.approx([0.9431, 0.0, 1.0370])
+    assert result["exec"]["target"] == pytest.approx([0.9431, 0.0, 1.0296])
+    assert result["raw"] == pytest.approx([0.7000, 0.0, 1.1000])
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_tcp_five_sample_switches_whole_cell_for_mode2(tmp_path):
+    """健康抛取 raw；Coast 五数整体取 exec；没有可信过面时不回退 raw。"""
+    script = (
+        "const isNum=v=>typeof v==='number'&&Number.isFinite(v);\n"
+        "const raw=[0.70,0.20,1.10], exec={t:9.9,tcp:[0.943,0,1.045]};\n"
+        "const tcpAt=t=>raw; let crossing=exec;\n"
+        "const armExecutionContactAt=h=>crossing;\n"
+        + _core("arm-tcp-five-sample-core-begin", "arm-tcp-five-sample-core-end")
+        + "\nconst healthy=armTcpFiveSampleAt({reswing:{lastMode:0}},10.1);\n"
+          "const coast=armTcpFiveSampleAt({reswing:{lastMode:2}},10.1);\n"
+          "crossing=null;\n"
+          "const missing=armTcpFiveSampleAt({reswing:{lastMode:2}},10.1);\n"
+          "console.log(JSON.stringify({healthy,coast,missing}));\n"
+    )
+    result = _run_node(tmp_path, script)
+
+    assert result["healthy"] == {"t": 10.1, "tcp": [0.70, 0.20, 1.10], "usesExec": False}
+    assert result["coast"] == {"t": 9.9, "tcp": [0.943, 0, 1.045], "usesExec": True}
+    assert result["missing"] is None
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
@@ -390,7 +531,8 @@ def test_swing_without_late_update_reports_no_replan(tmp_path):
 def test_late_ht_pairing_self_check_rejects_wrong_source(tmp_path):
     """顺序配对必须自校验：t+duration+10ms 与原消息 ht 差 >8ms 就不认，ht 置 null。
 
-    此时 hitTime 退回 status 时刻重建值（仍可判重定相），但 finalHt 不被污染。
+    此时 hitTime 退回 status 时刻重建值（仍可判重定相），但 finalHt/finalCt 必须清空，
+    让所有空间列显式缺失，绝不能退回 accepted HT 冒充最后消费时刻。
     """
     events = [
         _pred_event(9.95, 10.510),
@@ -402,8 +544,9 @@ def test_late_ht_pairing_self_check_rejects_wrong_source(tmp_path):
 
     assert h["reswing"]["ht"] is None
     assert h["reswing"]["newDone"] == pytest.approx(10.506)   # 退回 status t+duration
-    assert h["finalHt"] == pytest.approx(10.510)              # 不采信失配的 ht
-    assert h["finalCt"] == pytest.approx(9.95)                # ct 与 ht 同源一起退回
+    assert h["finalMismatch"] is True
+    assert h["finalHt"] is None
+    assert h["finalCt"] is None
 
 
 def _dup_session(x_scale: float = 1.0, drop_status_after: float | None = None,
@@ -651,20 +794,23 @@ def test_ball_car_gap_measured_at_given_time_and_rejects_pollution(tmp_path):
     assert result["miss"] is None       # 窗内无球观测不产出
 
 
-def test_main_pc_truth_uses_rk_ht_and_accepted_uses_own_ht():
+def test_main_pc_truth_and_aim_use_last_target_prediction_ht():
     source = SRC.read_text(encoding="utf-8")
-    assert "const truth=pcTruthAt(htPc);" in source
+    assert "const targetPredHtPc=targetPred?rkToPc(targetPred.ht):null;" in source
+    assert "const targetTruth=targetPredHtPc!=null?pcTruthAt(targetPredHtPc):null;" in source
+    assert "const truth=pcTruthAt(htPc);" not in source
     # 0805 起：全量RK重估的第三个 ht 不再单列，击球误差改成两列空间量——
-    # dy 是时序误差的空间形态，dx/dz 是 @300 预测击球点与真值的落点差（两侧同轴同基准）
-    # 0807 起全表空间量列（PC真值/TCP/车yaw/拍面yaw,pitch/这两列）统一锚「臂最后更新HT」
-    # = 臂真正执行的击球时刻（重定相生效时是那条 late ht saved），
-    # 与最后一条 accepted 原消息 ht 之差就是 Δht 重定相列
+    # dy 是时序误差的空间形态，dx/dz 是末次 target 对应预测击球点与真值的落点差（两侧同轴同基准）
+    # raw预测/盲区列统一锚「最后进入update_ht的raw HT」；mode=2时它不是执行接触时刻。
+    # 机械空间执行误差单独锚 /joint_states FK 实际穿 accepted 平面。
     assert "const gapFin=finalHt!=null?ballCarGapForThrow(th,finalHt):null;" in source
     assert "球面y−车y @臂最后更新HT<br>(cm, RK全量真值)</th>" in source
-    assert "击球点@300预测 − RK全量真值@臂最后更新HT<br>dx/dz(cm, 世界轴)</th>" in source
+    assert "击球点@末次target预测 − RK全量真值@臂最后更新HT<br>dx/dz(cm, 世界轴)</th>" in source
     # 0809 起两列改 cm：算式一律留米，换算只在 cmSigned/cmFmt 显示层做
-    assert "? (th.ref300Xw-th.ref300CarX)-gapFin.dx : null;" in source
-    assert "const aimDz=(gapFin&&isNum(th.ref300Z))?th.ref300Z-gapFin.dz:null;" in source
+    assert "? (targetPred.worldX-targetPred.carX)-gapFin.dx : null;" in source
+    assert "const aimDz=(gapFin&&targetPred&&isNum(targetPred.relZ))?targetPred.relZ-gapFin.dz:null;" in source
+    assert "th.ref300Xw-th.ref300CarX" not in source
+    assert "isNum(th.ref300Z))?th.ref300Z-gapFin.dz" not in source
     assert "+cmSigned(aimDx)+'/'+cmSigned(aimDz)+'</span>'" in source
     assert "+cmSigned(gapFin.dy)+'</span>'" in source
     assert "htAllS1ForThrow" not in source
@@ -673,11 +819,11 @@ def test_main_pc_truth_uses_rk_ht_and_accepted_uses_own_ht():
     assert "HT err@300<br>" not in source
     assert "'<td>'+htPc.toFixed(3)+'</td>'" not in source
     assert "const truth=pcTruthAt(accHtPc);" in source
-    assert "<td>'+pcTruthCell(truth,true,htPc)+'</td>" in source
+    assert source.count("<td>'+pcTruthCell(targetTruth,true,targetPredHtPc)+'</td>") == 2
     assert "<td>'+pcTruthCell(truth,false,accHtPc)+'</td>" in source
-    # 主表第二列 PC 真值：同一套拟合，评估时刻换成臂最后更新HT（臂真正执行的击球时刻，与 TCP 同锚）
+    # 主表第二列 PC 真值：同一套拟合，评估时刻换成raw臂最后更新HT。
     assert "const truthAcc=finalHt!=null?pcTruthAt(rkToPc(finalHt)):null;" in source
-    # 有/无 S1@300 两条渲染路径都要出这一列（该列只依赖 accepted，不依赖 @300 参考消息）
+    # 有/无末次 target 对应预测两条渲染路径都要出这一列（该列只依赖 accepted）
     assert source.count("pcTruthCell(truthAcc,true,finalHt!=null?rkToPc(finalHt):null)") == 2
     # 空值必须带原因：取值时刻要传进单元格，否则 "—" 分不清缺小车位姿、缺球观测还是拟合没过门
     assert "const pcTruthCell = (f,withY=false,tPc=null) => {" in source
@@ -699,35 +845,48 @@ def test_main_pc_truth_uses_rk_ht_and_accepted_uses_own_ht():
     assert "hitTableHtml" not in source
 
 
-def test_rk300_table_includes_last_accepted_target_and_tcp_at_final_ht():
+def test_rk300_table_merges_tcp_xyz_and_last_accepted_error():
     source = SRC.read_text(encoding="utf-8")
+    exporter = TABLE_EXPORTER.read_text(encoding="utf-8")
     assert "const accepted=lastAcceptedForThrow(th);" in source
     assert "const accHt=accepted&&isNum(accepted.wht)?accepted.wht-RK.t0:null;" in source
-    # 0807 起：TCP/PC真值/TCP−accepted 三列锚点由 accepted HT 改为臂最后更新HT（finalHt），
-    # TCP 臂系 x/y 按该时刻 /bot_state yaw 旋到世界轴（臂基≡车心 0标恒等式）、z−armZOff 还原
-    # 世界高度，即拍心−车中心世界轴偏移，与 PC真值(球−车,世界轴) 同轴同基准
-    assert "const tcp=finalHt!=null?tcpAt(finalHt):null;" in source
+    # 正常抛 TCP 锚 raw 最后更新HT；最后状态 mode=2 时五个数整体切到实际 accepted 平面过面。
+    assert "const rawTcp=finalHt!=null?tcpAt(finalHt):null;" in source
     assert "tcpAt(accHt)" not in source
-    assert "const tcpYawRad=(carYawAcc!=null?carYawAcc:0)*Math.PI/180;" in source
+    assert "const tcpSample=accepted?armTcpFiveSampleAt(accepted,finalHt):null;" in source
+    assert "const tcpUsesExecContact=!!(tcpSample&&tcpSample.usesExec);" in source
+    assert "const tcpSampleT=tcpSample?tcpSample.t:null;" in source
+    assert "const tcp=tcpSample?tcpSample.tcp:null;" in source
+    assert "const tcpYawDeg=tcpSampleT!=null?botYawDegAt(tcpSampleT):null;" in source
     assert "const tcpWorld=tcp?[tcp[0]*Math.cos(tcpYawRad)-tcp[1]*Math.sin(tcpYawRad)," in source
     assert "tcp[0]*Math.sin(tcpYawRad)+tcp[1]*Math.cos(tcpYawRad)," in source
     assert "tcp[2]-(isNum(armZOff)?armZOff:0)]:null;" in source
-    # TCP−accepted：dx 目标侧=同条消息的世界x−car_pred_x、dz=rel_z(≡世界z)，
-    # 悬停保留老口径臂系伺服差 tcp_x−rel_x 对照
-    assert "const tgtWx=accepted&&isNum(accepted.wxw)&&isNum(accepted.wcarx)?accepted.wxw-accepted.wcarx:null;" in source
-    assert "const tcpAcceptedDx=(tcpWorld&&tgtWx!=null)?(tcpWorld[0]-tgtWx)*100:null;" in source
-    assert "const tcpAcceptedDz=accepted&&tcpWorld&&isNum(accepted.wz)?(tcpWorld[2]-accepted.wz)*100:null;" in source
-    assert "const tcpServoDx=(tcp&&accepted&&isNum(accepted.wx))?(tcp[0]-accepted.wx)*100:null;" in source
+    # dx/dz 与 xyz 共用 tcpWorld，并减 status tx/tz；raw world_x-car_pred_x 含 rel_y，禁止回潮。
+    assert "const tcpAcceptedTarget=accepted&&isNum(accepted.tx)&&isNum(accepted.tz)" in source
+    assert "tcpAcceptedTarget[0]*Math.cos(tcpYawRad)-tcpAcceptedTarget[1]*Math.sin(tcpYawRad)" in source
+    assert "tcpAcceptedTarget[0]*Math.sin(tcpYawRad)+tcpAcceptedTarget[1]*Math.cos(tcpYawRad)" in source
+    assert "const tcpAcceptedDx=tcpWorld&&tcpAcceptedTargetWorld" in source
+    assert "const tcpAcceptedDz=tcpWorld&&tcpAcceptedTargetWorld" in source
+    assert "tableXyzCm(tcpWorld[0],tcpWorld[1],tcpWorld[2])+', '" in source
+    assert "tcpAcceptedError" not in source
+    assert "(finalHt!=null?rkToPc(finalHt).toFixed(3):'—')+'s 已与有效profile脱钩" in source
+    assert "各减同一个本场自标定提前量" in source
+    assert "各减10ms" not in source
+    assert source.count("<td>'+tcpCell+'</td>") == 2
+    assert "accepted.wxw-accepted.wcarx" not in source
+    assert "mode=2 Coast" in source
     assert "armPredictionMatchesAccepted(p,e.t+RK.t0,rec.tx,rec.tz,dur)" in source
     headers = [
+        "最后改target t / 对应ct<br>(s,PC轴)</th>",
+        "<th>对应预测 HT<br>(s,PC轴)</th>",
+        "<th>对应预测击球 rel_x/z(cm)</th>",
         "<th>车RUN末帧 目标−实际 dx/dy(cm)<br>(RK世界系)</th>",
-        "<th>RK@≈300ms预测车@HT−RUN末实际 dx/dy(cm)<br>(RK世界系)</th>",
+        "末次target对应预测车@HT−RUN末实际 dx/dy(cm)<br>(RK世界系)</th>",
         # 表头带悬停：本场回配成功率 + 自标定出来的臂端三个量（x 比例/z 偏移/提前量）
         "机械臂最后accepted目标 x/z(cm)</th>",
-        "<th>PC真值@HT300 x/y/z(cm)</th>",
+        "<th>PC真值@对应预测HT x/y/z(cm)</th>",
         "PC真值@臂最后更新HT x/y/z(cm)</th>",
-        "TCP−车心@臂最后更新HT x/y/z(cm,世界轴)</th>",
-        "TCP−accepted dx/dz(cm,世界轴)</th>",
+        "TCP−车心@臂最后更新HT x/y/z(cm,世界轴)<br>tcp−last accepted（dx，dz）</th>",
         "最后更新−挥拍起<br>(ms)</th>",
         "盲区 ht−ct@臂最后更新<br>(ms)</th>",
         "Δht 重定相<br>(ms)</th>",
@@ -739,8 +898,12 @@ def test_rk300_table_includes_last_accepted_target_and_tcp_at_final_ht():
     assert [source.index(header) for header in headers] == sorted(
         source.index(header) for header in headers
     )
+    assert "TCP@执行过面−accepted" not in source
     # 两列拍面角锚在「臂最后更新 HT」（含挥拍中 ht 重定相消费的那条），不是最后一条 accepted
-    assert "const finalHt=accepted&&isNum(accepted.finalHt)?accepted.finalHt-RK.t0:accHt;" in source
+    assert "? (accepted.finalMismatch ? null : (isNum(accepted.finalHt)?accepted.finalHt-RK.t0:accHt))" in source
+    assert "continuousSweep || e.t<=cur.done+0.05" in source
+    assert "const continuousSweep=/\\bsweep_w=/.test(e.text);" in source
+    assert "mode:continuousSweep?statusNum(e.text,'mode'):null" in source
     assert "faceAnglesWorldAt(finalHt)" in source
     assert "faceAnglesWorldPreAt(finalHt)" in source
     assert "faceAnglesWorldAt(accHt)" not in source
@@ -766,7 +929,7 @@ def test_rk300_table_includes_last_accepted_target_and_tcp_at_final_ht():
     assert "tgtSpeed:statusNum(e.text,'speed')" in source
     assert "tgtSpeedReq:statusNum(e.text,'speed_req')" in source
     assert source.count("<td>'+tgtSpeedCell+'</td>") == 2
-    # 盲区列的 ct/ht 必须同源，且与主表 lead(ms)（@300ms 参考消息）不是一回事
+    # 盲区列的 ct/ht 必须同源，且与主表末次 target 对应预测不是一回事
     assert "const finalCt=accepted&&isNum(accepted.finalCt)?accepted.finalCt-RK.t0:null;" in source
     # 回配失配（重定相生效但拿不到同源 ht/ct）必须出 ⚠— 而不是退回 accepted 冒充：
     # 0809 场 #6/#13 曾把 ~174ms 的真盲区显示成 327/306ms，且无任何提示
@@ -775,7 +938,7 @@ def test_rk300_table_includes_last_accepted_target_and_tcp_at_final_ht():
         "const blind=(finalHt!=null&&finalCt!=null&&!blindBad)?(finalHt-finalCt)*1000:null;"
         in source
     )
-    assert "else h.finalMismatch=true;" in source
+    assert "h.finalHt=null; h.finalCt=null; h.finalMismatch=true;" in source
     assert "⚠—" in source
     # 0803 已删列：视觉球拍@accepted HT（相对小车），其专用取值/单元格实现不应残留
     assert "视觉球拍" not in source
@@ -806,9 +969,18 @@ def test_rk300_table_includes_last_accepted_target_and_tcp_at_final_ht():
     assert "(runEnd.tx-runEnd.x)*100" in source
     assert "(runEnd.ty-runEnd.y)*100" in source
     assert source.count("<td>'+runTargetError+'</td>") == 2
-    assert "(th.ref300CarX-runEnd.x)*100" in source
-    assert "(th.ref300CarY-runEnd.y)*100" in source
-    assert source.count("<td>'+rkPredCarError+'</td>") == 2
+    assert "(targetPred.carX-runEnd.x)*100" in source
+    assert "(targetPred.carY-runEnd.y)*100" in source
+    assert "(th.ref300CarX-runEnd.x)*100" not in source
+    assert "(th.ref300CarY-runEnd.y)*100" not in source
+    assert source.count("<td>'+targetPredCarError+'</td>") == 2
+    assert "const targetPredHt=targetPredHtPc!=null?targetPredHtPc.toFixed(3):'—';" in source
+    assert "const targetPredHit=targetPred?tableXzCm(targetPred.relX,targetPred.relZ):'—';" in source
+    assert source.count("<td>'+targetPredHt+'</td>") == 2
+    assert source.count("<td>'+targetPredHit+'</td>") == 2
+    assert "'<br><span style=\"color:#a0a0c0\">ct '" not in source
+    assert "' <span style=\"color:#a0a0c0\">(ct '" in source
+    assert '"rk300Tbl": "北极星表（末次 Target 对应预测 / PC 真值 / 臂执行）"' in exporter
 
 
 @pytest.mark.parametrize("car,fp0", [("v03", 15.42), ("v04", 15.42)])

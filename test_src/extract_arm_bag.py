@@ -4,8 +4,8 @@
 必须在 ROS2 环境中运行（经 ros2/run_ros2.bat 启动），依赖 rosbag2_py。
 TCP 正解使用本文件内置的 FK，不依赖 tennis-man/arm_controller 源码路径。
 
-⚠ 车型（--car v03|v04）决定用哪条 FK 链，**没有默认值**：两台车的臂不同（v0.4 肩高 +11.1cm、
-拍长 +5.3cm），选错不会报错、只会让整场 TCP 偏几厘米。不给 --car 时从同目录的 tracker JSON
+⚠ 车型（--car v03|v04）决定用哪条 FK 链，**没有默认值**：两台车的肩高、连杆与拍心标定距离
+均不同，选错不会报错、只会让整场 TCP 偏几厘米。不给 --car 时从同目录的 tracker JSON
 （config.car_config_path，run_tracker 按启动的 --car 写入）推断，推不出来直接失败。
 选中的车型写进输出的 "car"/"car_source"/"fk_source"，报告端按它复算，绝不自己猜。
 
@@ -48,15 +48,15 @@ import numpy as np
 
 # ── 车型运动学（v0.3 / v0.4 是两台不同的臂）────────────────────────────────────
 # 逐值抄自 arm_controller.compact_arm_kinematics：v03 = a266857（USD
-# tennis_arm_j5j6_7_6_world），v04 = origin/unify/car-config（URDF
-# 000-zongzhuang-02-urdf，该文件写死那组即 v0.4）。抄进来是为了报告端自洽——出 arm JSON
-# 不该依赖隔壁 tennis-man checkout；真值源仍是
-# tennis-man/arm_controller/cpp/arm_controller_cpp/config/cars/<car>.yaml 的 kinematics 段，
+# tennis_arm_j5j6_7_6_world），v04 = arm_controller-unify@0e1104f（URDF
+# 000-zongzhuang-02-urdf + 2026-08-19 甜点标定）。抄进来是为了报告端自洽——出 arm JSON
+# 不该依赖隔壁 arm_controller checkout；真值源仍是
+# arm_controller-unify/cpp/arm_controller_cpp/config/cars/<car>.yaml 的 kinematics 段，
 # 两侧一致性由 test_src/test_arm_kinematics_cars.py 拿臂端导出的黄金向量守着。
 #
-# ⚠ 拿错车算 TCP **不会报错**，只会整场偏几厘米：v0.4 肩高 +11.1cm、拍长 +5.3cm，
-#   0816_081524 用 v0.3 链算 v0.4 的关节角，TCP−accepted 两列整场偏 (−5.4, −8.6)cm、
-#   FK 拍速低报 5%，而拍面 yaw/pitch 两车逐拍恒等（旋转链一致）——从角度列根本看不出来。
+# ⚠ 拿错车算 TCP **不会报错**，只会整场偏几厘米：当前资产用 v0.3 链交叉计算 v0.4
+#   黄金位形时 x 远约 2cm、z 低约 12cm，而拍面 yaw/pitch 两车逐拍恒等（旋转链一致）——
+#   从角度列根本看不出来。
 #   故本模块**没有默认车型**：先 use_car()（或 car_for_tracker_json 推断）再调 fk()。
 SHORT_JOINT_NAMES = ("joint1", "joint2", "joint3", "joint4", "joint5", "joint6")
 _V03_ROOT_LINK = "/tennis_arm_j5j6_7_6/Geometry/base_link"
@@ -192,8 +192,7 @@ _V04_WORLD_TO_BASE = _pose((0.0, -0.0450000000000024, 0.0), (1.0, 0.0, 0.0, 0.0)
 
 
 class CarModel(NamedTuple):
-    """一台车的整条 FK 链。tcp_distance = 拍甜点沿 link6 工具轴的距离（两车同为 0.62m，
-    但工具轴与 link6 系不同，所以拍心位置并不相同）。"""
+    """一台车的整条 FK 链。tcp_distance = 拍甜点沿 link6 工具轴的标定距离。"""
 
     car: str
     source_model: str
@@ -224,7 +223,7 @@ CAR_MODELS = {
         joints=_V04_JOINTS,
         tool_axis_in_link6=np.array([1.0, 0.0, 0.0]),
         face_normal_in_link6=np.array([0.0, 1.0, 0.0]),
-        tcp_distance=0.62,
+        tcp_distance=0.548946367,
     ),
 }
 

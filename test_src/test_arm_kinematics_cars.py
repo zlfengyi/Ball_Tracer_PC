@@ -25,7 +25,7 @@ import extract_arm_bag as eab  # noqa: E402
 
 # 臂端导出的黄金向量（逐条抄进来，免得测试依赖隔壁 tennis-man checkout 的存在与分支）。
 # 来源：v03 = origin/c++version:cpp/arm_controller_cpp/assets/test_vectors.json
-#      v04 = origin/unify/car-config:cpp/arm_controller_cpp/assets/v04/test_vectors.json
+#      v04 = arm_controller-unify@0e1104f:cpp/arm_controller_cpp/assets/v04/test_vectors.json
 # 每条 = (x, z, q6)：臂端 face_lookup/ik_hit 声称该位形把拍心放在 (x, y≈0, z)。
 GOLDEN = {
     "v03": [
@@ -42,17 +42,23 @@ GOLDEN = {
     ],
     "v04": [
         (1.0, 1.15,
-         [-0.07922583481293888, 0.12268758725424328, 1.7044932648076865,
-          1.6864725502508566, 0.12368435879051162, 0.2998813238813777]),
+         [-0.051970737187912314, 0.2909985676928369, 1.553974563237923,
+          1.7222877928352092, 0.09118969644015855, 0.3053721642437658]),
         (1.0, 1.136,
-         [-0.09171839172890976, 0.12307170901481712, 1.7126914923164884,
-          1.677039191098644, 0.1432631727521447, 0.30597990141549924]),
+         [-0.062136554915039145, 0.2899976768804198, 1.5641746368566103,
+          1.7115920079545708, 0.1090724415160484, 0.31239731944623406]),
         (1.0, 1.22,
-         [0.0, 0.16742212695726266, 1.7225325143019017, 1.8899546412591643, 0.0, 0.0]),
+         [0.0, 0.32228456810630046, 1.510894547632402,
+          1.8331791157387016, 0.0, 0.0]),
         (0.8, 1.0,
-         [0.0, 0.3125795340003781, 2.753124914356447, 3.0657044483568257, 0.0, 0.0]),
+         [0.0, 0.3661559666399792, 2.534715766627718,
+          2.9008717332676968, 0.0, 0.0]),
     ],
 }
+
+
+def test_v04_tcp_distance_matches_current_calibration():
+    assert eab.CAR_MODELS["v04"].tcp_distance == pytest.approx(0.548946367, abs=1e-12)
 
 
 @pytest.mark.parametrize("car", sorted(GOLDEN))
@@ -68,8 +74,7 @@ def test_fk_matches_arm_side_golden_vectors(car):
 
 
 def test_wrong_car_is_off_by_centimetres_not_millimetres():
-    """拿错车不是小数点级误差：同一组关节角，v0.3 链比 v0.4 链低 ~10cm、近 ~5cm。
-    这正是 0816_081524 报告里 TCP−accepted 两列 (−5.4, −8.6)cm 的来源。"""
+    """拿错车不是小数点级误差：当前 v0.4 黄金位形用 v0.3 链算会低约 12cm。"""
     pytest.importorskip("numpy")
     for x, z, q in GOLDEN["v04"]:
         good = eab.fk(q, car="v04")["tcp"]
