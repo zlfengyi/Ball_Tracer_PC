@@ -60,7 +60,11 @@ _WORLD_SCALE_M_PER_MM = 1.0 / 1000.0
 _HUBER_DELTA_PX = 3.0
 _VIEW_OUTLIER_MIN_PX = 4.0
 _VIEW_OUTLIER_RATIO = 2.5
-_YAW_MAX_REPROJECTION_ERROR_PX = 8.0
+_MAX_REPROJECTION_ERROR_PX = 8.0
+_CAR_X_BOUNDS_M = (-3.0, 3.0)
+_CAR_Y_BOUNDS_M = (0.0, 9.0)
+_CAR_MAX_SPEED_MPS = 4.0
+_CAR_JUMP_SLACK_M = 0.10
 # 单 tag 退化拟合时，冻结用的「最近一次双 tag yaw」允许多陈旧 (s)。
 # 车 yaw 变化慢：0811 场实测各定位空洞两端 yaw 差 1~5°/1.2~2.2s（≈3°/s 上界），
 # 0.5s 陈旧 ⇒ ~1.5°，经 tag0 的 0.42m 安装杠杆只值 ~11mm，比整帧丢定位好两个量级。
@@ -242,6 +246,7 @@ class CarLocalizer:
         # 单 tag 帧自己解出的 yaw 绝不回灌（否则误差会沿着退化链自我累积）。
         self._hold_yaw: Optional[float] = None
         self._hold_yaw_t: Optional[float] = None
+        self._last_accepted_loc: Optional[CarLoc] = None
         self.single_tag_frames = 0     # 诊断计数：走退化路径发出的帧数
 
     # 连续 N 次 raw 空而增强有效 → 切到「增强起手」；之后每 M 次回探一次 raw，
@@ -435,7 +440,7 @@ class CarLocalizer:
             yaw=None if fixed_yaw is not None else yaw,
             yaw_valid=(
                 fixed_yaw is None
-                and reprojection_error <= _YAW_MAX_REPROJECTION_ERROR_PX
+                and reprojection_error <= _MAX_REPROJECTION_ERROR_PX
                 and (len(tag_ids) >= 2 or len(cameras_used) >= 3)
             ),
             tag_ids=tag_ids,
@@ -500,9 +505,14 @@ class CarLocalizer:
         for fut in futures:
             all_dets[futures[fut]] = fut.result()
 
-        # 收集已配置 tag 的检测：{tag_id: {sn: CarDetection}}
+        # 收集已配置 tag 的检测：{tag_id: {sn: CarDetection}}。
+        # 同一相机同一车载 tag_id 出现多次时，该相机本帧的整条车体观测有歧义，
+        # 所有 tag 一起丢弃；绝不能让后一个检测静默覆盖前一个。
         tag_cameras: dict[int, dict[str, CarDetection]] = {}
         for sn, dets in all_dets.items():
+            configured_ids = [d.tag_id for d in dets if d.tag_id in self._tags]
+            if len(configured_ids) != len(set(configured_ids)):
+                continue
             for d in dets:
                 if d.tag_id in self._tags:
                     tag_cameras.setdefault(d.tag_id, {})[sn] = d
@@ -515,10 +525,9 @@ class CarLocalizer:
             result = self.estimate_car_pose(tag_cameras, t)
             # 离群剔除后有 tag 整块出局（如仅剩单视图且被剔）也算首选路径失败
             if result is not None and len(result.tag_ids) >= min_tags:
-                if result.yaw is not None and result.yaw_valid:
-                    self._hold_yaw = result.yaw
-                    self._hold_yaw_t = t
-                return result
+                # 已经形成首选解却没过最终质量门时，整帧拒绝；不能拿同一批污染
+                # 观测再绕进单 tag fallback。
+                return self._finalize_location(result, single_tag_fallback=False)
 
         if not single_tag_fallback:
             return None
@@ -528,7 +537,49 @@ class CarLocalizer:
             # 0.42m 杠杆，宁可不发，别用一个说不清误差的位置污染下游。
             return None
         result = self.estimate_car_pose(tag_cameras, t, fixed_yaw=yaw)
-        if result is not None:
+        if result is None:
+            return None
+        return self._finalize_location(result, single_tag_fallback=True)
+
+    def _finalize_location(
+        self,
+        result: CarLoc,
+        *,
+        single_tag_fallback: bool,
+    ) -> Optional[CarLoc]:
+        """最终 fail-closed 门；只有通过的结果才能刷新定位状态并向下游返回。"""
+        if not all(math.isfinite(value) for value in (
+            result.x, result.y, result.t, result.reprojection_error,
+        )):
+            return None
+        if result.yaw_valid and (
+            result.yaw is None or not math.isfinite(result.yaw)
+        ):
+            return None
+        if not (0.0 <= result.reprojection_error <= _MAX_REPROJECTION_ERROR_PX):
+            return None
+        if not (
+            _CAR_X_BOUNDS_M[0] <= result.x <= _CAR_X_BOUNDS_M[1]
+            and _CAR_Y_BOUNDS_M[0] <= result.y <= _CAR_Y_BOUNDS_M[1]
+        ):
+            return None
+
+        if self._last_accepted_loc is not None:
+            dt = result.t - self._last_accepted_loc.t
+            if dt <= 0.0:
+                return None
+            distance = math.hypot(
+                result.x - self._last_accepted_loc.x,
+                result.y - self._last_accepted_loc.y,
+            )
+            if distance > _CAR_JUMP_SLACK_M + _CAR_MAX_SPEED_MPS * dt:
+                return None
+
+        self._last_accepted_loc = result
+        if result.yaw is not None and result.yaw_valid:
+            self._hold_yaw = result.yaw
+            self._hold_yaw_t = result.t
+        if single_tag_fallback:
             self.single_tag_frames += 1
         return result
 

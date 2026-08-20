@@ -347,6 +347,101 @@ def test_locate_publishes_only_with_both_tags(tmp_path):
     assert result.tag_ids == [0, 1]
 
 
+def test_locate_drops_entire_camera_on_duplicate_tag_id(tmp_path):
+    localizer, dets = _make_case(
+        tmp_path,
+        x_m=0.3, y_m=2.2, yaw=0.1,
+        tag_cameras={0: ALL_CAMS, 1: ALL_CAMS},
+    )
+    images = _fake_locate_images(localizer, dets)
+    base_detect = localizer.detect
+    duplicate = _detection(1, dets[1]["cam3"].corners + 30.0)
+
+    def detect_with_duplicate(image):
+        found = list(base_detect(image))
+        if int(image[0, 0]) == 3:
+            found.append(duplicate)
+        return found
+
+    localizer.detect = detect_with_duplicate  # type: ignore[method-assign]
+
+    result = localizer.locate(images, t=100.0)
+
+    assert result is not None
+    assert set(result.cameras_used) == {"cam0", "cam1", "cam2"}
+    assert "cam3" not in result.corners_px
+
+
+def test_locate_rejects_final_reprojection_over_limit(tmp_path, monkeypatch):
+    localizer, dets = _make_case(
+        tmp_path,
+        x_m=0.3, y_m=2.2, yaw=0.1,
+        tag_cameras={0: ALL_CAMS, 1: ALL_CAMS},
+    )
+    images = _fake_locate_images(localizer, dets)
+
+    def uniformly_bad_fit(pose, units, free_yaw=True):
+        del free_yaw
+        component_error = 8.01 / math.sqrt(2.0)
+        return pose, np.full(len(units) * 8, component_error)
+
+    monkeypatch.setattr(localizer, "_fit_car_pose", uniformly_bad_fit)
+
+    assert localizer.locate(images, t=100.0) is None
+    assert localizer._last_accepted_loc is None
+    assert localizer._hold_yaw is None
+    assert localizer._hold_yaw_t is None
+
+
+@pytest.mark.parametrize(
+    ("x_m", "y_m"),
+    [(-3.01, 2.2), (3.01, 2.2), (0.3, -0.01), (0.3, 9.01)],
+)
+def test_locate_rejects_car_center_outside_field(
+    tmp_path, monkeypatch, x_m, y_m,
+):
+    localizer, dets = _make_case(
+        tmp_path,
+        x_m=0.3, y_m=2.2, yaw=0.1,
+        tag_cameras={0: ALL_CAMS, 1: ALL_CAMS},
+    )
+    candidate = localizer.estimate_car_pose(dets, t=100.0)
+    assert candidate is not None
+    candidate.x = x_m
+    candidate.y = y_m
+    monkeypatch.setattr(
+        localizer,
+        "estimate_car_pose",
+        lambda tag_detections, t=0.0, fixed_yaw=None: candidate,
+    )
+
+    assert localizer.locate(_fake_locate_images(localizer, dets), t=100.0) is None
+    assert localizer._last_accepted_loc is None
+
+
+def test_position_jump_gate_keeps_last_accepted_location(tmp_path):
+    localizer, make_dets = _case_factory(tmp_path)
+    first = _locate(localizer, make_dets(
+        x_m=0.3, y_m=2.2, yaw=0.1,
+        tag_cameras={0: ALL_CAMS, 1: ALL_CAMS}), t=100.0)
+    assert first is not None
+
+    # 0.1s 内 0.6m：允许量只有 0.10 + 4.0*0.1 = 0.5m，应拒绝且不污染锚点。
+    jumped = _locate(localizer, make_dets(
+        x_m=0.9, y_m=2.2, yaw=0.1,
+        tag_cameras={0: ALL_CAMS, 1: ALL_CAMS}), t=100.1)
+    assert jumped is None
+    assert localizer._last_accepted_loc is first
+    assert localizer._hold_yaw_t == pytest.approx(100.0)
+
+    # 相对同一个最后接受点，0.3s 内 0.6m 是物理可达的，重新允许。
+    recovered = _locate(localizer, make_dets(
+        x_m=0.9, y_m=2.2, yaw=0.1,
+        tag_cameras={0: ALL_CAMS, 1: ALL_CAMS}), t=100.3)
+    assert recovered is not None
+    assert localizer._last_accepted_loc is recovered
+
+
 def test_locate_rejects_single_tag_before_any_yaw_lock(tmp_path):
     """还没锁定过双 tag yaw 时，单 tag 帧一律不发：印面 0.161m 短基线的 yaw
     撑不住 0.42m 安装杠杆，宁可空着也不发一个说不清误差的位置。"""
