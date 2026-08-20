@@ -649,8 +649,9 @@ const rkMovZCoarse = rkFlights.flatMap(flight=>{
     flight[Math.round(i*(flight.length-1)/Math.max(1,count-1))]);
 }).sort((a,b)=>a.t-b.t);
 
-// PC 发布的小车位姿会原样进入 RK world 的 bot_x/bot_y/bot_yaw。
-// 用这些共同值拟合两台机器时钟的比例，避免把数分钟场次强行压成一个固定 offset。
+// PC 发布的小车位姿会进入 RK world 的 bot_x/bot_y/bot_yaw，但两侧记录的不是同一事件时刻：
+// PC 行是相机曝光时刻，RK world.t 是球时刻，bot_* 还是经过视觉处理、网络与状态保持后的历史值。
+// 因此这些共同值只配做 bias 粗定位，绝不能再拿来拟合时钟比例。报告合同固定 scale=1。
 const clockAnchor = (()=>{
   if(!RK || pcCarRows.length<20) return {scale:1,bias:null,anchors:0,mad:null};
   const wx=ys(RK.world,'bot_x'), wy=ys(RK.world,'bot_y'), wyaw=ys(RK.world,'bot_yaw');
@@ -677,42 +678,16 @@ const clockAnchor = (()=>{
   if(anchors.length<8) return {scale:1,bias:null,anchors:anchors.length,mad:null};
   const off0=median(anchors.map(row=>row.off));
   const offMad=median(anchors.map(row=>Math.abs(row.off-off0)));
-  // 真锚的离散只有 /pc_car_loc→bot_state 的管线延迟量级（几十 ms~0.3s）；
-  // 位姿键重复时 rkFirst 会配到错的一条，这些错锚能偏出 ±14s。它们把 offMad 顶到
-  // 秒级后 8×offMad 反而全放行，Theil–Sen 斜率被拖歪触发 scale 门、整组锚被丢弃
-  // （0809 场：offMad 1.81s → 放行 ±14.5s → scale 0.9864 → bias=null）。给硬上限。
+  // 位姿键重复时 rkFirst 会配到错的一条，这些错锚能偏出 ±14s；给偏移离群门硬上限。
   const maxDev=Math.min(0.5,Math.max(0.2,8*offMad));
   anchors=anchors.filter(row=>Math.abs(row.off-off0)<=maxDev).sort((a,b)=>a.rk-b.rk);
   if(anchors.length<8) return {scale:1,bias:null,anchors:anchors.length,mad:null};
-  // 钟漂 scale 需要长跨度 + 大量锚才有意义；锚少时**仍然交出 bias**——它只用来把
-  // 搜索窗收到 ±0.75s，精度由后面的 z 形状精锁负责。旧代码在这里用 <20 的硬门把整组
-  // 锚连同 bias 一起丢掉：0812_052638 场 14 条锚（MAD 45ms、够准）被丢 → 搜索退回全场
-  // ±130s → 在重复抛球形状里锁到错的一抛（z 形状误差 0.289m）。
-  if(anchors.length<20 || anchors[anchors.length-1].rk-anchors[0].rk<30){
-    const biasOnly=median(anchors.map(row=>row.off));
-    const madOnly=median(anchors.map(row=>Math.abs(row.off-biasOnly)));
-    return madOnly>0.25
-      ? {scale:1,bias:null,anchors:anchors.length,mad:madOnly}
-      : {scale:1,bias:biasOnly,anchors:anchors.length,mad:madOnly};
-  }
-  const fitRows=anchors.length<=400 ? anchors : Array.from({length:400},(_,i)=>
-    anchors[Math.round(i*(anchors.length-1)/399)]);
-  const span=fitRows[fitRows.length-1].rk-fitRows[0].rk;
-  const minSpan=Math.max(20,0.2*span);
-  const slopes=[];
-  for(let i=0;i<fitRows.length;i++){
-    for(let j=i+1;j<fitRows.length;j++){
-      const dt=fitRows[j].rk-fitRows[i].rk;
-      if(dt>=minSpan) slopes.push((fitRows[j].pc-fitRows[i].pc)/dt);
-    }
-  }
-  if(slopes.length<20) return {scale:1,bias:null,anchors:anchors.length,mad:null};
-  const scale=median(slopes);
-  if(Math.abs(scale-1)>0.005) return {scale:1,bias:null,anchors:anchors.length,mad:null};
-  const bias=median(fitRows.map(row=>row.pc-scale*row.rk));
-  const residualMad=median(fitRows.map(row=>Math.abs(row.pc-(scale*row.rk+bias))));
-  if(residualMad>0.08) return {scale:1,bias:null,anchors:anchors.length,mad:residualMad};
-  return {scale,bias,anchors:anchors.length,mad:residualMad};
+  // 只交出常数偏移来收窄搜索窗；亚帧精度由后面的逐抛 z 形状精锁负责。
+  const bias=median(anchors.map(row=>row.off));
+  const mad=median(anchors.map(row=>Math.abs(row.off-bias)));
+  return mad>0.25
+    ? {scale:1,bias:null,anchors:anchors.length,mad}
+    : {scale:1,bias,anchors:anchors.length,mad};
 })();
 
 // ===== 粗定位来源 ①：录制时直接量出来的 PC↔RK 时钟桥（最强，且不依赖本场有没有球）=====
@@ -755,10 +730,10 @@ const interpPcPose = t => {
   };
 };
 // 位姿残差：x/y 用米、yaw 用弧度加权 2（≈半个车长的端点位移量级）。同源时是 mm 级。
-const scorePose = (scale,bias,rows) => {
+const scorePose = (bias,rows) => {
   const dx=[], dy=[], dyaw=[];
   for(const row of rows){
-    const pc=interpPcPose(scale*row.t+bias);
+    const pc=interpPcPose(row.t+bias);
     if(pc.x!=null) dx.push(Math.abs(pc.x-row.x));
     if(pc.y!=null) dy.push(Math.abs(pc.y-row.y));
     if(pc.yaw!=null) dyaw.push(Math.abs(pc.yaw-row.yaw));
@@ -774,14 +749,13 @@ const POSE_LOCK_HALF_WIN=1.0;   // 实测最大 0.289s，留 3 倍余量；抛�
 const poseLock = (()=>{
   const empty={bias:null,err:null,n:0,span:null,usable:false};
   if(rkPoseRows.length<50||pcCarRows.length<50||pcCarYawRows.length<50) return empty;
-  const scale=clockAnchor.scale;
   const step=Math.max(1,Math.round(rkPoseRows.length/200));
   const sub=rkPoseRows.filter((_,i)=>i%step===0);
-  const lo=pcCarRows[0].t-scale*rkPoseRows[rkPoseRows.length-1].t-1;
-  const hi=pcCarRows[pcCarRows.length-1].t-scale*rkPoseRows[0].t+1;
+  const lo=pcCarRows[0].t-rkPoseRows[rkPoseRows.length-1].t-1;
+  const hi=pcCarRows[pcCarRows.length-1].t-rkPoseRows[0].t+1;
   const cands=[];
   for(let bias=lo;bias<=hi;bias+=0.1){
-    const s=scorePose(scale,bias,sub);
+    const s=scorePose(bias,sub);
     if(s) cands.push({bias,...s});
   }
   if(!cands.length) return empty;
@@ -794,7 +768,7 @@ const poseLock = (()=>{
   for(const [width,stepSize] of [[0.1,0.01],[0.01,0.002]]){
     let local=best;
     for(let bias=best.bias-width;bias<=best.bias+width+1e-9;bias+=stepSize){
-      const s=scorePose(scale,bias,sub);
+      const s=scorePose(bias,sub);
       if(s&&s.err<local.err) local={bias,...s};
     }
     best=local;
@@ -802,13 +776,13 @@ const poseLock = (()=>{
   return {bias:best.bias,err:best.err,n:best.n,span,usable:best.err<=POSE_LOCK_MAX_ERR};
 })();
 
-// 给定仿射时间映射 PC t = scale * RK t + bias，只比较每抛 z 形状；
+// 给定固定比例时间映射 PC t = RK t + bias，只比较每抛 z 形状；
 // 每抛独立去除固定高度偏差，再对各抛误差取中位数，长轨迹不会压过短轨迹。
-const scoreTimeMap = (scale,bias,rows) => {
+const scoreTimeMap = (bias,rows) => {
   const matches=pcFlights.map(()=>({dz:[], first:null, last:null}));
   let flightIdx=0;
   for(const row of rows){
-    const t=scale*row.t+bias;
+    const t=row.t+bias;
     while(flightIdx<pcFlights.length && t>pcFlights[flightIdx][pcFlights[flightIdx].length-1].t) flightIdx+=1;
     if(flightIdx>=pcFlights.length) break;
     const flight=pcFlights[flightIdx];
@@ -837,21 +811,20 @@ const windowSource = clockBridge.bias!=null ? 'bridge'
   : (poseLock.usable ? 'pose' : (clockAnchor.bias!=null ? 'anchor' : 'scan'));
 const estimateTimeMap = () => {
   const requiredFlights=windowSource==='scan'?3:2;
-  const empty={scale:clockAnchor.scale,bias:null,err:null,n:0,flights:0,
+  const empty={scale:1,bias:null,err:null,n:0,flights:0,
     anchors:clockAnchor.anchors,anchorMad:clockAnchor.mad,requiredFlights,
     windowSource,poseErr:poseLock.err,poseBias:poseLock.bias,
     bridgeBias:clockBridge.bias,margin:null};
   if(rkMovZ.length<30 || rkMovZCoarse.length<15 || pcFlights.length<requiredFlights) return empty;
-  const scale=clockAnchor.scale;
   const center=windowSource==='bridge'?clockBridge.bias
     :(windowSource==='pose'?poseLock.bias:clockAnchor.bias);
   const half=windowSource==='scan'?0.75
     :(windowSource==='anchor'?0.75:POSE_LOCK_HALF_WIN);
   const lo=center==null
-    ? Math.floor(pcRows[0].t-scale*rkMovZ[rkMovZ.length-1].t)-1
+    ? Math.floor(pcRows[0].t-rkMovZ[rkMovZ.length-1].t)-1
     : center-half;
   const hi=center==null
-    ? Math.ceil(pcRows[pcRows.length-1].t-scale*rkMovZ[0].t)+1
+    ? Math.ceil(pcRows[pcRows.length-1].t-rkMovZ[0].t)+1
     : center+half;
   const coarse=Math.max(0.005,Math.min(0.05,(hi-lo)/18000));
   // 窗由位姿/锚定死时用全部 RK 点粗扫（几百个候选，便宜）；只有退到全场 ±百秒扫描时
@@ -860,8 +833,8 @@ const estimateTimeMap = () => {
   const scanRows=narrow?rkMovZ:rkMovZCoarse;
   const cands=[];
   for(let bias=lo; bias<=hi+1e-4; bias+=coarse){
-    const s=scoreTimeMap(scale,bias,scanRows);
-    if(s) cands.push({scale,bias,...s});
+    const s=scoreTimeMap(bias,scanRows);
+    if(s) cands.push({scale:1,bias,...s});
   }
   if(!cands.length) return empty;
   // 覆盖门（抛数 ≥0.6×最大）是防全场扫描里「只靠少量重叠样本打分」的假谷用的
@@ -882,8 +855,8 @@ const estimateTimeMap = () => {
   const win=Math.max(0.04,coarse*3);
   let best=null;
   for(let bias=coarseBest.bias-win; bias<=coarseBest.bias+win+1e-4; bias+=0.0002){
-    const s=scoreTimeMap(scale,bias,rkMovZ);
-    if(s && s.flights>=minFlights && (!best || s.err<best.err)) best={scale,bias,...s};
+    const s=scoreTimeMap(bias,rkMovZ);
+    if(s && s.flights>=minFlights && (!best || s.err<best.err)) best={scale:1,bias,...s};
   }
   if(!best) return empty;
   return {...best,anchors:clockAnchor.anchors,anchorMad:clockAnchor.mad,requiredFlights,
@@ -896,7 +869,6 @@ const auto = RK ? estimateTimeMap() : {
   windowSource:'scan',poseErr:null,poseBias:null,bridgeBias:null,margin:null,
 };
 const presetBias = isNum(D.rk_time_bias_preset) ? Number(D.rk_time_bias_preset) : null;
-let rkScale=isNum(auto.scale)?auto.scale:1;
 // z 精锁失败时退到粗定位的 bias（时钟桥差几十 ms、位姿形状锁差 0.1~0.3s 管线延迟），
 // 而不是退到 0——退 0 等于把 RK 整条轨迹平移几十秒，页面上全是无意义的曲线。
 const fallbackBias = isNum(auto.bias) ? auto.bias
@@ -904,13 +876,13 @@ const fallbackBias = isNum(auto.bias) ? auto.bias
     : (clockBridge.bias!=null ? clockBridge.bias
       : (poseLock.usable ? poseLock.bias : null)));
 let rkBias=Math.round((presetBias!=null?presetBias:(isNum(fallbackBias)?fallbackBias:0))*10000)/10000;
-const rkToPc = t => isNum(Number(t)) ? rkScale*Number(t)+rkBias : null;
+const rkToPc = t => isNum(Number(t)) ? Number(t)+rkBias : null;
 // RK 轴是否真的对齐到了 PC（预置/精锁/时钟桥/位姿锁任一给出 bias）。全缺时 rkBias=0 只是
 // 「原样平移」，把 RK 数字标成 PC 是撒谎——显示侧须退回 RK 记法（0817 用户定：Car Move
 // 面板时间统一 PC 主显，逐帧侧栏仍保留 t(RK) 行供对 bag）。
 const rkAxisAligned = presetBias!=null || isNum(fallbackBias);
 const publishRkTimeMap = () => {
-  window.__rkTimeMap={scale:rkScale,bias:rkBias};
+  window.__rkTimeMap={scale:1,bias:rkBias};
 };
 publishRkTimeMap();
 window.__dbgAlign={
@@ -920,8 +892,8 @@ window.__dbgAlign={
   clockBridge:()=>clockBridge,
   clockAnchor:()=>clockAnchor,
   poseLock:()=>poseLock,
-  scorePose:(scale,bias)=>scorePose(scale,bias,rkPoseRows),
-  scoreTimeMap:(scale,bias)=>scoreTimeMap(scale,bias,rkMovZ),
+  scorePose:(bias)=>scorePose(bias,rkPoseRows),
+  scoreTimeMap:(bias)=>scoreTimeMap(bias,rkMovZ),
   auto:()=>auto,
 };
 // 有外部 bias 预置时由操作者承担锚点来源；否则必须同时通过轨迹形状、点数和抛数质量门。
@@ -935,7 +907,6 @@ const alignBad = !!RK && presetBias==null &&
    auto.flights<auto.requiredFlights ||
    (auto.windowSource==='scan' && auto.margin!=null && auto.margin<1.35));
 const windowSourceLabel = {bridge:'录制时时钟桥', pose:'位姿形状锁', anchor:'精确值锚', scan:'全场扫描'};
-const driftPpm=(rkScale-1)*1e6;
 const alignWarnHtml = alignBad
   ? `<div style="border:1px solid #e94560;background:rgba(233,69,96,0.12);color:#e94560;font-weight:600;border-radius:8px;padding:8px 12px;margin:0 0 10px">`+
     `⚠ PC↔RK 自动对齐不可信——本页所有跨轴内容（北极星表 / RK 轨迹叠加 / Arm 对齐）不可靠。<br>`+
@@ -959,7 +930,7 @@ const alignWarnHtml = alignBad
     `</span></div>`
   : (RK
     ? `<div style="font-size:11px;color:#7fbf9f;margin:0 0 6px">PC↔RK 对齐 ✓ `+
-      `PC t = ${rkScale.toFixed(8)} × RK t + ${rkBias.toFixed(4)}s（drift ${driftPpm>=0?'+':''}${driftPpm.toFixed(1)}ppm）`+
+      `PC t = RK t + ${rkBias.toFixed(4)}s（scale 固定为 1）`+
       (presetBias!=null
         ? `（--rk-time-bias 外部锚预置）`
         : `（粗定位 ${windowSourceLabel[auto.windowSource]||auto.windowSource}`+
@@ -1374,7 +1345,7 @@ window.__dbgPcTruth = {
 // ---- 臂侧共享数据 ----
 // v3 起臂数据与 RK 数据同钟（RK 单调钟绝对秒，extract_arm_bag.py 里由
 // header.stamp 经常数换算）：减 RK.t0 落到 RK 相对轴后，与 RK 轨迹/预测
-// 完全同轴 —— 全项目只有 PC/RK 两个时间轴，显示统一走 rkToPc 仿射映射。
+// 完全同轴 —— 全项目只有 PC/RK 两个时间轴，显示统一走 rkToPc 的 scale=1 常数偏移映射。
 // v2 旧文件（bag 接收轴）不再桥接：显示未对齐提示，重跑 extract_arm_bag.py 即可。
 const armAligned = !!(ARM && ARM.time_axis==='rk_mono_abs_s' && RK && isNum(RK.t0));
 if(armAligned){
@@ -3497,7 +3468,7 @@ buildPlots[4] = () => {
       return seg.join(' → ');
     });
     const axisInfo=(aligned
-      ? `Axis: PC report time（PC t = ${rkScale.toFixed(8)} × RK t + ${rkBias.toFixed(4)}s） &nbsp; `
+      ? `Axis: PC report time（PC t = RK t + ${rkBias.toFixed(4)}s，scale=1） &nbsp; `
       : 'Axis: arm data time（未对齐：需 v3 _arm.json + RK 数据） &nbsp; ') +
       (ARM.fk_source ? `FK: ${escA(ARM.fk_source)} &nbsp; ` : '') +
       (marks.length ? '| ' + marks.join(' &nbsp;|&nbsp; ') : '| no accepted commands');
@@ -3551,8 +3522,7 @@ buildPlots[5] = () => {
     const errText = auto.err==null ? 'n/a' : `${auto.err.toFixed(3)}m / ${auto.n} pts`;
     const srcText = presetBias!=null ? `preset bias ${presetBias.toFixed(4)}s; ` : '';
     info.innerHTML = (alignBad ? '<span style="color:#e94560;font-weight:700">⚠ 对齐不可信</span> ' : '')
-      + `PC t = ${rkScale.toFixed(8)} × RK t + ${rkBias.toFixed(4)}s; `+
-        `drift ${driftPpm>=0?'+':''}${driftPpm.toFixed(1)}ppm; ${srcText}auto z-shape ${errText}`;
+      + `PC t = RK t + ${rkBias.toFixed(4)}s; scale fixed 1; ${srcText}auto z-shape ${errText}`;
   };
   const tr = (series,key,name,axis,color,mode='markers',extra={}) => g2({
     x:shifted(ts(series)), y:ys(series,key), name, mode,
@@ -3724,7 +3694,6 @@ buildPlots[5] = () => {
   });
   const autoBtn = document.getElementById('rkAuto');
   if(autoBtn) autoBtn.addEventListener('click',()=>{
-    rkScale=isNum(auto.scale)?auto.scale:1;
     rkBias=Math.round((isNum(auto.bias)?auto.bias:0)*10000)/10000;
     if(input) input.value=rkBias.toFixed(4);
     redraw();
@@ -3765,7 +3734,6 @@ buildPlots[5] = () => {
   });
   const sigAuto = document.getElementById('rkSigAuto');
   if(sigAuto) sigAuto.addEventListener('click',()=>{
-    rkScale=isNum(auto.scale)?auto.scale:1;
     rkBias=Math.round((isNum(auto.bias)?auto.bias:0)*10000)/10000;
     if(input) input.value=rkBias.toFixed(4);
     redraw().then(syncSignalControls);
@@ -3989,8 +3957,7 @@ def main() -> None:
     parser.add_argument("--rk-tracking-json", default=None)
     parser.add_argument(
         "--rk-time-bias", type=float, default=None,
-        help="预置仿射时间映射的 bias（秒）；scale 仍由共享小车位姿自动估计。"
-             "页面 Auto align 按钮可恢复自动 bias。",
+        help="预置固定 scale=1 时间映射的 bias（秒）；页面 Auto align 按钮可恢复自动 bias。",
     )
     parser.add_argument("--output", default=None)
     parser.add_argument(

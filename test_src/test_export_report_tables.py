@@ -92,7 +92,7 @@ def test_export_runs_the_page_and_writes_both_products(tmp_path: Path):
 
     text = md_path.read_text(encoding="utf-8")
     assert "✓ 对齐可信" in text
-    assert "PC t = 1.00000000 × RK t + -11.7505 s" in text
+    assert "PC t = RK t + -11.7505 s（scale 固定为 1）" in text
     assert "| 1 | 90.5/-54.7 | accepted |" in text
     assert "Ball 3D: 473" in text
 
@@ -108,6 +108,16 @@ def test_export_flags_untrustworthy_alignment(tmp_path: Path):
     html_path.write_text(bad, encoding="utf-8")
     md_path, _ = export(html_path)
     assert "⚠ 对齐不可信" in md_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_export_flags_legacy_non_unit_scale(tmp_path: Path):
+    old = PAGE.replace("{scale:1, bias:-11.7505}", "{scale:0.9992, bias:-11.7505}")
+    assert old != PAGE
+    html_path = tmp_path / "tracker_old_scale.html"
+    html_path.write_text(old, encoding="utf-8")
+    md_path, _ = export(html_path)
+    assert "旧版报告使用非 1 scale" in md_path.read_text(encoding="utf-8")
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")

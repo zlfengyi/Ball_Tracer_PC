@@ -679,8 +679,8 @@ def draw_return_vector(
 # ---------------- RK bot 目标点叠加（每次抛球：小车当前位置 → 要去的目标点） ----------------
 # 目标点来自 <stem>_rk_tracking.json 的 bot_state（RK 相对时轴、与 PC 同名世界系）。
 # 时间对齐用共享小车位姿锚（RK world 的 bot_x/bot_y/bot_yaw 是 PC 发布位姿的回显，
-# 与报告 clockAnchor 同思路）：bias = median(pc_elapsed − rk_t)，scale 视为 1
-# （钟漂实测 ~1ms/min，整场 <0.5ms，对叠加可忽略）。锚不足或残差过大则跳过叠加。
+# 与报告的常数偏移合同一致）：bias = median(pc_elapsed − rk_t)，scale 固定为 1。
+# 场内真实频差只积累到几毫秒量级，对视频叠加忽略。锚不足或残差过大则跳过叠加。
 # 注意：锚匹配必须用 tracker 原始发布的 car_locs（RK 回显的就是它），
 # 要在 clear_car_results() 全帧重标之前完成。
 

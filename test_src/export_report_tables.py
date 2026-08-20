@@ -162,8 +162,12 @@ def _align_lines(align: dict) -> list[str]:
             "重新跑一次 `generate_curve3_html.py --input <run>.json` 即可拿到完整判定。",
             f"- 旧版字段原样: {json.dumps(auto, ensure_ascii=False)}",
         ]
+    non_unit_scale = (
+        isinstance(time_map.get("scale"), (int, float))
+        and abs(time_map["scale"] - 1.0) > 1e-12
+    )
     lines = [
-        f"- 时间映射: PC t = {fmt(time_map.get('scale'), 8)} × RK t + {fmt(time_map.get('bias'))} s",
+        f"- 时间映射: PC t = RK t + {fmt(time_map.get('bias'))} s（scale 固定为 1）",
         f"- 粗定位来源: {auto.get('windowSource')}"
         f"（时钟桥 bias={fmt(bridge.get('bias'))}/n={bridge.get('n')}"
         f"；位姿形状锁 bias={fmt(pose.get('bias'))}/残差={fmt(pose.get('err'))}/usable={pose.get('usable')}"
@@ -175,14 +179,19 @@ def _align_lines(align: dict) -> list[str]:
     if auto.get("margin") is not None:
         lines.append(f"- 全场扫描混叠余量 margin={fmt(auto.get('margin'), 2)}×（需 ≥1.35）")
     bad = (
+        non_unit_scale
+        or
         auto.get("bias") is None or auto.get("err") is None or auto.get("err") > 0.08
         or (auto.get("n") or 0) < (30 if auto.get("windowSource") == "scan" else 15)
         or (auto.get("flights") or 0) < (auto.get("requiredFlights") or 3)
         or (auto.get("windowSource") == "scan" and auto.get("margin") is not None
             and auto["margin"] < 1.35)
     )
-    lines.insert(0, "- 结论: " + ("⚠ 对齐不可信，本文件里所有跨轴数值都不要用"
-                                 if bad else "✓ 对齐可信"))
+    if non_unit_scale:
+        lines.insert(0, "- 结论: ⚠ 旧版报告使用非 1 scale，必须重新生成后再用")
+    else:
+        lines.insert(0, "- 结论: " + ("⚠ 对齐不可信，本文件里所有跨轴数值都不要用"
+                                     if bad else "✓ 对齐可信"))
     return lines
 
 

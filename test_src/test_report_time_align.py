@@ -167,13 +167,16 @@ def _run_estimate(
     return json.loads(result.stdout.strip().splitlines()[-1])
 
 
-def test_all_cross_axis_rendering_uses_affine_time_map():
+def test_all_cross_axis_rendering_uses_offset_only_time_map():
     source = SRC.read_text(encoding="utf-8")
-    assert "const rkToPc = t =>" in source
+    assert "const rkToPc = t => isNum(Number(t)) ? Number(t)+rkBias : null;" in source
     assert "const shifted = xs => xs.map(rkToPc);" in source
     assert "const ctPc=rkToPc(th.ref300T);" in source
     assert "const htPc=rkToPc(th.ref300Ht);" in source
     assert "armTcpRows.map(s=>rkToPc(s.t))" in source
+    assert "rkScale" not in source
+    assert "driftPpm" not in source
+    assert "scale*row.t" not in _align_core_js()
     assert "rkOffset" not in source
     assert "__rkOffset" not in source
 
@@ -204,15 +207,35 @@ def test_estimate_time_map_sub_millisecond_refinement(tmp_path):
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
-def test_estimate_time_map_recovers_clock_drift(tmp_path):
+def test_estimate_time_map_never_fits_clock_drift(tmp_path):
     obs, car, rk_data = _synth(
         -8.8222,
         scale=1.0004,
         noise_amplitude=0.0,
     )
+    anchor = _run_estimate(obs, car, rk_data, tmp_path, expr="clockAnchor")
     best = _run_estimate(obs, car, rk_data, tmp_path)
-    assert abs(best["scale"] - 1.0004) <= 2e-5, best
-    assert abs(best["bias"] + 8.8222) <= 0.002, best
+    assert anchor["scale"] == 1, anchor
+    assert best["scale"] == 1, best
+    assert best["err"] is not None and best["err"] < 0.05, best
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_pose_pipeline_age_cannot_create_a_clock_scale(tmp_path):
+    """共同 pose 值的两端时刻混有视觉/网络/状态保持年龄，斜率不得进入时间映射。"""
+    bias = -9.0693
+    obs, car, rk_data = _synth(bias, noise_amplitude=0.0)
+    for row in car:
+        row["elapsed_s"] = round(row["elapsed_s"] - 0.0008 * row["elapsed_s"], 6)
+
+    anchor = _run_estimate(obs, car, rk_data, tmp_path, expr="clockAnchor")
+    assert anchor["anchors"] >= 20, anchor
+    assert anchor["scale"] == 1, anchor
+
+    cfg = {"rk_clock_bridge": {"pc_minus_rk": bias + 0.020, "mad": 0.002, "n": 5000}}
+    best = _run_estimate(obs, car, rk_data, tmp_path, cfg=cfg)
+    assert best["scale"] == 1, best
+    assert abs(best["bias"] - bias) <= 0.01, best
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
@@ -240,9 +263,8 @@ def test_estimate_time_map_weights_flights_not_frames(tmp_path):
 def test_estimate_time_map_survives_contaminated_pose_anchors(tmp_path):
     """0809 场：多数共享位姿锚配错，把 offMad 顶到秒级，8×offMad 反而全放行。
 
-    错锚拖歪 Theil–Sen 斜率 → scale 门跳闸 → 整组锚被丢弃 → bias 搜索退回全场
-    ±250s，在重复抛球形状里锁到错的一抛（该场锁偏 4.2s，z 形状误差 0.248m）。
-    锚阶段必须靠硬上限把错锚滤掉，仍然交出可用的 scale/bias 来收窄搜索窗。
+    错锚会把 bias 搜索窗带离真解；锚阶段必须靠硬上限过滤，只交出常数 bias 收窄窗口，
+    绝不能再从这种管线年龄里拟合 scale。
     """
     bias = -10.11
     obs, car, rk_data = _synth(bias, noise_amplitude=0.0)
@@ -255,7 +277,7 @@ def test_estimate_time_map_survives_contaminated_pose_anchors(tmp_path):
 
     anchor = _run_estimate(obs, car, rk_data, tmp_path, expr="clockAnchor")
     assert anchor["bias"] is not None, anchor
-    assert abs(anchor["scale"] - 1.0) <= 1e-4, anchor
+    assert anchor["scale"] == 1, anchor
     assert abs(anchor["bias"] - bias) <= 0.05, anchor
     assert anchor["anchors"] >= 20, anchor
 
@@ -352,7 +374,7 @@ def test_clock_anchor_keeps_bias_when_anchors_are_few_but_tight(tmp_path):
 
     0812_052638 场只有 14 条锚（MAD 45ms，够把窗收到 ±0.75s），旧代码的 `<20` 硬门
     把 bias 连同锚一起丢掉 → 搜索退回全场 ±130s → 锁到错的一抛（z 形状误差 0.289m）。
-    锚少时只是不做钟漂拟合（scale 记 1），bias 照给。
+    位姿值锚无论多少都只做常数 bias 粗定位，scale 永远为 1。
     """
     bias = -11.75
     obs, car, rk_data = _synth(bias, noise_amplitude=0.0, exact_pose_every=30)
