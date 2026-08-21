@@ -7,7 +7,7 @@ from pathlib import Path
 from src.ros2_support import ROS2_ROOT
 from src.run_tracker import (
     CarLocJob,
-    _car_submit_latest,
+    _submit_latest,
     _infer_engine_batch_from_model_path,
     _infer_model_input_size_from_model_path,
     _report_tool_env,
@@ -140,8 +140,8 @@ def test_car_submit_latest_returns_stale_on_full_queue():
     stale = CarLocJob(frame_idx=10, exposure_pc=1.0, elapsed_s=0.0, images={})
     latest = CarLocJob(frame_idx=12, exposure_pc=2.0, elapsed_s=0.1, images={})
 
-    assert _car_submit_latest(job_queue, stale) is None
-    evicted = _car_submit_latest(job_queue, latest)
+    assert _submit_latest(job_queue, stale) is None
+    evicted = _submit_latest(job_queue, latest)
 
     queued = job_queue.get_nowait()
     assert evicted is stale

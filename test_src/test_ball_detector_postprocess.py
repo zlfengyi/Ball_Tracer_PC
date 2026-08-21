@@ -5,6 +5,8 @@ import math
 from pathlib import Path
 import sys
 
+import numpy as np
+
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _MODULE_PATH = _PROJECT_ROOT / "src" / "ball_detector.py"
@@ -39,6 +41,47 @@ def _det(
         y2=y2,
         label=label,
     )
+
+
+class _BulkOnlyTensor:
+    def __init__(self, values: list) -> None:
+        self._values = np.asarray(values, dtype=np.float32)
+        self.cpu_calls = 0
+
+    def __getitem__(self, index):
+        raise AssertionError("box tensors must be transferred in bulk")
+
+    def cpu(self):
+        self.cpu_calls += 1
+        return self
+
+    def numpy(self):
+        return self._values
+
+
+class _FakeBoxes:
+    def __init__(self) -> None:
+        self.xyxy = _BulkOnlyTensor([
+            [100.0, 200.0, 120.0, 224.0],
+            [300.0, 400.0, 330.0, 430.0],
+        ])
+        self.conf = _BulkOnlyTensor([0.75, 0.9])
+
+    def __len__(self) -> int:
+        return 2
+
+
+def test_parse_boxes_transfers_tensor_columns_in_bulk() -> None:
+    boxes = _FakeBoxes()
+    result = type("FakeResult", (), {"boxes": boxes})()
+
+    detections = BallDetector._parse_boxes(result)
+
+    assert boxes.xyxy.cpu_calls == 1
+    assert boxes.conf.cpu_calls == 1
+    assert np.allclose([det.confidence for det in detections], [0.9, 0.75])
+    assert detections[0].x == 315.0
+    assert detections[0].y == 415.0
 
 
 def test_postprocess_removes_near_identical_duplicates() -> None:

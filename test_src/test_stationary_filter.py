@@ -79,3 +79,36 @@ def test_history_is_kept_per_camera() -> None:
 
     assert detector_filter.classify("cam_a", [cam_a_det], 5.0)[0].label == STATIONARY_OBJECT_LABEL
     assert detector_filter.classify("cam_b", [cam_b_det], 5.0)[0].label == TENNIS_BALL_LABEL
+
+
+def test_neighboring_grid_cells_still_match_by_radius() -> None:
+    detector_filter = StationaryObjectFilter(
+        window_s=15.0,
+        radius_px=2.0,
+        min_occurrences=2,
+    )
+
+    first = FakeDetection(x=1.9, y=10.0)
+    second = FakeDetection(x=2.1, y=10.0)
+
+    assert detector_filter.classify("cam_a", [first], 0.0)[0].label == TENNIS_BALL_LABEL
+    assert detector_filter.classify("cam_a", [second], 1.0)[0].label == STATIONARY_OBJECT_LABEL
+
+
+def test_detections_in_same_frame_keep_insertion_order_semantics() -> None:
+    detector_filter = StationaryObjectFilter(
+        window_s=15.0,
+        radius_px=2.0,
+        min_occurrences=2,
+    )
+
+    labels = [
+        det.label
+        for det in detector_filter.classify(
+            "cam_a",
+            [FakeDetection(20.0, 30.0), FakeDetection(20.0, 30.0)],
+            0.0,
+        )
+    ]
+
+    assert labels == [TENNIS_BALL_LABEL, STATIONARY_OBJECT_LABEL]

@@ -281,12 +281,13 @@ class BallDetector:
         boxes = result.boxes
         if boxes is None or len(boxes) == 0:
             return detections
-        for i in range(len(boxes)):
-            x1, y1, x2, y2 = boxes.xyxy[i].cpu().numpy()
+        xyxy = boxes.xyxy.cpu().numpy()
+        confidences = boxes.conf.cpu().numpy()
+        for (x1, y1, x2, y2), confidence in zip(xyxy, confidences):
             detections.append(BallDetection(
                 x=float((x1 + x2) / 2.0),
                 y=float((y1 + y2) / 2.0),
-                confidence=float(boxes.conf[i].cpu()),
+                confidence=float(confidence),
                 x1=float(x1),
                 y1=float(y1),
                 x2=float(x2),

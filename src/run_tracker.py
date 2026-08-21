@@ -50,7 +50,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, TypeVar
 
 import cv2
 import numpy as np
@@ -283,11 +283,14 @@ class CarLocEvent:
     car_loc: Optional[CarLoc] = None
 
 
-def _car_submit_latest(
-    job_queue: queue.Queue[CarLocJob | None],
-    job: CarLocJob,
-) -> Optional[CarLocJob]:
-    """向 maxsize=1 的 car_loc 队列投递任务；队列满时弹出旧任务并返回。"""
+_QueueItem = TypeVar("_QueueItem")
+
+
+def _submit_latest(
+    job_queue: queue.Queue[_QueueItem | None],
+    job: _QueueItem,
+) -> Optional[_QueueItem]:
+    """非阻塞投递最新任务；队列满时弹出旧任务并返回。"""
     while True:
         try:
             job_queue.put_nowait(job)
@@ -298,7 +301,7 @@ def _car_submit_latest(
             except queue.Empty:
                 continue
             if stale is None:
-                raise RuntimeError("car_loc queue entered shutdown while submitting")
+                raise RuntimeError("queue entered shutdown while submitting")
             try:
                 job_queue.put_nowait(job)
                 return stale
@@ -2371,7 +2374,7 @@ def main() -> int:
 
                         if job.car_loc_sampled:
                             assert _car_job_queue is not None
-                            stale = _car_submit_latest(
+                            stale = _submit_latest(
                                 _car_job_queue,
                                 CarLocJob(
                                     frame_idx=job.frame_idx,
@@ -2423,6 +2426,27 @@ def main() -> int:
             signal.signal(signal.SIGBREAK, _signal_handler)
 
         # ── 主循环 ────────────────────────────────────────────────────
+        # Keep assembling synchronized groups while the main thread runs YOLO.
+        _capture_queue: queue.Queue[dict | None] = queue.Queue(maxsize=2)
+        _capture_stop = threading.Event()
+        _capture_drop_count = 0
+
+        def _capture_worker():
+            nonlocal _capture_drop_count
+            while not _capture_stop.is_set():
+                captured = cap.get_frames(timeout_s=0.1)
+                if captured is None:
+                    continue
+                if _submit_latest(_capture_queue, captured) is not None:
+                    _capture_drop_count += 1
+
+        _capture_thread = threading.Thread(
+            target=_capture_worker,
+            name="SyncCaptureWorker",
+            daemon=True,
+        )
+        _capture_thread.start()
+
         frame_idx = 0
         first_frame_exposure_pc: float | None = None
         t_start = time.perf_counter()
@@ -2448,7 +2472,10 @@ def main() -> int:
                     _stop_file.unlink(missing_ok=True)
                     break
                 _t_loop0 = time.perf_counter()
-                frames = cap.get_frames(timeout_s=1.0)
+                try:
+                    frames = _capture_queue.get(timeout=1.0)
+                except queue.Empty:
+                    frames = None
                 _t_capture_done = time.perf_counter()
                 if frames is None:
                     timeout_count += 1
@@ -2660,6 +2687,10 @@ def main() -> int:
 
         # ── 清理 ──
         processing_elapsed = time.perf_counter() - t_start
+        _capture_stop.set()
+        _capture_thread.join(timeout=2.0)
+        if _capture_thread.is_alive():
+            raise RuntimeError("capture worker did not finish before shutdown")
         _tile_decode_pool.shutdown(wait=True)
         # 先排空全图解码线，再关闭 car_loc / 视频消费者。
         if _full_job_queue is not None:
@@ -2854,6 +2885,7 @@ def main() -> int:
             "processing_duration_s": round(processing_elapsed, 3),
             "end_to_end_duration_s": round(total_elapsed, 3),
             "timeouts": timeout_count,
+            "capture_queue_dropped": _capture_drop_count,
             "observations_3d": len(log_observations),
             "predictions": len(log_predictions),
             "car_locs": len(log_car_locs),
@@ -2956,6 +2988,7 @@ def main() -> int:
         f"dropped={_full_drop_count}  "
         f"qmax={_full_queue_max_size}"
     )
+    print(f"  采集异步线: dropped={_capture_drop_count}")
     print(
         "  YOLO批量:   "
         f"engine_batch={engine_batch}  "

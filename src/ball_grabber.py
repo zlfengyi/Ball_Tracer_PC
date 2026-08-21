@@ -770,6 +770,7 @@ class ActionTriggerLoop(threading.Thread):
         *,
         stop_event: threading.Event,
         fps: float,
+        acquisition_frame_rate: float,
         device_key: int,
         group_key: int,
         group_mask: int,
@@ -779,11 +780,20 @@ class ActionTriggerLoop(threading.Thread):
         super().__init__(daemon=True, name="ActionTriggerLoop")
         self._stop_event = stop_event
         self._period = 1.0 / max(float(fps), 0.001)
+        self._minimum_period = (
+            1.0 / max(float(acquisition_frame_rate), 0.001) + 0.00025
+        )
         self._device_key = int(device_key)
         self._group_key = int(group_key)
         self._group_mask = int(group_mask)
         self._broadcast_address = str(broadcast_address)
         self._timeout_ms = int(timeout_ms)
+
+    def _next_trigger_time(self, previous_deadline: float, now: float) -> float:
+        scheduled_t = previous_deadline + self._period
+        if scheduled_t >= now + self._minimum_period:
+            return scheduled_t
+        return now + self._period
 
     def run(self) -> None:
         next_t = time.perf_counter()
@@ -806,9 +816,10 @@ class ActionTriggerLoop(threading.Thread):
             info.nSpecialNetIP = 0
             MvCamera.MV_GIGE_IssueActionCommand(info, results)
 
-            next_t += self._period
-            if now - next_t > 1.0:
-                next_t = now + self._period
+            # Preserve the requested cadence after ordinary wake-up jitter, but
+            # abandon catch-up when the next interval would exceed the camera's
+            # acquisition-rate limit and create a rejected trigger.
+            next_t = self._next_trigger_time(next_t, now)
 
 
 class SyncCapture:
@@ -945,6 +956,7 @@ class SyncCapture:
                 self._action_trigger = ActionTriggerLoop(
                     stop_event=self._stop,
                     fps=self._fps,
+                    acquisition_frame_rate=acquisition_frame_rate,
                     device_key=action_device_key,
                     group_key=action_group_key,
                     group_mask=action_group_mask,
