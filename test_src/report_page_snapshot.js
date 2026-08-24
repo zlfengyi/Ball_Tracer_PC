@@ -161,10 +161,11 @@ try {
 } catch (e) {
   align.error = String(e);
 }
+const armContract = context.__armHitContract || null;
 
 fs.writeFileSync(
   outPath,
-  JSON.stringify({ order: ORDER, captured: CAPTURED, align, error, tabErrors }),
+  JSON.stringify({ order: ORDER, captured: CAPTURED, align, armContract, error, tabErrors }),
   'utf-8',
 );
 console.log(JSON.stringify({

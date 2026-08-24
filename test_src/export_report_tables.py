@@ -235,6 +235,7 @@ def export(html_path: Path, *, node: str | None = None) -> tuple[Path, Path]:
     json_path.write_text(json.dumps({
         "source_html": html_path.name,
         "align": snap.get("align"),
+        "arm_contract": snap.get("armContract"),
         "sections": sections,
         "script_error": snap.get("error"),
         "tab_errors": snap.get("tabErrors"),

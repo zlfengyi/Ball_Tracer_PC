@@ -796,8 +796,9 @@ def test_ball_car_gap_measured_at_given_time_and_rejects_pollution(tmp_path):
 
 def test_main_pc_truth_and_aim_use_last_target_prediction_ht():
     source = SRC.read_text(encoding="utf-8")
-    assert "const targetPredHtPc=targetPred?rkToPc(targetPred.ht):null;" in source
-    assert "const targetTruth=targetPredHtPc!=null?pcTruthAt(targetPredHtPc):null;" in source
+    assert "const targetPredHtBaseline=targetPred?rkToPc(targetPred.ht):null;" in source
+    assert "const targetPredSamplePc=targetPred?pcSampleTimeForThrow(th,targetPred.ht):null;" in source
+    assert "const targetTruth=targetPredSamplePc!=null?pcTruthAt(targetPredSamplePc):null;" in source
     assert "const truth=pcTruthAt(htPc);" not in source
     # 0805 起：全量RK重估的第三个 ht 不再单列，击球误差改成两列空间量——
     # dy 是时序误差的空间形态，dx/dz 是末次 target 对应预测击球点与真值的落点差（两侧同轴同基准）
@@ -818,13 +819,13 @@ def test_main_pc_truth_and_aim_use_last_target_prediction_ht():
     assert "<th>HT真实(触球)<br>(s,PC轴)</th>" not in source
     assert "HT err@300<br>" not in source
     assert "'<td>'+htPc.toFixed(3)+'</td>'" not in source
-    assert "const truth=pcTruthAt(accHtPc);" in source
-    assert source.count("<td>'+pcTruthCell(targetTruth,true,targetPredHtPc)+'</td>") == 2
-    assert "<td>'+pcTruthCell(truth,false,accHtPc)+'</td>" in source
+    assert "const truth=accHtPcSample!=null?pcTruthAt(accHtPcSample):null;" in source
+    assert source.count("<td>'+pcTruthCell(targetTruth,true,targetPredSamplePc)+'</td>") == 2
+    assert "<td>'+pcTruthCell(truth,false,accHtPcSample)+'</td>" in source
     # 主表第二列 PC 真值：同一套拟合，评估时刻换成raw臂最后更新HT。
-    assert "const truthAcc=finalHt!=null?pcTruthAt(rkToPc(finalHt)):null;" in source
+    assert "const truthAcc=finalHtPcSample!=null?pcTruthAt(finalHtPcSample):null;" in source
     # 有/无末次 target 对应预测两条渲染路径都要出这一列（该列只依赖 accepted）
-    assert source.count("pcTruthCell(truthAcc,true,finalHt!=null?rkToPc(finalHt):null)") == 2
+    assert source.count("pcTruthCell(truthAcc,true,finalHtPcSample)") == 2
     # 空值必须带原因：取值时刻要传进单元格，否则 "—" 分不清缺小车位姿、缺球观测还是拟合没过门
     assert "const pcTruthCell = (f,withY=false,tPc=null) => {" in source
     assert "if(!f) return pcTruthMissCell(tPc);" in source
@@ -877,15 +878,16 @@ def test_rk300_table_merges_tcp_xyz_and_last_accepted_error():
     assert "mode=2 Coast" in source
     assert "armPredictionMatchesAccepted(p,e.t+RK.t0,rec.tx,rec.tz,dur)" in source
     headers = [
-        "最后改target t / 对应ct<br>(s,PC轴)</th>",
-        "<th>对应预测 HT<br>(s,PC轴)</th>",
+        "PC取样 zPhase<br>offset(ms)</th>",
+        "最后改target t / 对应ct<br>(s,global PC轴)</th>",
+        "<th>对应预测 HT<br>(s,global PC轴)</th>",
         "<th>对应预测击球 rel_x/z(cm)</th>",
         "<th>车RUN末帧 目标−实际 dx/dy(cm)<br>(RK世界系)</th>",
         "末次target对应预测车@HT−RUN末实际 dx/dy(cm)<br>(RK世界系)</th>",
         # 表头带悬停：本场回配成功率 + 自标定出来的臂端三个量（x 比例/z 偏移/提前量）
         "机械臂最后accepted目标 x/z(cm)</th>",
-        "<th>PC真值@对应预测HT x/y/z(cm)</th>",
-        "PC真值@臂最后更新HT x/y/z(cm)</th>",
+        "<th>PC真值@对应预测HT+zPhase x/y/z(cm)</th>",
+        "PC真值@臂最后更新HT+zPhase x/y/z(cm)</th>",
         "TCP−车心@臂最后更新HT x/y/z(cm,世界轴)<br>tcp−last accepted（dx，dz）</th>",
         "最后更新−挥拍起<br>(ms)</th>",
         "盲区 ht−ct@臂最后更新<br>(ms)</th>",
@@ -974,7 +976,7 @@ def test_rk300_table_merges_tcp_xyz_and_last_accepted_error():
     assert "(th.ref300CarX-runEnd.x)*100" not in source
     assert "(th.ref300CarY-runEnd.y)*100" not in source
     assert source.count("<td>'+targetPredCarError+'</td>") == 2
-    assert "const targetPredHt=targetPredHtPc!=null?targetPredHtPc.toFixed(3):'—';" in source
+    assert "const targetPredHt=targetPredHtBaseline!=null?targetPredHtBaseline.toFixed(3):'—';" in source
     assert "const targetPredHit=targetPred?tableXzCm(targetPred.relX,targetPred.relZ):'—';" in source
     assert source.count("<td>'+targetPredHt+'</td>") == 2
     assert source.count("<td>'+targetPredHit+'</td>") == 2
@@ -1086,25 +1088,17 @@ def test_rk_plot_uses_predict_hit_car_position_and_removes_old_traces():
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
-def test_visual_racket_fit_estimates_position_velocity_and_extrapolation_error(tmp_path):
-    core = _core("racket-fit-core-begin", "racket-fit-core-end")
+def test_visual_racket_bracket_keeps_nearest_raw_before_and_after(tmp_path):
+    core = _core("racket-bracket-core-begin", "racket-bracket-core-end")
     harness = (
-        "const isNum=v=>typeof v==='number'&&Number.isFinite(v);\n"
         f"{core}\n"
-        "const interp=[-0.15,-0.10,-0.05,0,0.05,0.10,0.15].map(t=>"
-        "({t,x:1+2*t+3*t*t,y:0,z:1.5-0.4*t+2*t*t}));\n"
-        "const extra=[-0.40,-0.35,-0.30,-0.25,-0.20,-0.15].map(t=>"
-        "({t,x:1+2*t,y:0,z:1.5-0.4*t}));\n"
-        "console.log(JSON.stringify({interp:fitVisualRacketRows(interp,0),"
-        "extra:fitVisualRacketRows(extra,0)}));\n"
+        "const rows=[-0.040,-0.020,-0.005,0.010,0.030,0.040].map(t=>({t}));\n"
+        "console.log(JSON.stringify({both:bracketVisualRacketRows(rows,0),"
+        "beforeOnly:bracketVisualRacketRows([{t:-0.006}],0)}));\n"
     )
     result = _run_node(tmp_path, harness)
 
-    assert result["interp"]["x"] == pytest.approx(1.0)
-    assert result["interp"]["z"] == pytest.approx(1.5)
-    assert result["interp"]["vx"] == pytest.approx(2.0)
-    assert result["interp"]["mode"] == "interpolation"
-    assert result["extra"]["x"] == pytest.approx(1.0)
-    assert result["extra"]["vx"] == pytest.approx(2.0)
-    assert result["extra"]["mode"] == "extrapolation"
-    assert result["extra"]["err"] == pytest.approx(0.225)
+    assert result["both"]["before"]["t"] == pytest.approx(-0.005)
+    assert result["both"]["after"]["t"] == pytest.approx(0.010)
+    assert result["beforeOnly"]["before"]["t"] == pytest.approx(-0.006)
+    assert result["beforeOnly"]["after"] is None

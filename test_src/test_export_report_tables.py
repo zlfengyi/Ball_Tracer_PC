@@ -40,6 +40,13 @@ const built = new Set();
 function ensurePlot(i){ if(built.has(i)) return; const b=buildPlots[i]; if(typeof b!=='function') return; b(); built.add(i); }
 window.ensurePlot = ensurePlot;
 window.__rkTimeMap = {scale:1, bias:-11.7505};
+window.__armHitContract = {schema:'arm_final_ht/v4', rkT0:123.0,
+  baselineTrusted:true,unmappedReportRows:[],
+  zPhasePolicy:{maxAbsOffsetMs:100,appliesTo:'all_pc_sampling',rkUse:'global_baseline'},
+  calibration:{zOff:-0.1471}, rows:[{reportRow:1,accepted:true,
+    finalHtPcBaselineElapsed:4.25,finalHtPcSampleElapsed:4.275,
+    zPhase:{usable:true,baselineTrusted:true,failureReason:null,
+      deltaS:.025,deltaMs:25,pcFlight:2,rkFlight:3}}]};
 window.__dbgAlign = {
   auto:()=>({scale:1,bias:-11.7505,err:0.018,n:166,flights:7,requiredFlights:2,
              windowSource:'pose',margin:null,anchors:14}),
@@ -84,6 +91,17 @@ def test_export_runs_the_page_and_writes_both_products(tmp_path: Path):
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     assert payload["script_error"] is None, payload["script_error"]
     assert payload["tab_errors"] == []
+    assert payload["arm_contract"]["schema"] == "arm_final_ht/v4"
+    assert payload["arm_contract"]["baselineTrusted"] is True
+    assert payload["arm_contract"]["unmappedReportRows"] == []
+    assert payload["arm_contract"]["calibration"]["zOff"] == pytest.approx(-0.1471)
+    row = payload["arm_contract"]["rows"][0]
+    assert row["finalHtPcBaselineElapsed"] == pytest.approx(4.25)
+    assert row["finalHtPcSampleElapsed"] == pytest.approx(4.275)
+    assert row["zPhase"]["deltaMs"] == pytest.approx(25)
+    assert row["zPhase"]["rkFlight"] == 3
+    assert row["zPhase"]["baselineTrusted"] is True
+    assert row["zPhase"]["failureReason"] is None
     # 懒加载的表（只有 sw(5) 才会建）必须被逼出来
     table = payload["sections"]["rk300Tbl"]["tables"][0]
     assert table["headers"] == ["#", "RK x/z(cm)", "备注"]

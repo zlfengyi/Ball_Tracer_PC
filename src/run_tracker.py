@@ -762,33 +762,10 @@ def _generate_post_run_artifacts(
             arm_json_path = candidate
             generated["arm_json"] = candidate
 
-    # ── 四目实测拍心（供报告「视觉拍心−车心」列）──
-    # 逐帧过 ≥3相机 / 刚体长轴 / 相机对分歧三道门，只写通过的观测；耗时随场次长度 1~6min，
-    # 默认关闭。已有同名侧车文件时即便本次不量也会喂给报告（方便手工先跑一遍）。
-    racket_json_path: Path | None = None
-    racket_candidate = json_path.with_name(f"{json_path.stem}_racket.json")
-    if measure_racket and video_path is not None and video_path.exists():
-        if _run_postprocess_command(
-            "Measure racket at HT",
-            [
-                python_exe,
-                str(_ROOT / "test_src" / "racket_ht_measure.py"),
-                "--input",
-                str(json_path),
-                "--video",
-                str(video_path),
-                "--output",
-                str(racket_candidate),
-            ],
-            env=report_env,
-        ) and racket_candidate.exists():
-            generated["racket_json"] = racket_candidate
-    if racket_candidate.exists():
-        racket_json_path = racket_candidate
+    html_path = json_path.with_suffix(".html")
 
-    if generate_html:
-        html_path = json_path.with_suffix(".html")
-        html_command = [
+    def html_command(racket_path: Path | None) -> list[str]:
+        command = [
             python_exe,
             str(_ROOT / "test_src" / "generate_curve3_html.py"),
             "--input",
@@ -797,12 +774,69 @@ def _generate_post_run_artifacts(
             str(html_path),
         ]
         if arm_json_path is not None:
-            html_command.extend(["--arm-json", str(arm_json_path)])
+            command.extend(["--arm-json", str(arm_json_path)])
         if rk_tracking_json_path is not None:
-            html_command.extend(["--rk-tracking-json", str(rk_tracking_json_path)])
-        if racket_json_path is not None:
-            html_command.extend(["--racket-json", str(racket_json_path)])
-        if _run_postprocess_command("Generate HTML", html_command, env=report_env):
+            command.extend(["--rk-tracking-json", str(rk_tracking_json_path)])
+        if racket_path is not None:
+            command.extend(["--racket-json", str(racket_path)])
+        return command
+
+    # ── V04 四相机固定黑标拍心（供报告「视觉拍心−车心」列）──
+    # 第一次报告给出逐抛 baseline+zPhase HT contract；测量只扫 HT±4 帧，第二次报告合入视觉侧车。
+    racket_json_path: Path | None = None
+    racket_candidate = json_path.with_name(f"{json_path.stem}_racket.json")
+    if measure_racket:
+        racket_candidate.unlink(missing_ok=True)
+        prerequisites = (
+            generate_html
+            and video_path is not None
+            and video_path.exists()
+            and arm_json_path is not None
+            and rk_tracking_json_path is not None
+            and car != "v03"
+        )
+        if not prerequisites:
+            print("[post] Skip fixed black-marker racket: V04 grid video/arm/RK/report missing")
+        else:
+            tables_path = html_path.with_name(f"{html_path.stem}_tables.json")
+            tables_path.unlink(missing_ok=True)
+        if prerequisites and _run_postprocess_command(
+            "Prepare racket HT contract", html_command(None), env=report_env
+        ):
+            measure_command = [
+                python_exe,
+                str(_ROOT / "test_src" / "racket_ht_black_marker.py"),
+                "--input",
+                str(json_path),
+                "--video",
+                str(video_path),
+                "--arm-json",
+                str(arm_json_path),
+                "--rk-tracking-json",
+                str(rk_tracking_json_path),
+                "--tables-json",
+                str(tables_path),
+                "--output",
+                str(racket_candidate),
+            ]
+            if (
+                tables_path.exists()
+                and _run_postprocess_command(
+                    "Measure V04 fixed black-marker racket",
+                    measure_command,
+                    env=report_env,
+                )
+                and racket_candidate.exists()
+            ):
+                racket_json_path = racket_candidate
+                generated["racket_json"] = racket_candidate
+    elif racket_candidate.exists():
+        racket_json_path = racket_candidate
+
+    if generate_html:
+        if _run_postprocess_command(
+            "Generate HTML", html_command(racket_json_path), env=report_env
+        ):
             generated["html"] = html_path
 
     if generate_annotated_video:
@@ -1876,8 +1910,7 @@ def main() -> int:
     post_run_annotated_video_no_racket = post_run_cfg.get(
         "annotated_video_no_racket", True
     )
-    # 四目实测拍心：默认关（要重跑一遍视频，1~6min）。开了报告北极星表就多一列
-    # 「视觉拍心−车心」，与 FK TCP 列同基准，两列相减即 FK 链偏差。
+    # V04 四相机固定黑标拍心：结束后按逐抛 baseline+zPhase HT 重扫视频并写入报告。
     post_run_measure_racket = bool(post_run_cfg.get("measure_racket", False))
 
     # ── 初始化组件 ──────────────────────────────────────────────────────

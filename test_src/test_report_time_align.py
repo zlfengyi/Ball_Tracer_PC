@@ -14,6 +14,8 @@ import pytest
 
 
 SRC = Path(__file__).resolve().parent / "generate_curve3_html.py"
+RUN_TRACKER = Path(__file__).resolve().parents[1] / "src" / "run_tracker.py"
+TRACKER_CONFIG = RUN_TRACKER.parent / "config" / "tracker.json"
 NODE = shutil.which("node")
 
 
@@ -167,18 +169,117 @@ def _run_estimate(
     return json.loads(result.stdout.strip().splitlines()[-1])
 
 
-def test_all_cross_axis_rendering_uses_offset_only_time_map():
+def test_throw_phase_changes_all_pc_sampling_but_not_rk_values():
     source = SRC.read_text(encoding="utf-8")
     assert "const rkToPc = t => isNum(Number(t)) ? Number(t)+rkBias : null;" in source
+    assert "const pcToRk =" not in source
     assert "const shifted = xs => xs.map(rkToPc);" in source
-    assert "const targetPredHtPc=targetPred?rkToPc(targetPred.ht):null;" in source
-    assert "const truthAcc=finalHt!=null?pcTruthAt(rkToPc(finalHt)):null;" in source
     assert "armTcpRows.map(s=>rkToPc(s.t))" in source
+    assert "const pcSampleTimeForThrow = (th,t) => {" in source
+    assert "const rkToPcForThrow" not in source
+    assert "const pcToRkForThrow" not in source
+    assert "const targetPredHtBaseline=targetPred?rkToPc(targetPred.ht):null;" in source
+    assert "const targetPredSamplePc=targetPred?pcSampleTimeForThrow(th,targetPred.ht):null;" in source
+    assert "const truthAcc=finalHtPcSample!=null?pcTruthAt(finalHtPcSample):null;" in source
+    assert "const visPcT=finalHtPcSample;" in source
+    assert "const visRkT=finalHt!=null&&visPcT!=null?finalHt+(visSrc.t-visPcT):null;" in source
+    assert "const hitAnchorPc=accHt!=null?pcSampleTimeForThrow(th,accHt)" in source
+    assert "const accHtPcBaseline=rkToPc(accHt);" in source
+    assert "const accHtPcSample=th?pcSampleTimeForThrow(th,accHt):null;" in source
+    assert "const result=accHtPcSample!=null?strikeAfter(accHtPcSample).verdict:'—';" in source
+    assert "if(!rkAxisAligned||!throwBaselineTrusted||!isNum(th.ht)) return empty;" in source
+    assert "appliesTo:'all_pc_sampling',rkUse:'global_baseline'" in source
+    assert "const faceYaw=faceAnglesWorldAt(finalHt);" in source
+    assert "faceAnglesWorldAt(finalHt,finalHtPcSample)" not in source
+    assert "baselineTrusted:throwBaselineTrusted" in source
+    assert "failureReason:zPhaseFailure" in source
+    assert "unmappedReportRows:throwPhases.filter(p=>p.rkFlight==null||p.pcFlight==null)" in source
+    assert "const phaseSummaryGood=reportThrows.length===0 ||" in source
     assert "rkScale" not in source
     assert "driftPpm" not in source
     assert "scale*row.t" not in _align_core_js()
+    assert "tHit" not in _align_core_js()
+    assert "finalHt" not in _align_core_js()
+    assert "pcReturnAt" not in _align_core_js()
     assert "rkOffset" not in source
     assert "__rkOffset" not in source
+
+
+def test_post_run_visual_racket_uses_v4_contract_flow():
+    source = RUN_TRACKER.read_text(encoding="utf-8")
+    config = json.loads(TRACKER_CONFIG.read_text(encoding="utf-8"))
+
+    assert '"racket_ht_black_marker.py"' in source
+    assert '"Prepare racket HT contract"' in source
+    assert '"--tables-json"' in source
+    assert "racket_candidate.unlink(missing_ok=True)" in source
+    assert '"racket_ht_measure.py"' not in source
+    assert config["post_run"]["measure_racket"] is True
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_estimate_flight_phase_recovers_distinct_throw_offsets(tmp_path):
+    global_bias = -8.8097
+    local_biases = [-8.8222, -8.7972]
+    obs, car, rk_data = _synth(global_bias, noise_amplitude=0.0)
+    starts = [10.0, 24.5]
+    durations = [1.08, 1.12]
+    for index, rk_t in enumerate(rk_data["world"]["t"]):
+        pc_t = rk_t + global_bias
+        for start, duration, local_bias in zip(starts, durations, local_biases):
+            if start - 1e-6 <= pc_t <= start + duration + 1e-6:
+                rk_data["world"]["t"][index] = round(pc_t - local_bias, 6)
+                break
+
+    result = _run_estimate(
+        obs,
+        car,
+        rk_data,
+        tmp_path,
+        expr=(
+            "[estimateFlightPhase(pcFlights[0],rkFlights[0],-8.8097),"
+            "estimateFlightPhase(pcFlights[1],rkFlights[1],-8.8097)]"
+        ),
+    )
+    assert all(row["usable"] for row in result), result
+    assert result[0]["offsetS"] == pytest.approx(local_biases[0] - global_bias, abs=0.001)
+    assert result[1]["offsetS"] == pytest.approx(local_biases[1] - global_bias, abs=0.001)
+    assert result[1]["offsetS"] - result[0]["offsetS"] == pytest.approx(0.025, abs=0.001)
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+@pytest.mark.parametrize(
+    "expr",
+    [
+        "estimateFlightPhase("
+        "Array.from({length:5},(_,i)=>({t:i*.03,z:i*.06})),"
+        "Array.from({length:5},(_,i)=>({t:i*.03,v:i*.06+.2})),0)",
+        "estimateFlightPhase("
+        "Array.from({length:31},(_,i)=>({t:i*.03,z:2*i*.03})),"
+        "Array.from({length:31},(_,i)=>({t:i*.03,v:2*i*.03+.2})),0)",
+    ],
+)
+def test_estimate_flight_phase_fails_closed_when_short_or_ambiguous(
+    tmp_path, expr
+):
+    obs, car, rk_data = _synth(0.0, noise_amplitude=0.0)
+    result = _run_estimate(obs, car, rk_data, tmp_path, expr=expr)
+    assert result["usable"] is False
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+@pytest.mark.parametrize(("offset_s", "usable"), [(0.099, True), (0.101, False)])
+def test_estimate_flight_phase_has_hard_100ms_limit(tmp_path, offset_s, usable):
+    obs, car, rk_data = _synth(0.0, noise_amplitude=0.0)
+    expr = (
+        "(()=>{const pc=Array.from({length:41},(_,i)=>{const t=i*.03;"
+        "return {t,z:.3+4*t-4.9*t*t};});"
+        f"const rk=pc.map(row=>({{t:row.t-{offset_s},v:row.z+.2}}));"
+        "return estimateFlightPhase(pc,rk,0);})()"
+    )
+    result = _run_estimate(obs, car, rk_data, tmp_path, expr=expr)
+    assert result["usable"] is usable, result
+    assert abs(result["offsetS"]) <= 0.1000001, result
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
