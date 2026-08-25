@@ -38,7 +38,6 @@ ROS2_BEST_EFFORT_DEPTH = 1
 ROS2_RELIABLE_TOPICS = frozenset(
     {
         "/predict_hit_pos",
-        "/racket_vz",
     }
 )
 

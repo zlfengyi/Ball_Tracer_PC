@@ -14,8 +14,6 @@ import pytest
 
 
 SRC = Path(__file__).resolve().parent / "generate_curve3_html.py"
-RUN_TRACKER = Path(__file__).resolve().parents[1] / "src" / "run_tracker.py"
-TRACKER_CONFIG = RUN_TRACKER.parent / "config" / "tracker.json"
 NODE = shutil.which("node")
 
 
@@ -195,6 +193,8 @@ def test_throw_phase_changes_all_pc_sampling_but_not_rk_values():
     assert "failureReason:zPhaseFailure" in source
     assert "unmappedReportRows:throwPhases.filter(p=>p.rkFlight==null||p.pcFlight==null)" in source
     assert "const phaseSummaryGood=reportThrows.length===0 ||" in source
+    assert "本抛局部PC↔RK bias" not in source
+    assert "逐抛局部对齐，质量不过门的跨轴格" not in source
     assert "rkScale" not in source
     assert "driftPpm" not in source
     assert "scale*row.t" not in _align_core_js()
@@ -203,18 +203,6 @@ def test_throw_phase_changes_all_pc_sampling_but_not_rk_values():
     assert "pcReturnAt" not in _align_core_js()
     assert "rkOffset" not in source
     assert "__rkOffset" not in source
-
-
-def test_post_run_visual_racket_uses_v4_contract_flow():
-    source = RUN_TRACKER.read_text(encoding="utf-8")
-    config = json.loads(TRACKER_CONFIG.read_text(encoding="utf-8"))
-
-    assert '"racket_ht_black_marker.py"' in source
-    assert '"Prepare racket HT contract"' in source
-    assert '"--tables-json"' in source
-    assert "racket_candidate.unlink(missing_ok=True)" in source
-    assert '"racket_ht_measure.py"' not in source
-    assert config["post_run"]["measure_racket"] is True
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")

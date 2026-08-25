@@ -89,12 +89,52 @@ def _merge_racket_json(base_data: dict, racket_data: dict, racket_json_path: str
     return merged
 
 
+def _merge_racket_impact_json(
+    base_data: dict,
+    impact_data: dict,
+    impact_json_path: str | None,
+    tracker_json_path: str,
+) -> dict:
+    schema = impact_data.get("schema")
+    if schema != "racket_impact/v3":
+        raise ValueError(
+            "racket impact sidecar schema mismatch: "
+            f"expected 'racket_impact/v3', got {schema!r}"
+        )
+    measurements = impact_data.get("racket_impact")
+    if not isinstance(measurements, list):
+        raise ValueError("racket impact sidecar must contain a racket_impact array")
+    expected_metadata = {
+        "control_usage": "record_only",
+        "frame_time_semantics": "mosaic_group_mean_exposure_center_pc_perf_counter",
+        "vz_semantics": "racket_head_bbox_center_world_velocity_proxy",
+    }
+    for key, expected in expected_metadata.items():
+        if impact_data.get(key) != expected:
+            raise ValueError(
+                f"racket impact sidecar {key} mismatch: "
+                f"expected {expected!r}, got {impact_data.get(key)!r}"
+            )
+    source = impact_data.get("source")
+    source_tracker = source.get("tracker_json") if isinstance(source, dict) else None
+    if (
+        not isinstance(source_tracker, str)
+        or Path(source_tracker).resolve() != Path(tracker_json_path).resolve()
+    ):
+        raise ValueError("racket impact sidecar tracker source mismatch")
+    merged = copy.deepcopy(base_data)
+    merged["racket_impact"] = copy.deepcopy(measurements)
+    if impact_json_path:
+        merged.setdefault("config", {})["racket_impact_json_path"] = str(impact_json_path)
+    return merged
+
+
 def _add_face_angles(arm, *, tracker_json_path: str | None = None, car: str | None = None) -> None:
-    """给 arm.states 逐帧附加 fy/fp/vt，并按本场车型复算 TCP。
+    """给 arm.states 逐帧附加 fy/fp/v_tcp_arm，并按本场车型复算 TCP。
 
     fy/fp = FK 拍面法向（该车 link6 系的法向轴，前向规范化）在臂系的
     yaw（°，atan2(x,y) 口径，与 PC回球 yaw 同式）与 pitch（°，asin(n_z)，正=开面上仰），
-    vt = 拍心线速度大小（m/s）。
+    v_tcp_arm = 拍心相对机械臂基座的三维线速度（m/s，臂系）。
     单源复用 extract_arm_bag.fk（0801 dz/yawrate 分析脚本同一公式），不在 JS 里抄第二份 FK 链。
 
     **车型**：v0.3 与 v0.4 是两台不同的臂，TCP 差几厘米（见 extract_arm_bag 文件头）。
@@ -104,10 +144,10 @@ def _add_face_angles(arm, *, tracker_json_path: str | None = None, car: str | No
     所选车型自洽，不必为了改车型重跑 rosbag 提取。
     **pitch 不需要减车 yaw**：J1/BASE_ROT 都是纯 z（垂直）转，只搬 n 的水平分量、不动 n_z，
     故臂系 pitch ≡ 世界 pitch（车无 roll/pitch 前提），比 yaw 少一个误差源。
-    **vt 走解析 Jacobian**：同一次 fk 已经给出每个关节的 joint_frames，转轴 a_j=R_j·axis、
+    **v_tcp_arm 走解析 Jacobian**：同一次 fk 已经给出每个关节的 joint_frames，转轴 a_j=R_j·axis、
     轴上一点 o_j=p_j 都是现成的，故 v_tcp = Σ_j q̇_j·(a_j×(p_tcp−o_j))——与 6 次数值差分
-    逐分量一致到 1e-6，但只需一次 FK（差分要 7 次，整场多花 ~30s）。速度大小与车 yaw 无关
-    （纯 z 转不改模长），故 vt 同时是臂系值与世界系值。缺 velocity 的帧只出 fy/fp。
+    逐分量一致到 1e-6，但只需一次 FK（差分要 7 次，整场多花 ~30s）。必须保留三维向量，
+    后续才能与同刻车体平移及 yaw 刚体速度做世界系向量合成。缺 velocity 的帧只出 fy/fp。
     关节残缺（None 或非 6 关节）时跳过该帧，报告列显示 —。
     导入失败不让整份报告挂掉，但必须打到 stderr：2026-08-05 前 run_tracker 的
     post-run 把 ROS2 pixi 的 site-packages 留在 PYTHONPATH 里，子进程 import numpy
@@ -182,13 +222,14 @@ def _add_face_angles(arm, *, tracker_json_path: str | None = None, car: str | No
             frame = res["joint_frames"][joint["name"]]
             axis = frame[:3, :3] @ joint["axis"]
             vel += rate * _np.cross(axis, tcp - frame[:3, 3])
-        s["vt"] = round(float(_np.linalg.norm(vel)), 4)
+        s["v_tcp_arm"] = [round(float(v), 4) for v in vel]
 
 
 def generate_html(
     input_path: str,
     output_path: str,
     racket_json_path: str | None = None,
+    racket_impact_json_path: str | None = None,
     arm_json_path: str | None = None,
     rk_tracking_json_path: str | None = None,
     rk_time_bias: float | None = None,
@@ -197,6 +238,11 @@ def generate_html(
     data = _load_json(input_path)
     if racket_json_path:
         data = _merge_racket_json(data, _load_json(racket_json_path), racket_json_path)
+    impact_path = racket_impact_json_path
+    if impact_path:
+        data = _merge_racket_impact_json(
+            data, _load_json(impact_path), impact_path, input_path
+        )
     if arm_json_path:
         data["arm"] = _load_json(arm_json_path)
         _add_face_angles(data["arm"], tracker_json_path=input_path)
@@ -367,7 +413,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;b
 <div id="p5" class="pnl on">
   <div class="cc">
     <div class="rkCtl"><span>RK time bias(s)</span><input id="rkOff" type="number" step="0.0001" value="0"><button type="button" class="zb" id="rkApply">Apply</button><button type="button" class="zb" id="rkAuto">Auto align</button><span id="rkInfo"></span></div>
-    <div class="rkCoordNote"><b>坐标说明：</b>PC真值 x/y = 拟合球世界 x/y − 同时刻插值车世界 x/y，采用世界坐标轴，不随车体 yaw 旋转（0731 起全表统一世界系；rel_x/rel_z 列除外，那是臂端车体系合同值）。PC S1 以同抛最后一条 RK S0 世界 y 为相会面，沿原 PC S1 drag 状态重求 x/z/HT/v；交点落到地面下时不显示。</div>
+    <div class="rkCoordNote"><b>坐标说明：</b>PC真值采用世界坐标轴，不随车体 yaw 旋转。x = 拟合球心 world_x − 同时刻插值车体中心 world_x；y 默认是球心 world_y − 车体中心 world_y，仅“PC真值@对应预测HT”列的 y 显示球接触面，即 (球心 world_y − R球3.3cm) − 车体中心 world_y。PC S1 以同抛最后一条 RK S0 世界 y 为相会面，沿原 PC S1 drag 状态重求 x/z/HT/v；交点落到地面下时不显示。</div>
     <div class="armEv" id="rk300Tbl" style="padding:0 0 4px"></div>
     <div class="lc" id="l5"></div><div class="zt"><span class="ztl">X zoom / click plot + wheel</span><button type="button" class="zb" data-plot="c5" data-action="out">X-</button><button type="button" class="zb on" data-plot="c5" data-action="reset">Reset</button><button type="button" class="zb" data-plot="c5" data-action="in">X+</button><span id="c5r" class="zr">1.00x</span></div><div class="zx"><div id="c5" class="cb"></div></div>
   </div>
@@ -682,7 +728,7 @@ const clockAnchor = (()=>{
   const maxDev=Math.min(0.5,Math.max(0.2,8*offMad));
   anchors=anchors.filter(row=>Math.abs(row.off-off0)<=maxDev).sort((a,b)=>a.rk-b.rk);
   if(anchors.length<8) return {scale:1,bias:null,anchors:anchors.length,mad:null};
-  // 只交出常数偏移来收窄搜索窗；亚帧精度由后面的逐抛 z 形状精锁负责。
+  // 只交出常数偏移来收窄搜索窗；后面的逐抛 z 形状精锁按约 ±10ms 口径报质量。
   const bias=median(anchors.map(row=>row.off));
   const mad=median(anchors.map(row=>Math.abs(row.off-bias)));
   return mad>0.25
@@ -968,7 +1014,7 @@ let throwBaselineTrusted = presetBias!=null || clockBridge.bias!=null || poseLoc
 const windowSourceLabel = {bridge:'录制时时钟桥', pose:'位姿形状锁', anchor:'精确值锚', scan:'全场扫描'};
 const alignWarnHtml = alignBad
   ? `<div style="border:1px solid #e94560;background:rgba(233,69,96,0.12);color:#e94560;font-weight:600;border-radius:8px;padding:8px 12px;margin:0 0 10px">`+
-    `⚠ PC↔RK 自动对齐不可信——本页所有跨轴内容（北极星表 / RK 轨迹叠加 / Arm 对齐）不可靠。<br>`+
+    `⚠ PC↔RK 全局自动对齐不可信——总览叠加不可靠；只有 baseline 身份可信的抛球才尝试PC取样 zPhase，质量不过门隐藏所有依赖该PC取样的格（含视觉），RK字段不受影响。<br>`+
     `<span style="font-weight:400">`+
     `① 粗定位：时钟桥 ${clockBridge.bias!=null?`✓ bias ${clockBridge.bias.toFixed(3)}s（${clockBridge.n} 样本）`
       :`✗ ${clockBridge.n?`抖动 ${clockBridge.mad==null?'n/a':clockBridge.mad.toFixed(3)}s 过大`:'本场未录（0812 前的场次没有这个字段）'}`}；`+
@@ -998,11 +1044,17 @@ const alignWarnHtml = alignBad
           (auto.windowSource==='anchor'?` ${auto.anchors} 条`:'')+
           (auto.windowSource==='scan'&&auto.margin!=null?` 次优比 ${auto.margin.toFixed(2)}×`:'')+
           `；z 形状 ${auto.err.toFixed(3)}m / ${auto.n} 点 / ${auto.flights} 抛）`)+
-      `——对齐可信时，表内 Δt/dx/dz 的偏差应解读为预测/执行误差而非错轴。</div>`
+      `——此全局 bias 供所有RK显示；每抛 zPhase 给所有PC取样（含视觉）加一个小offset。</div>`
     : '');
 const rkPredStage = RK ? ys(RK.pred,'stage') : [];
 const rkPredDurMs = (RK ? ys(RK.pred,'duration') : []).map(v=>isNum(v)?v*1000:null);
 const rkPredNFit = RK ? ys(RK.pred,'n_bounce_fit') : [];
+const rkPredRacketVz = RK ? ys(RK.pred,'rvz') : [];
+const rkPredCorXyEff = RK ? ys(RK.pred,'cor_xy_eff') : [];
+const rkPredCorEff = RK ? ys(RK.pred,'cor_eff') : [];
+const rkPredCorMeasReplay = RK ? ys(RK.pred,'cor_meas_replay') : [];
+const rkPredCxyMeasReplay = RK ? ys(RK.pred,'cxy_meas_replay') : [];
+const rkPredCorMeasClosureMs = RK ? ys(RK.pred,'cor_meas_closure_ms') : [];
 // 分抛：按 ht_rel 聚类 RK 预测消息；ref300* 字段严格来自同一条、提前量最接近 300ms 的 S1 消息。
 // [[rk300-contract-core-begin]]
 const REF_LEAD_TARGET=0.3;
@@ -1022,8 +1074,18 @@ const rkThrows = (()=>{
       th.ht=ht[i]; th.lastT=ti; th.lastIdx=i; th.msgs=(th.msgs||0)+1;
       if(Number(rkPredStage[i])===0 && isNum(worldY[i])){
         th.lastS0Y=worldY[i]; th.lastS0T=ti; th.lastS0Idx=i;
+        th.lastS0Rvz=isNum(rkPredRacketVz[i])?rkPredRacketVz[i]:null;
+        th.lastS0CorXyEff=isNum(rkPredCorXyEff[i])?rkPredCorXyEff[i]:null;
+        th.lastS0CorEff=isNum(rkPredCorEff[i])?rkPredCorEff[i]:null;
       } else if(Number(rkPredStage[i])===1){
         th.hasS1=true;
+        if(!isNum(th.corMeasReplay) && isNum(rkPredCorMeasReplay[i]) &&
+           isNum(rkPredCxyMeasReplay[i])){
+          th.corMeasReplay=rkPredCorMeasReplay[i];
+          th.cxyMeasReplay=rkPredCxyMeasReplay[i];
+          th.corMeasClosureMs=isNum(rkPredCorMeasClosureMs[i])?rkPredCorMeasClosureMs[i]:null;
+          th.corMeasIdx=i;
+        }
       }
       if(isNum(relx[i])&&isNum(rely[i])&&isNum(relz[i])){
         th.stage=rkPredStage[i]; th.rel_x=relx[i]; th.rel_y=rely[i]; th.rel_z=relz[i];
@@ -1049,7 +1111,10 @@ const rkThrows = (()=>{
                 ref300Stage:null, ref300X:null, ref300Y:null, ref300Z:null, ref300T:null, ref300Ht:null,
                 ref300Xw:null, ref300CarX:null, ref300CarY:null,
                 ref300Lead:null, ref300LeadDev:null, ref300NFit:null, ref300Idx:null,
-                lastS0Y:null, lastS0T:null, lastS0Idx:null, hasS1:false};
+                lastS0Y:null, lastS0T:null, lastS0Idx:null,
+                lastS0Rvz:null, lastS0CorXyEff:null, lastS0CorEff:null,
+                corMeasReplay:null,cxyMeasReplay:null,corMeasClosureMs:null,corMeasIdx:null,
+                hasS1:false};
       upd(th);
       out.push(th);
     }
@@ -1404,7 +1469,8 @@ window.__dbgPcTruth = {
 // ---- 臂侧共享数据 ----
 // v3 起臂数据与 RK 数据同钟（RK 单调钟绝对秒，extract_arm_bag.py 里由
 // header.stamp 经常数换算）：减 RK.t0 落到 RK 相对轴后，与 RK 轨迹/预测
-// 完全同轴 —— 全项目只有 PC/RK 两个时间轴，显示统一走 rkToPc 的 scale=1 常数偏移映射。
+// 完全同轴 —— 全项目只有 PC/RK 两个时间轴；RK显示与臂数据只走全局 rkToPc，
+// 所有逐抛 PC 取样查询（含视觉）额外使用同抛 scale=1 zPhase offset。
 // v2 旧文件（bag 接收轴）不再桥接：显示未对齐提示，重跑 extract_arm_bag.py 即可。
 const armAligned = !!(ARM && ARM.time_axis==='rk_mono_abs_s' && RK && isNum(RK.t0));
 if(armAligned){
@@ -1594,8 +1660,8 @@ const statusNum = (text,key) => {
   return m?Number(m[1]):null;
 };
 const _armHit = (()=>{
-  if(!ARM) return {marks:[], zOff:null, nAcc:0, nMatch:0};
-  const out=[], zOffs=[];
+  if(!ARM) return {marks:[], nAcc:0, nMatch:0};
+  const out=[];
   let nAcc=0, nMatch=0;
   // late ht saved 状态只写 duration、不写 ht，必须回配到原 /predict_hit_pos 才拿得到原始 ht。
   // 回配一律走序号对齐（[[arm-pred-align-core]]）：两个 topic 各自保序但**跨 topic 的 bag
@@ -1643,9 +1709,13 @@ const _armHit = (()=>{
            //   speed=     0808 起恒带的计划触球拍速（m/s，拍心），已过各级钳位
            //   speed_req= 钳位改动了拍速时补的原始指令值；shortened= 引拍被夹掉的 rad
            //   face_yaw=  臂端锁面目标（rad，臂系）
-           tgtPitch:statusNum(e.text,'pitch'), tgtSpeed:statusNum(e.text,'speed'),
-            tgtSpeedReq:statusNum(e.text,'speed_req'), shortened:statusNum(e.text,'shortened'),
-            tgtFaceYaw:statusNum(e.text,'face_yaw'), tgtYawExtraDeg:statusNum(e.text,'yaw_extra'),
+            tgtPitch:statusNum(e.text,'pitch'), tgtSpeed:statusNum(e.text,'speed'),
+             tgtSpeedReq:statusNum(e.text,'speed_req'), shortened:statusNum(e.text,'shortened'),
+             tgtFaceYaw:statusNum(e.text,'face_yaw'),
+             tgtOutYaw:statusNum(e.text,'out_yaw'),
+             tgtOutPitch:statusNum(e.text,'out_pitch'),
+             tgtOutSpeed:statusNum(e.text,'out_speed'),
+             tgtOutReplay:statusNum(e.text,'out_replay')===1,
            wx:null, wy:null, wz:null, wxw:null, wcarx:null, wct:null, wht:null, wpredT:null, wstage:null, wnFit:null};
       nAcc+=1;
       let hit=armPredForStatus(s,dur);                      // ① 序号键
@@ -1671,7 +1741,6 @@ const _armHit = (()=>{
         rec.wxw=isNum(hit.xWorld)?hit.xWorld:null; rec.wcarx=isNum(hit.carPredX)?hit.carPredX:null;
         rec.wpredT=hit.t; rec.wstage=hit.stage; rec.wnFit=hit.nFit;
         nMatch+=1;
-        if(isNum(hit.rel_z)) zOffs.push(rec.tz-hit.rel_z);
       }
     } else {
       m=/^accepted arm_command (\w+) duration=([0-9.]+)/.exec(e.text);
@@ -1688,7 +1757,7 @@ const _armHit = (()=>{
     }
   });
   // 逐拍保留最后进入 update_ht() 的 raw HT/CT，供预测盲区账使用；它不是 executed profile HT。
-  // TCP−accepted 的机械执行误差另由 /joint_states FK 穿越 controller accepted 击球平面求值。
+  // TCP 列严格在这个 raw HT 取 /joint_states FK；不另找过面时刻。
   // 旧版无 sweep_w 日志仍保留一次性触发的剩余时间门。raw HT/CT 回配失败时不退 accepted 冒充。
   out.forEach(h=>{
     if(h.label!=='hit') return;
@@ -1707,8 +1776,7 @@ const _armHit = (()=>{
     const ok=continuousSweep || last.hitTime-trig>=SWING_HT_UPDATE_MIN_REMAINING_SEC;
     h.lastUpdateT=last.t;
     const nCoast=continuousSweep?lates.filter(x=>x.mode===2).length:0;
-    h.sweepCoast=nCoast>0;
-    h.reswing={trig, ok, continuousSweep, n:lates.length, nCoast, lastMode:last.mode,
+    h.reswing={trig, ok, continuousSweep, n:lates.length, nCoast,
                oldDone:h.done, newDone:last.hitTime,
                delta:(last.hitTime-h.done)*1000, remain:last.hitTime-trig,
                ht:last.ht, ct:last.ct};
@@ -1720,12 +1788,10 @@ const _armHit = (()=>{
       }
     }
   });
-  zOffs.sort((a,b)=>a-b);
-  return {marks:out, zOff:zOffs.length?zOffs[zOffs.length>>1]:null, nAcc, nMatch};
+  return {marks:out, nAcc, nMatch};
 })();
 // [[arm-swing-ht-core-end]]
 const armHitMarks = _armHit.marks;
-const armZOff = _armHit.zOff;  // 臂系 z − 世界系 z；FK 还原世界系 = tcp_z − armZOff
 // 本页 TCP 用的是哪台车的 FK 链（Python _add_face_angles 按 arm JSON 的 car / 本场 tracker
 // JSON 的 car_config_path 定，并按它复算过 tcp）。两台车的臂不同，这条必须显示在 TCP 列上。
 const armFkCarNote = ARM
@@ -1769,62 +1835,67 @@ const tcpAt = t => {
   if(!s || !Array.isArray(s.a.tcp) || !Array.isArray(s.b.tcp)) return null;
   return [0,1,2].map(k=>lerp(s.a.tcp[k],s.b.tcp[k],s.f));
 };
-// [[arm-execution-contact-core-begin]]
-// 机械臂空间执行误差必须在实际拍心穿过 controller accepted 击球平面的时刻量，不能用
-// raw last-saved HT。连续 sweep 的 mode=2 会让 ht_ 继续移动但旧 profile 继续执行；第2抛
-// raw HT 已进随挥，而 /joint_states FK 过面仍清楚可见。accepted status 的 x 是控制器真正
-// 消费的半径；整体多转 yaw_extra 后，目标在臂系为 (x*cosδ, x*sinδ, z)。
-const armExecutionContactAt = h => {
-  if(!h || !isNum(h.tx) || !isNum(h.tz) || armTcpRows.length<2) return null;
-  const delta=(isNum(h.tgtYawExtraDeg)?h.tgtYawExtraDeg:0)*Math.PI/180;
-  const target=[h.tx*Math.cos(delta),h.tx*Math.sin(delta),h.tz];
-  const rawHt=isNum(h.finalHt)?h.finalHt-RK.t0:(isNum(h.wht)?h.wht-RK.t0:h.done);
-  const lo=(isNum(h.start)?h.start:h.done-h.hitT)-0.08;
-  const hi=Math.max(h.done,isNum(rawHt)?rawHt:h.done)+0.20;
-  let best=null;
-  for(let i=1;i<armTcpRows.length;i++){
-    const a=armTcpRows[i-1], b=armTcpRows[i];
-    if(b.t<lo) continue;
-    if(a.t>hi) break;
-    if(!Array.isArray(a.tcp)||!Array.isArray(b.tcp)||b.t-a.t>0.05) continue;
-    const ya=a.tcp[1]-target[1], yb=b.tcp[1]-target[1];
-    if(ya*yb>0 || Math.abs(yb-ya)<1e-9) continue;
-    const f=Math.max(0,Math.min(1,-ya/(yb-ya)));
-    const tcp=[0,1,2].map(k=>lerp(a.tcp[k],b.tcp[k],f));
-    const score=Math.hypot(tcp[0]-target[0],tcp[2]-target[2]);
-    const rec={t:lerp(a.t,b.t,f),tcp,target,score};
-    if(!best || rec.score<best.score) best=rec;
-  }
-  // 过面却离 accepted x/z 超过 20cm，多半是回程/别拍穿越，不冒充本拍执行接触。
-  return best&&best.score<=0.20?best:null;
-};
-// [[arm-execution-contact-core-end]]
-// [[arm-tcp-five-sample-core-begin]]
-// 正常拍取 raw 最后更新HT；mode=2 Coast 必须整格切到实际过面，找不到就返回空，禁止回退随挥 raw TCP。
-const armTcpFiveSampleAt = (h,rawHt) => {
-  const needsExec=!!(h&&h.reswing&&h.reswing.lastMode===2);
-  if(needsExec){
-    const exec=armExecutionContactAt(h);
-    return exec?{t:exec.t,tcp:exec.tcp,usesExec:true}:null;
-  }
-  const tcp=isNum(rawHt)?tcpAt(rawHt):null;
-  return tcp?{t:rawHt,tcp,usesExec:false}:null;
-};
-// [[arm-tcp-five-sample-core-end]]
+// [[arm-point-world-core-begin]]
 // x/y 按给定车 yaw 旋到世界轴；z 从 FK 安装面零点平移到机械臂中心地面点 z=0。
+// zArmMinusWorld = 臂模型 z − 世界/地面 z（V04 为负安装高度）。
+const rotateBodyVectorWorld = (v,yawDeg) => {
+  if(!Array.isArray(v)||v.length!==3||!v.every(isNum)||!isNum(yawDeg)) return null;
+  const a=yawDeg*Math.PI/180;
+  return [v[0]*Math.cos(a)-v[1]*Math.sin(a),
+          v[0]*Math.sin(a)+v[1]*Math.cos(a),v[2]];
+};
 const armPointWorld = (p,yawDeg,zArmMinusWorld) => {
   if(!Array.isArray(p)||!isNum(yawDeg)||!isNum(zArmMinusWorld)) return null;
-  const a=yawDeg*Math.PI/180;
-  return [p[0]*Math.cos(a)-p[1]*Math.sin(a),
-          p[0]*Math.sin(a)+p[1]*Math.cos(a),p[2]-zArmMinusWorld];
+  const rotated=rotateBodyVectorWorld(p,yawDeg);
+  return rotated ? [rotated[0],rotated[1],p[2]-zArmMinusWorld] : null;
 };
+// [[arm-point-world-core-end]]
+// [[racket-world-speed-core-begin]]
+// 世界系真实拍心速度 = 六轴相对臂座速度 + 车心平移 + 车体 yaw 刚体转动。
+// armForwardOffset 是录制时配置里的「臂座相对车心沿车前方偏移」；V04 当前为 0.045m。
+const racketWorldVelocity = (vArm,tcp,vCar,yawDeg,yawRate,armForwardOffset) => {
+  if(!Array.isArray(vArm)||vArm.length!==3||!vArm.every(isNum) ||
+     !Array.isArray(tcp)||tcp.length!==3||!tcp.every(isNum) ||
+     !Array.isArray(vCar)||vCar.length!==2||!vCar.every(isNum) ||
+     !isNum(yawDeg)||!isNum(yawRate)||!isNum(armForwardOffset)) return null;
+  const rBody=[tcp[0],tcp[1]+armForwardOffset,tcp[2]];
+  const turnBody=[-yawRate*rBody[1],yawRate*rBody[0],0];
+  const armWorld=rotateBodyVectorWorld(vArm,yawDeg);
+  const turnWorld=rotateBodyVectorWorld(turnBody,yawDeg);
+  const carWorld=[vCar[0],vCar[1],0];
+  const world=[0,1,2].map(k=>armWorld[k]+carWorld[k]+turnWorld[k]);
+  const norm=v=>Math.hypot(v[0],v[1],v[2]);
+  return {world,armWorld,carWorld,turnWorld,
+          speedWorld:norm(world),speedArm:norm(armWorld),
+          speedCar:norm(carWorld),speedTurn:norm(turnWorld)};
+};
+// 拍面 yaw 口径是 atan2(nx,ny)，pitch=asin(nz)：还原世界系前向单位法向。
+const faceNormalWorld = (yawDeg,pitchDeg) => {
+  if(!isNum(yawDeg)||!isNum(pitchDeg)) return null;
+  const y=yawDeg*Math.PI/180, p=pitchDeg*Math.PI/180, cp=Math.cos(p);
+  return [Math.sin(y)*cp,Math.cos(y)*cp,Math.sin(p)];
+};
+// 球拍碰撞的拍面法向恢复系数：u=v_ball-v_racket，u_out,n=-e_n*u_in,n。
+// 这是逐拍实测等效量；负值或 >1 保留作诊断，不钳位。只有法向闭合速度不足时 fail closed。
+const racketNormalRestitution = (vIn,vOut,vRacket,normal) => {
+  const vectors=[vIn,vOut,vRacket,normal];
+  if(vectors.some(v=>!Array.isArray(v)||v.length!==3||!v.every(isNum))) return null;
+  const nNorm=Math.hypot(normal[0],normal[1],normal[2]);
+  if(nNorm<1e-9) return null;
+  const n=normal.map(v=>v/nNorm);
+  const relNormal=v=>[0,1,2].reduce((sum,k)=>sum+(v[k]-vRacket[k])*n[k],0);
+  const uInN=relNormal(vIn), uOutN=relNormal(vOut), closing=-uInN;
+  if(!(closing>1.0)) return null;
+  return {en:uOutN/closing,uInN,uOutN,closing,normal:n};
+};
+// [[racket-world-speed-core-end]]
 // 离线三角测量的拍心（世界系, m）：PC 报告轴，重投影 >30px 丢弃。
 const pcRacketRows = racket
   .map(r=>({t:isNum(r.rel_s)?r.rel_s:relTime(r.t), x:r.x, y:r.y, z:r.z,
-            rp:isNum(r.reproj_err)?r.reproj_err:(isNum(r.reproj)?r.reproj:null),
-            rpMax:r.reproj_max_px, looMaxMm:r.loo_max_mm, heldoutMaxPx:r.heldout_max_px,
-            n_cam:r.n_cam, pair_cm:r.pair_cm, d02_mm:r.d02_mm,
-            blackMarker:r.black_marker===true}))
+             rp:isNum(r.reproj_err)?r.reproj_err:(isNum(r.reproj)?r.reproj:null),
+             rpMax:r.reproj_max_px, looMaxMm:r.loo_max_mm, heldoutMaxPx:r.heldout_max_px,
+             n_cam:r.n_cam, pair_cm:r.pair_cm, d02_mm:r.d02_mm,
+             blackMarker:r.black_marker===true}))
   .filter(p=>isNum(p.t)&&isNum(p.x)&&isNum(p.y)&&isNum(p.z)&&(p.rp==null||p.rp<=30))
   .sort((a,b)=>a.t-b.t);
 // [[racket-bracket-core-begin]]
@@ -1942,6 +2013,41 @@ const RETURN_HALF_G=4.905;  // z 拟合先扣重力 ½g·u²，线性退化时 v
 const RETURN_FIT_RESID_M=0.12;  // 防污染门 3：三轴拟合 max|残差| 上限
 const RETURN_MIN_FIT_Z=0.05;    // 防污染门 2：[0,段首] 拟合 z（含重力）下限
 const evalFit=(f,u)=>f.a+f.b*u+f.c*u*u;
+const ballVelocityFitAt = (seg,tHit) => {
+  if(seg.length<5 || seg[seg.length-1].t-seg[0].t<0.06) return null;
+  const fx=quadFitU(seg.map(p=>({t:p.t,v:p.x})),tHit);
+  const fy=quadFitU(seg.map(p=>({t:p.t,v:p.y})),tHit);
+  const fz=quadFitU(seg.map(p=>({t:p.t,v:p.z+RETURN_HALF_G*(p.t-tHit)*(p.t-tHit)})),tHit);
+  if(!fx||!fy||!fz) return null;
+  let maxRes=0;
+  for(const p of seg){
+    const u=p.t-tHit;
+    maxRes=Math.max(maxRes,
+      Math.abs(p.x-evalFit(fx,u)),
+      Math.abs(p.y-evalFit(fy,u)),
+      Math.abs(p.z+RETURN_HALF_G*u*u-evalFit(fz,u)));
+  }
+  return {vx:fx.b,vy:fy.b,vz:fz.b,fx,fy,fz,maxRes,n:seg.length,
+          span:seg[seg.length-1].t-seg[0].t};
+};
+// e_n 的来球速度只取触球前同一条连续入弧的末段；若窗内含落地反弹，切到最后一次反弹之后。
+// 这条三轴拟合只服务 e_n，不改变既有 PC 回球列的识别结果；质量不过门时 incoming=null。
+const pcIncomingAt = tHit => {
+  const runs=splitByTrackDev(pcRuns(tHit-0.38,tHit-0.025))
+    .filter(r=>r.length>=5 && tHit-r[r.length-1].t<=0.10)
+    .sort((a,b)=>b[b.length-1].t-a[a.length-1].t);
+  if(!runs.length) return null;
+  const run=runs[0];
+  let start=0;
+  for(let i=2;i<run.length;i++){
+    const vzA=(run[i-1].z-run[i-2].z)/Math.max(1e-9,run[i-1].t-run[i-2].t);
+    const vzB=(run[i].z-run[i-1].z)/Math.max(1e-9,run[i].t-run[i-1].t);
+    if(vzA<-0.5 && vzB-vzA>3.0) start=i;
+  }
+  const seg=run.slice(start).filter(p=>p.t>=tHit-0.30);
+  const fit=ballVelocityFitAt(seg,tHit);
+  return fit&&fit.vy<-1.0&&fit.maxRes<=RETURN_FIT_RESID_M ? fit : null;
+};
 const pcHitTimeAt = tApprox => {
   // 入弧取最贴近触球且 ≥5 点的连续段
   const yinRun=[...pcRuns(tApprox-0.38,tApprox-0.025)].reverse().find(r=>r.length>=5);
@@ -1991,18 +2097,16 @@ const pcHitTimeNear = tApprox => {
 const pcReturnAt = tApprox => {
   const tHit=pcHitTimeNear(tApprox);
   if(tHit==null) return null;
+  const incoming=pcIncomingAt(tHit);
   // 出弧速度段：段首距触球 ≤300ms（限制回推外推量），按点数优先取首个过门槛的段
   const cands=splitByTrackDev(pcRuns(tHit+0.02,tHit+0.40))
     .filter(r=>r.length>=5 && r[0].t-tHit<=0.30)
     .sort((a,b)=>b.length-a.length);
   for(const run of cands){
     const {seg,bounceCut}=bounceCutRun(run);
-    if(seg.length<5 || seg[seg.length-1].t-seg[0].t<0.06) continue;
-    const fx=quadFitU(seg.map(p=>({t:p.t,v:p.x})),tHit);
-    const fy=quadFitU(seg.map(p=>({t:p.t,v:p.y})),tHit);
-    const fz=quadFitU(seg.map(p=>({t:p.t,v:p.z+RETURN_HALF_G*(p.t-tHit)*(p.t-tHit)})),tHit);
-    if(!fx||!fy||!fz) continue;
-    const vx=fx.b, vy=fy.b, vz=fz.b;
+    const fit=ballVelocityFitAt(seg,tHit);
+    if(!fit) continue;
+    const {vx,vy,vz,fx,fy,fz,maxRes}=fit;
     if(vy<=0.5) continue;
     const vh=Math.hypot(vx,vy);
     if(vh<1.0) continue;
@@ -2015,30 +2119,22 @@ const pcReturnAt = tApprox => {
     }
     if(minZ<RETURN_MIN_FIT_Z) continue;
     // 防污染门 3：混轨/乱拟合拒绝出数（不剔点重拟合——高杠杆野点会反把真点顶成最大残差）
-    let maxRes=0;
-    for(const p of seg){
-      const u=p.t-tHit;
-      maxRes=Math.max(maxRes,
-        Math.abs(p.x-evalFit(fx,u)),
-        Math.abs(p.y-evalFit(fy,u)),
-        Math.abs(p.z+RETURN_HALF_G*u*u-evalFit(fz,u)));
-    }
     if(maxRes>RETURN_FIT_RESID_M) continue;
     return {tHit, vx, vy, vz,
       yaw:Math.atan2(vx,vy)*180/Math.PI,
       pitch:Math.atan2(vz,vh)*180/Math.PI,
       speed:Math.hypot(vx,vy,vz),
       n:seg.length, span:seg[seg.length-1].t-seg[0].t,
-      start, bounceCut, maxRes};
+      start, bounceCut, maxRes, incoming};
   }
   return null;
 };
 // [[pc-return-core-end]]
 // 拍面世界yaw,pitch@臂最后更新HT：臂系 face_yaw/face_pitch（Python _add_face_angles 逐帧 FK，
-// link6 +X 法向）取冲击前窗 [−80,−6]ms 线性外推到该 HT——J5 冲击突跳（触始+13ms 机械传递，
-// 本场 ≈ht−3ms）会污染跨冲击帧的直接插值（rebound 位姿采样同款约定）；车 yaw 直接取同一 RK
-// 时刻的 /bot_state yaw（imu_t 轴）。ψ_world = fy − 车yaw，口径与 PC回球 yaw 同为 atan2(x,y)；
-// 纯 RK/Arm 值，不含 PC zPhase，也不含 δ6 球侧偏置。
+// 车型配置的拍面法向轴；V04 为 link6 +Y）取冲击前窗 [−80,−6]ms 线性外推到该 HT——J5 冲击突跳（触始+13ms 机械传递，
+// 本场 ≈ht−3ms）会污染跨冲击帧的直接插值（rebound 位姿采样同款约定）；车 yaw 直接取同一 RK 时刻的
+// /bot_state yaw（imu_t 轴）。ψ_world = fy − 车yaw，口径与 PC回球 yaw 同为 atan2(x,y)；纯 RK/Arm 值，
+// 不含 PC zPhase，也不含 δ6 球侧偏置。
 // **pitch 不减车 yaw**：J1/BASE_ROT 是纯 z 转、不动 n_z，故臂系 pitch ≡ 世界 pitch（车无 roll/pitch
 // 前提），θ_world 比 ψ_world 少一个车侧误差源；且 θ̇≈0（挥拍是近水平圆弧，法向在 yaw 里飞扫、
 // 在 pitch 里冻结），故 pitch 对时序误差天然免疫，两列之差应当接近 0。
@@ -2057,17 +2153,16 @@ const fitFaceAnglesTo = (accHtRk,tEval) => {
   return {fy:(sy*stt-st*sty)/den, rate:(n*sty-st*sy)/den,
           fp:(sp*stt-st*stp)/den, pitchRate:(n*stp-st*sp)/den, n};
 };
-const faceAnglesWorldAt = accHtRk => {
-  const fit=fitFaceAnglesTo(accHtRk,accHtRk);
+const faceAnglesWorldAt = (accHtRk,tEval=accHtRk) => {
+  const fit=fitFaceAnglesTo(accHtRk,tEval);
   if(!fit) return null;
-  const carYaw=botYawDegAt(accHtRk);
-  return {deg:carYaw!=null?wrapDeg(fit.fy-carYaw):null, fy:fit.fy, carYaw,
+  const botYaw=botYawDegAt(tEval);
+  return {deg:botYaw!=null?wrapDeg(fit.fy-botYaw):null, fy:fit.fy, botYaw,
           n:fit.n, rate:fit.rate,
           pitch:fit.fp, pitchRate:fit.pitchRate};
 };
 // 拍面yaw,pitch,speed@臂最后更新HT−12ms（世界系）：fy/fp 同款冲击前窗拟合改在 HT−12ms 取值
-// （拍速同样在该刻插值）；车 yaw
-// 不用挥拍前圆均值，直接取该时刻 /bot_state yaw——车控接受 AprilTag 定位后 yaw 由
+// （拍速同样在该刻插值）；主列与本列都直接取各自 RK 时刻的 /bot_state yaw——车控接受 AprilTag 定位后 yaw 由
 // IMU 连续更新，直到 HT 结束后才用 AprilTag 重定位更新 bot_state，因此 HT 前采样点
 // 的 bot yaw 是无重定位台阶的瞬时值（挥拍塌陷伪迹只污染位置，yaw 走 IMU 不受累）。
 const rkBotYawRows = (()=>{
@@ -2089,8 +2184,25 @@ const botYawDegAt = t => {
   }
   return null;
 };
+// /bot_state 的 vx/vy 是车心世界系速度；位姿字段必须按同条 imu_t 物理轴取值，不能按发布 t。
+const rkBotVelocityRows = (()=>{
+  if(!RK || !RK.bot) return [];
+  const T=ys(RK.bot,'imu_t')||[], VX=ys(RK.bot,'vx'), VY=ys(RK.bot,'vy'), rows=[];
+  for(let i=0;i<T.length;i++){
+    const t=T[i], vx=VX[i], vy=VY[i];
+    if(isNum(t)&&isNum(vx)&&isNum(vy)) rows.push({t,vx,vy});
+  }
+  return rows.sort((a,b)=>a.t-b.t);
+})();
+const botVelocityAt = t => {
+  const exact=nearest(rkBotVelocityRows,t);
+  if(exact&&Math.abs(exact.t-t)<=1e-9) return [exact.vx,exact.vy];
+  const s=interpRow(rkBotVelocityRows,t,0.05);
+  return s ? [lerp(s.a.vx,s.b.vx,s.f),lerp(s.a.vy,s.b.vy,s.f)] : null;
+};
 // 车 yaw 角速度：取 /chassis_can/imu 的 yaw_speed（rad/s，零滞后陀螺原值）。bot_state yaw
-// 自身有 0.3~0.5s 滤波滞后，绝不能对它数值求导当瞬时角速度；这里只做时序灵敏度提示。
+// 自身有 0.3~0.5s 滤波滞后，绝不能对它数值求导当瞬时角速度。该原值未减 BotState 启动
+// bias（bag 未记录 bias-corrected yaw_rate）；近期三场由纯 IMU 段反推的影响 <0.002m/s，低于 0.01m/s 显示分辨率。
 const rkImuYawRateRows = (()=>{
   if(!RK || !RK.imu) return [];
   const T=ts(RK.imu), W=ys(RK.imu,'yaw_speed'), rows=[];
@@ -2100,14 +2212,19 @@ const rkImuYawRateRows = (()=>{
   }
   return rows.sort((a,b)=>a.t-b.t);
 })();
-const imuYawRateDegAt = t => {
-  const n=nearest(rkImuYawRateRows,t);
-  return (n && Math.abs(n.t-t)<=0.06) ? n.w*180/Math.PI : null;
+const imuYawRateAt = t => {
+  const exact=nearest(rkImuYawRateRows,t);
+  if(exact&&Math.abs(exact.t-t)<=1e-9) return exact.w;
+  const s=interpRow(rkImuYawRateRows,t,0.05);
+  return s ? lerp(s.a.w,s.b.w,s.f) : null;
 };
-// 实测拍速@臂最后更新HT（m/s）：vt = Python 侧用同一次 FK 的解析 Jacobian 算出的完整拍心线
-// 速度 |v_tcp|（逐帧，见 _add_face_angles），JS 只做插值；J1 分量 |q̇1|·r 与杠杆
-// r=hypot(tcp_x,tcp_y)（J1 转轴是过臂基的铅垂线）用已有字段现算，用来和 status `speed=`
-// 的口径（2·行程/hit_time·x，只算 J1）直接对齐。
+const imuYawRateDegAt = t => {
+  const w=imuYawRateAt(t);
+  return w!=null ? w*180/Math.PI : null;
+};
+// 实测世界拍速@臂最后更新HT（m/s）：Python 侧保存六轴解析 Jacobian 的臂系三维速度，JS
+// 在同一 RK 物理时刻叠加车心世界系 vx/vy 与 yaw 刚体速度，再取世界系合速度模长。
+// J1 分量 |q̇1|·r 与杠杆 r=hypot(tcp_x,tcp_y) 只用于对齐 status `speed=` 的 J1 规划口径。
 // **拍速不外推**（与同列 yaw/pitch 不同）：挥拍段 J1 走 S 曲线，[−80,−6]ms 窗内拍速强非线性，
 // 线性外推到 HT 实测会高估 40%+；HT 处两侧都有 100Hz 采样，直接插值即可。
 // 触球锚不靠"实测峰值"找：实测 q̇1 全程叠着 ±0.5~1.4m/s 的伺服振荡（引拍段无球时同样存在，
@@ -2116,38 +2233,48 @@ const imuYawRateDegAt = t => {
 // 巡航，故指令 J1 速度进入平台的第一帧就是 finish_hit_time（本场落在 HT−5~−12ms，与臂内
 // 提前量对得上），该刻的实测/指令差才是伺服欠速。
 const armSpeedRows = ARM ? ARM.states.filter(
-  s=>isNum(s.vt)&&Array.isArray(s.tcp)&&Array.isArray(s.velocity)) : [];
+  s=>Array.isArray(s.v_tcp_arm)&&s.v_tcp_arm.length===3&&s.v_tcp_arm.every(isNum)&&
+     Array.isArray(s.tcp)&&s.tcp.length===3&&s.tcp.every(isNum)&&Array.isArray(s.velocity)) : [];
 const armCmdSpeedRows = ARM ? (ARM.commands||[]).filter(
   c=>Array.isArray(c.tcp)&&Array.isArray(c.velocity)&&isNum(c.velocity[0])) : [];
 const j1SpeedOf = row => Math.abs(row.velocity[0])*Math.hypot(row.tcp[0],row.tcp[1]);
 const RACKET_SPEED_MAX_GAP_S=0.05;
+const armForwardOffsetM=CA.bot_center&&CA.bot_center.params&&
+  isNum(CA.bot_center.params.arm_forward_offset_m)
+    ? CA.bot_center.params.arm_forward_offset_m : null;
 const cmdSpeedAt = t => {
   const c=interpRow(armCmdSpeedRows,t,RACKET_SPEED_MAX_GAP_S);
   return c?lerp(j1SpeedOf(c.a),j1SpeedOf(c.b),c.f):null;
 };
-// 任意时刻的实测拍速（HT 与 HT−12ms 两列共用）：|v_tcp| 插值 + J1 分量 + 同刻指令值。
+// 任意时刻的实测拍速（HT 与 HT−12ms 两列共用）：所有向量分量先插值再合成；任一项缺失
+// 都返回 null，绝不把 arm-only 或缺 yaw 项的数冒充世界拍速。
 const racketSpeedRawAt = t => {
   if(t==null || !armSpeedRows.length) return null;
   const s=interpRow(armSpeedRows,t,RACKET_SPEED_MAX_GAP_S);
   if(!s) return null;
-  return {v:lerp(s.a.vt,s.b.vt,s.f),
-          vj1:lerp(j1SpeedOf(s.a),j1SpeedOf(s.b),s.f),
-          r:lerp(Math.hypot(s.a.tcp[0],s.a.tcp[1]),Math.hypot(s.b.tcp[0],s.b.tcp[1]),s.f),
-          cmd:cmdSpeedAt(t)};
+  const vArm=[0,1,2].map(k=>lerp(s.a.v_tcp_arm[k],s.b.v_tcp_arm[k],s.f));
+  const tcp=[0,1,2].map(k=>lerp(s.a.tcp[k],s.b.tcp[k],s.f));
+  const vCar=botVelocityAt(t), yawDeg=botYawDegAt(t), yawRate=imuYawRateAt(t);
+  const total=racketWorldVelocity(vArm,tcp,vCar,yawDeg,yawRate,armForwardOffsetM);
+  if(!total) return null;
+  return Object.assign(total,
+    {vJ1:lerp(j1SpeedOf(s.a),j1SpeedOf(s.b),s.f),
+     radiusJ1:Math.hypot(tcp[0],tcp[1]),cmdJ1:cmdSpeedAt(t),
+     yawDeg,yawRate,armForwardOffsetM});
 };
 const racketSpeedAt = htRk => {
   const base=racketSpeedRawAt(htRk);
   if(!base) return null;
   // 臂内触球锚 = 指令 J1 速度平台的第一帧（挥拍段末端，之后是恒 ω 巡航）
   const seg=armCmdSpeedRows.filter(c=>c.t>=htRk-0.30&&c.t<=htRk+0.12).map(c=>({t:c.t,v:j1SpeedOf(c)}));
-  let contactT=null, cmdContact=null, measContact=null;
+  let contactT=null, cmdContactJ1=null, measContactJ1=null;
   if(seg.length>10){
     const vmax=seg.reduce((m,c)=>Math.max(m,c.v),0);
     const hit=seg.find(c=>c.v>=vmax*0.995);
     if(hit){
-      contactT=hit.t; cmdContact=vmax;
+      contactT=hit.t; cmdContactJ1=vmax;
       const ms=interpRow(armSpeedRows,contactT,RACKET_SPEED_MAX_GAP_S);
-      if(ms) measContact=lerp(ms.a.vt,ms.b.vt,ms.f);
+      if(ms) measContactJ1=lerp(j1SpeedOf(ms.a),j1SpeedOf(ms.b),ms.f);
     }
   }
   // 单点读数的抖动量级：引拍段[−250,−120]ms（肯定无球）实测−指令 J1 拍速残差的 std
@@ -2158,22 +2285,21 @@ const racketSpeedAt = htRk => {
     if(c==null) return;
     const d=j1SpeedOf(row)-c; sum+=d; sum2+=d*d; n++;
   });
-  const osc=n>=4?Math.sqrt(Math.max(0,sum2/n-(sum/n)*(sum/n))):null;
+  const oscJ1=n>=4?Math.sqrt(Math.max(0,sum2/n-(sum/n)*(sum/n))):null;
   return Object.assign({}, base,
-    {contactDt:contactT!=null?(contactT-htRk)*1000:null, cmdContact, measContact, osc});
+    {contactDt:contactT!=null?(contactT-htRk)*1000:null,
+     cmdContactJ1,measContactJ1,oscJ1});
 };
+const speedVectorText = v => Array.isArray(v)
+  ? '('+v.map(x=>(x>=0?'+':'')+x.toFixed(2)).join(', ')+')' : '—';
 // 固定探针偏移：0808 起 12ms（此前 10ms）。本场用指令速度平台首帧定位的臂内触球锚落在
 // HT−1.5~−18ms、中位 −11ms，故 −12ms 基本踩在真实触球上；与主列之差 = 角速度/加速度×12ms。
 const FACE_YAW_PRE_S=0.012;
 const faceAnglesWorldPreAt = accHtRk => {
   if(accHtRk==null) return null;
   const tEval=accHtRk-FACE_YAW_PRE_S;
-  const fit=fitFaceAnglesTo(accHtRk,tEval);
-  if(!fit) return null;
-  const botYaw=botYawDegAt(tEval);
-  if(botYaw==null) return null;
-  return {deg:wrapDeg(fit.fy-botYaw), fy:fit.fy, botYaw, n:fit.n, rate:fit.rate,
-          pitch:fit.fp, pitchRate:fit.pitchRate};
+  const face=faceAnglesWorldAt(accHtRk,tEval);
+  return face&&face.deg!=null?face:null;
 };
 // 末次 target 主表与机械臂最后 accepted 分表：两个合同独立取值、独立对齐 PC 真值。
 const reportThrows = rkThrows.filter(t=>(t.msgs||0)>=3).sort((a,b)=>a.ht-b.ht);
@@ -2227,6 +2353,133 @@ const pcSampleTimeForThrow = (th,t) => {
   return phase&&phase.usable&&baseline!=null?baseline+phase.offsetS:null;
 };
 window.__dbgAlign.throwPhases=()=>throwPhases;
+// PC球拍头 bbox 中心 bundle vz、RK当时S0系数、RK弹后实测是三条独立证据。
+// vz_world_mps 是检测框几何中心的世界 z 速度代理，不是校准拍面速度，也不是球自转。
+// v3 只按 contact_anchor_t_rk 回配；它是 RK ball_world 固定高度外推锚点。
+// 拍头速度只拟合接触锚前125ms至后35ms，避免把准备下沉当成击球方向。
+// 不是视频直接观测到的 impact 时刻。
+// S0 系数和历史旧拍头vz只认同抛最后一条 Stage0 /predict_hit_pos；弹后实测只认 extractor
+// 按 RK 已采纳 S1 帧复算出的 cor_meas_replay/cxy_meas_replay，不拿在线锚点冒充本抛实测。
+// [[racket-cor-core-begin]]
+const RACKET_IMPACT_MATCH_MAX_S=1.5;
+const RACKET_NEAR_HORIZONTAL_VZ_MPS=0.30;
+const racketMotionForVz = vz => !isNum(vz) ? null
+  : (vz>=RACKET_NEAR_HORIZONTAL_VZ_MPS ? '拍头上行'
+    : (vz<=-RACKET_NEAR_HORIZONTAL_VZ_MPS ? '拍头下行' : '近水平'));
+const racketSpinTypeForVz = vz => !isNum(vz) ? null
+  : (vz>=RACKET_NEAR_HORIZONTAL_VZ_MPS ? '上旋倾向'
+    : (vz<=-RACKET_NEAR_HORIZONTAL_VZ_MPS ? '下旋倾向' : '旋转类型不判定'));
+const racketImpactAvailable=()=>Array.isArray(D.racket_impact);
+const racketImpactRows=(racketImpactAvailable()&&RK&&isNum(RK.t0)?D.racket_impact:[])
+  .filter(row=>row&&(row.status==='accepted'||row.status==='rejected'))
+  .map(row=>{
+    const anchorTRk=isNum(row.contact_anchor_t_rk)?row.contact_anchor_t_rk:null;
+    return {row,anchorTRk,matchedTRk:anchorTRk,timeSource:'contact_anchor',
+            matchT:isNum(anchorTRk)?anchorTRk-RK.t0:null};
+  })
+  .filter(item=>isNum(item.matchT))
+  .sort((a,b)=>a.matchT-b.matchT);
+const racketImpactAssignments = () => {
+  const assigned=new Map();
+  if(!racketImpactAvailable()||!RK||!isNum(RK.t0)) return assigned;
+  const temporal=[...reportThrows].sort((a,b)=>a.firstT-b.firstT);
+  let throwIdx=0;
+  racketImpactRows.forEach(item=>{
+    while(throwIdx<temporal.length && temporal[throwIdx].firstT<item.matchT) throwIdx++;
+    if(throwIdx>=temporal.length) return;
+    const th=temporal[throwIdx], dt=th.firstT-item.matchT;
+    if(dt<=RACKET_IMPACT_MATCH_MAX_S){
+      assigned.set(th,{...item,dt});
+      throwIdx++;
+    }
+  });
+  return assigned;
+};
+const racketCorForThrow = (th,assignments) => {
+  const match=assignments.get(th)||null;
+  const rowStatus=match?match.row.status:null;
+  const contactAnchorStatus=match?match.row.contact_anchor_status:null;
+  const visionEvaluated=match?match.row.vision_evaluated:null;
+  const measurement=match&&match.row.measurement&&typeof match.row.measurement==='object'
+    ? match.row.measurement : null;
+  const bundle=measurement&&measurement.bundle_diagnostics
+    &&typeof measurement.bundle_diagnostics==='object'
+    ? measurement.bundle_diagnostics : null;
+  const bundleVelocity=bundle&&Array.isArray(bundle.bbox_center_velocity_world_mps)
+    ? bundle.bbox_center_velocity_world_mps:null;
+  const acceptedEvidence=measurement&&measurement.accepted===true
+    &&measurement.reason==='accepted'
+    &&measurement.observation_semantics==='racket_head_bbox_geometric_center_native_pixel'
+    &&measurement.velocity_semantics==='racket_head_bbox_center_world_velocity_proxy'
+    &&Array.isArray(measurement.raw_bbox_observations)
+    &&measurement.raw_bbox_observations.length>=6
+    &&bundle&&bundle.accepted===true&&bundle.reason==='accepted'
+    &&bundle.observation_semantics==='racket_head_bbox_geometric_center'
+    &&Array.isArray(bundle.supported_frames)&&bundle.supported_frames.length>=3
+    &&isNum(bundle.fit_span_s)&&bundle.fit_span_s>=.055
+    &&isNum(bundle.max_reprojection_error_px)&&bundle.max_reprojection_error_px<=8
+    &&bundleVelocity&&bundleVelocity.length===3&&bundleVelocity.every(isNum)
+    &&isNum(match.row.vz_world_mps)&&Math.abs(match.row.vz_world_mps)>=RACKET_NEAR_HORIZONTAL_VZ_MPS
+    &&match.row.vz_semantics==='racket_head_bbox_center_world_velocity_proxy'
+    &&isNum(measurement.bbox_center_vz_world_mps)
+    &&isNum(bundle.bbox_center_vz_world_mps)
+    &&Math.abs(match.row.vz_world_mps-measurement.bbox_center_vz_world_mps)<=1e-9
+    &&Math.abs(match.row.vz_world_mps-bundle.bbox_center_vz_world_mps)<=1e-9
+    &&Math.abs(match.row.vz_world_mps-bundleVelocity[2])<=1e-9;
+  const acceptedState=rowStatus==='accepted'&&contactAnchorStatus==='accepted'
+    &&visionEvaluated===true;
+  const validAccepted=acceptedState&&acceptedEvidence;
+  const validContactRejected=rowStatus==='rejected'&&contactAnchorStatus==='rejected'
+    &&visionEvaluated===false;
+  const validVisionNotEvaluated=rowStatus==='rejected'&&contactAnchorStatus==='accepted'
+    &&visionEvaluated===false;
+  const validVisionRejected=rowStatus==='rejected'&&contactAnchorStatus==='accepted'
+    &&visionEvaluated===true;
+  const acceptedVz=validAccepted&&isNum(match.row.vz_world_mps)
+    ? match.row.vz_world_mps : null;
+  const usedRvz=isNum(th.lastS0Rvz)?th.lastS0Rvz:null;
+  const corXyEff=isNum(th.lastS0CorXyEff)?th.lastS0CorXyEff:null;
+  const corEff=isNum(th.lastS0CorEff)?th.lastS0CorEff:null;
+  const corMeasReplay=isNum(th.corMeasReplay)?th.corMeasReplay:null;
+  const cxyMeasReplay=isNum(th.cxyMeasReplay)?th.cxyMeasReplay:null;
+  const status=!racketImpactAvailable() ? 'legacy_untrusted'
+    : (!match ? 'missing'
+      : (validAccepted ? 'measured'
+        : (acceptedState ? 'invalid_accepted_evidence'
+        : (validContactRejected ? 'contact_rejected'
+          : (validVisionNotEvaluated ? 'vision_not_evaluated'
+            : (validVisionRejected ? 'vision_rejected':'invalid_v3_row'))))));
+  const rejectedStatus=status==='contact_rejected'||status==='vision_not_evaluated'
+    ||status==='vision_rejected';
+  const failureReason=rejectedStatus&&typeof match.row.failure_reason==='string'
+    &&match.row.failure_reason.trim() ? match.row.failure_reason.trim()
+    : (rejectedStatus?'未提供failure_reason':null);
+  return {status,motion:racketMotionForVz(acceptedVz),spinType:racketSpinTypeForVz(acceptedVz),
+          measuredVz:acceptedVz,
+          failureReason,
+          rowStatus,contactAnchorStatus,visionEvaluated,
+          acceptanceMode:match&&typeof match.row.acceptance_mode==='string'
+            ? match.row.acceptance_mode:null,
+          prefixSpread:match&&isNum(match.row.prefix_spread_s)
+            ? match.row.prefix_spread_s:null,
+          contactPointSpread:match&&isNum(match.row.contact_point_spread_m)
+            ? match.row.contact_point_spread_m:null,
+          supportedFrames:bundle&&Array.isArray(bundle.supported_frames)
+            ? bundle.supported_frames:null,
+          fitSpan:bundle&&isNum(bundle.fit_span_s)?bundle.fit_span_s:null,
+          reprojectionMax:bundle&&isNum(bundle.max_reprojection_error_px)
+            ? bundle.max_reprojection_error_px:null,
+          leaveOneFrameVz:bundle&&Array.isArray(bundle.leave_one_frame_bbox_center_vz_mps)
+            ? bundle.leave_one_frame_bbox_center_vz_mps:null,
+          rejectionCounts:measurement?measurement.rejection_counts:null,
+          usedRvz,corXyEff,corEff,
+          corMeasReplay,cxyMeasReplay,corMeasClosureMs:th.corMeasClosureMs,
+          corMeasIdx:th.corMeasIdx,
+          matchedTRk:match?match.matchedTRk:null,
+          anchorTRk:match?match.anchorTRk:null,
+          timeSource:match?match.timeSource:null,dt:match?match.dt:null};
+};
+// [[racket-cor-core-end]]
 // 球面−车 (dx,dy,dz)(t)：RK 全量无污染观测重建的空间真值，可在任意时刻取值。
 //   球 = 该抛 S1 期 RK 球世界观测（z≥0.15，[ht−0.45,ht−0.025] 窗）三轴二次拟合，3σ 剔污染按
 //        主运动轴 y 判定，x/z 用同一批采样点（同进同出，不各剔各的）；
@@ -2239,8 +2492,8 @@ window.__dbgAlign.throwPhases=()=>throwPhases;
 // dx/dz = 球心 − 车中心：接触点在拍面上的落点（拍面法向≈y），扣球半径无意义故不扣；
 // 量纲可直接对 RK 消息的 rel_x/rel_z（差 = 预测误差 + 车体系↔世界轴的 yaw 旋转）。
 // [[ball-car-gap-core-begin]]
+const R_BALL=0.033;  // 网球半径；报告 y 接触面统一取球心 world_y − R_BALL
 const ballCarGapForThrow = (()=>{
-  const R_BALL=0.033;  // 网球半径：车 y 面≡拍面（RK rel_y 无臂基 y 补偿），故触球=球面够到车 y 面
   const rows=[];
   if(RK && RK.world){
     const T=ts(RK.world), X=ys(RK.world,'x'), Y=ys(RK.world,'y'), Z=ys(RK.world,'z');
@@ -2252,9 +2505,9 @@ const ballCarGapForThrow = (()=>{
   }
   const botRows=[];
   if(RK && RK.bot){
-    const BT=ts(RK.bot), BX=ys(RK.bot,'x'), BY=ys(RK.bot,'y');
+    const BT=ys(RK.bot,'imu_t')||[], BX=ys(RK.bot,'x'), BY=ys(RK.bot,'y');
     for(let i=0;i<BT.length;i++){
-      const t=Number(BT[i]);
+      const t=BT[i];
       if(isNum(t)&&isNum(BX[i])&&isNum(BY[i])) botRows.push({t,x:BX[i],y:BY[i]});
     }
     botRows.sort((a,b)=>a.t-b.t);
@@ -2362,10 +2615,25 @@ const tableXyzCm = (x,y,z,d=1) => (isNum(x)&&isNum(y)&&isNum(z))
   ? cmFmt(x,d)+'/'+cmFmt(y,d)+'/'+cmFmt(z,d) : '—';
 const tableEsc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 // [[bot-run-end-core-begin]]
+const BOT_POSE_MAX_GAP_S=0.05;
+const rkBotPoseRows = (()=>{
+  if(!RK || !RK.bot) return [];
+  const T=ys(RK.bot,'imu_t')||[], X=ys(RK.bot,'x'), Y=ys(RK.bot,'y'), rows=[];
+  for(let i=0;i<T.length;i++){
+    const t=T[i], x=X[i], y=Y[i];
+    if(isNum(t)&&isNum(x)&&isNum(y)) rows.push({t,x,y});
+  }
+  return rows.sort((a,b)=>a.t-b.t);
+})();
+const botPoseAtImuTime = t => {
+  const exact=nearest(rkBotPoseRows,t);
+  if(exact&&Math.abs(exact.t-t)<=1e-9) return {t,x:exact.x,y:exact.y};
+  const s=interpRow(rkBotPoseRows,t,BOT_POSE_MAX_GAP_S);
+  return s ? {t,x:lerp(s.a.x,s.b.x,s.f),y:lerp(s.a.y,s.b.y,s.f)} : null;
+};
 const botRunEndForThrow = th => {
   if(!RK || !th || !isNum(th.ht)) return null;
   const t=ts(RK.bot), phase=ys(RK.bot,'phase');
-  const x=ys(RK.bot,'x'), y=ys(RK.bot,'y');
   const tx=ys(RK.bot,'target_x'), ty=ys(RK.bot,'target_y');
   const remaining=ys(RK.bot,'remaining')||[];
   let best=null;
@@ -2375,8 +2643,8 @@ const botRunEndForThrow = th => {
     if(dt>0.1 || (best && dt>=best.dt)) continue;
     const owner=reportThrows.reduce((closest,candidate)=>
       !closest || Math.abs(candidate.ht-t[i])<Math.abs(closest.ht-t[i]) ? candidate : closest, null);
-    if(owner!==th || ![x[i],y[i],tx[i],ty[i]].every(isNum)) continue;
-    best={t:t[i],x:x[i],y:y[i],tx:tx[i],ty:ty[i],dt,endIdx:i};
+    if(owner!==th || ![tx[i],ty[i]].every(isNum)) continue;
+    best={t:t[i],tx:tx[i],ty:ty[i],dt,endIdx:i};
   }
   if(!best) return null;
   let startIdx=best.endIdx;
@@ -2423,7 +2691,7 @@ const lastTargetPredictionForThrow = (th,runEnd) => {
   return best&&best.htError<=LAST_TARGET_HT_MATCH_MAX_S?best:null;
 };
 // [[last-target-pred-core-end]]
-const pcTruthCell = (f,withY=false,tPc=null) => {
+const pcTruthCell = (f,withY=false,tPc=null,contactY=false) => {
   if(!f) return pcTruthMissCell(tPc);
   // 两侧时距都显示：球是**外推**（拟合窗末点到目标时刻），车是**插值**（到前后最近一条
   // /pc_car_loc 的较大一侧）。0731 起 x/y 是「球世界−车世界」，只报球侧会把车侧的
@@ -2440,9 +2708,16 @@ const pcTruthCell = (f,withY=false,tPc=null) => {
       '），剩 '+f.nPts+' 点参与拟合。剔除条件=最坏点 ≥2.5× 中位残差且本身超门、剔完剩 ≥8 点、'+
       '最多剔 2 个；坏点来源通常是多球关联失败或弹跳接触帧，不是球的测量'
     : '';
-  return (withY?tableXyzCm(f.x,f.y,f.z):tableXzCm(f.x,f.z))+
-    ' <span style="color:'+(carMs>150?'#f97316':'#fbbf24')+'" title="入弧拟合真值：x/y 线性、z 重力+阻力(λ=k_drag·水平速)+带界旋转曲率(|δ|≤2m/s²)；本行 δz='+((f.delta||0)>=0?'+':'')+(f.delta||0).toFixed(2)+'m/s²；表中 x/y=拟合球世界坐标−车世界坐标(世界轴不转yaw)；只用目标时刻20ms前观测，不跨目标时刻插值；max|残差| '+
-    cmFmt(f.resMax)+'cm，ball_y−car_y='+cmSigned(f.y)+'cm'+
+  const yValue=contactY?f.y-R_BALL:f.y;
+  const coordTitle=contactY
+    ? '表中 x=球心world_x−车体中心world_x，y=(球心world_y−R球3.3cm)−车体中心world_y，z=球心world_z（世界轴不转yaw）；'
+    : '表中 x/y=拟合球世界坐标−车世界坐标(世界轴不转yaw)；';
+  const yTitle=contactY
+    ? 'ball_surface_y−car_y='+cmSigned(yValue)+'cm'
+    : 'ball_y−car_y='+cmSigned(f.y)+'cm';
+  return (withY?tableXyzCm(f.x,yValue,f.z):tableXzCm(f.x,f.z))+
+    ' <span style="color:'+(carMs>150?'#f97316':'#fbbf24')+'" title="入弧拟合真值：x/y 线性、z 重力+阻力(λ=k_drag·水平速)+带界旋转曲率(|δ|≤2m/s²)；本行 δz='+((f.delta||0)>=0?'+':'')+(f.delta||0).toFixed(2)+'m/s²；'+coordTitle+'只用目标时刻20ms前观测，不跨目标时刻插值；max|残差| '+
+    cmFmt(f.resMax)+'cm，'+yTitle+
     '；球外推 '+Math.round(f.dNear*1000)+'ms（拟合窗末点→目标时刻）'+
     '；车 /pc_car_loc 前 '+Math.round((f.carGa||0)*1000)+'ms / 后 '+Math.round((f.carGb||0)*1000)+
     'ms 夹住插值（不外推、不冻结），按底盘 a_dec_max=3m/s² 折算插值误差 ±'+cmFmt(f.eCar||0)+
@@ -2492,9 +2767,89 @@ const rejectNoteForThrow = th => {
     : '未收到 accepted，且无可回配 reject 状态';
 };
 
+const racketCorCellHtml = (th,assignments) => {
+  const r=racketCorForThrow(th,assignments);
+  const signed3=v=>isNum(v)?(v>=0?'+':'')+v.toFixed(3):'—';
+  const metaValue=v=>typeof v==='string'?v:JSON.stringify(v);
+  const auditMeta=[
+    r.acceptanceMode?'contact_acceptance_mode='+r.acceptanceMode:null,
+    isNum(r.prefixSpread)?'prefix_spread_ms='+(1000*r.prefixSpread).toFixed(2):null,
+    isNum(r.contactPointSpread)?'contact_point_spread_cm='+(100*r.contactPointSpread).toFixed(2):null,
+    r.supportedFrames!=null?'supported_frames='+metaValue(r.supportedFrames):null,
+    isNum(r.fitSpan)?'bundle_fit_span_ms='+(1000*r.fitSpan).toFixed(2):null,
+    isNum(r.reprojectionMax)?'bundle_max_reprojection_error_px='+r.reprojectionMax.toFixed(2):null,
+    r.leaveOneFrameVz!=null?'leave_one_frame_bbox_center_vz_mps='+metaValue(r.leaveOneFrameVz):null,
+    r.rejectionCounts!=null?'rejection_counts='+metaValue(r.rejectionCounts):null,
+  ].filter(Boolean).join(', ');
+  const matchTimingNote=r.timeSource==='contact_anchor'
+    ? '仅按 contact_anchor_t_rk='+r.anchorTRk.toFixed(6)+
+      's 回配（RK ball_world 固定高度外推锚点，不是视频直接观测到的impact）'
+    : '';
+  const impactText=r.status==='measured'
+    ? r.spinType+' '+signed3(r.measuredVz)
+    : '—';
+  const usedText=isNum(r.usedRvz)
+    ? 'RK当时S0采用的旧拍头vz '+signed3(r.usedRvz)
+    : 'RK当时S0未采用旧拍头vz（cor_xy走aMz）';
+  const corXyText=isNum(r.corXyEff)?r.corXyEff.toFixed(4):'—';
+  const corText=isNum(r.corEff)?r.corEff.toFixed(4):'—';
+  const measuredCxyText=isNum(r.cxyMeasReplay)?r.cxyMeasReplay.toFixed(3):'—';
+  const measuredCorText=isNum(r.corMeasReplay)?r.corMeasReplay.toFixed(3):'—';
+  const usedValue=isNum(r.usedRvz)?signed3(r.usedRvz):'—';
+  const sourceNote=r.status==='measured'
+    ? '触球锚已通过；vision_evaluated=true；球拍头bbox中心bundle vz代理='+
+      signed3(r.measuredVz)+'m/s（≥+0.30 拍头上行，≤−0.30 拍头下行，其余近水平）；'+
+      matchTimingNote+'；拍头上行/下行→上旋/下旋倾向；不是直接观测球自转；'+
+      '不是校准拍面速度（not calibrated racket-face speed）；未用于本场S0'+
+      (auditMeta?'；审计字段 '+auditMeta:'')
+    : (r.status==='contact_rejected'
+      ? '触球锚阶段拒绝；vision_evaluated=false，视频检测与bundle没有运行；'+
+        'failure_reason='+r.failureReason+(auditMeta?'；审计字段 '+auditMeta:'')
+      : (r.status==='vision_not_evaluated'
+        ? '触球锚已通过；vision_evaluated=false，视频检测与bundle没有运行；'+
+          'failure_reason='+r.failureReason+(auditMeta?'；审计字段 '+auditMeta:'')
+        : (r.status==='vision_rejected'
+          ? '触球锚已通过；vision_evaluated=true；bundle拒绝；'+matchTimingNote+
+            '；failure_reason='+r.failureReason+(auditMeta?'；审计字段 '+auditMeta:'')+
+            '；拒绝记录的 vz_world_mps 无论是否存在都不读取、不显示'
+      : (r.status==='legacy_untrusted'
+        ? '旧session没有 D.racket_impact；旧运动质心流程已判定不可信，绝不再用于判型'
+        : (r.status==='invalid_accepted_evidence'
+            ? '本抛状态声称accepted，但measurement/bundle/vz语义或数值链不完整、不一致；'+
+              matchTimingNote+'；vz_world_mps不读取、不显示'
+          : (r.status==='invalid_v3_row'
+            ? 'racket_impact/v3 状态组合无效（status='+metaValue(r.rowStatus)+
+              ', contact_anchor_status='+metaValue(r.contactAnchorStatus)+
+              ', vision_evaluated='+metaValue(r.visionEvaluated)+'）；vz_world_mps不读取、不显示'
+            : '本抛没有可保序回配的 racket_impact/v3 记录'))))));
+  const corNote=isNum(r.corXyEff)
+    ? '水平cor_xy='+r.corXyEff.toFixed(4)+'（payload字段cor_xy_eff）直接取同抛最后一条Stage0 /predict_hit_pos（idx='+
+      th.lastS0Idx+'）；Stage0用它计算弹后vx/vy，不取配置值，也不拿S1遥测冒充；'+usedText
+    : '同抛最后Stage0缺cor_xy_eff，显示—，不从配置回填';
+  const normalCorNote=isNum(r.corEff)
+    ? '竖直cor_z='+r.corEff.toFixed(4)+'（payload字段cor_eff）取自同一条Stage0，Stage0按 vz_post=−cor_z·vz_pre 使用；'+
+      '它是当前在线法向COR锚点，不是尚未发生的本抛反弹实测真值'
+    : '同抛最后Stage0缺cor_eff，显示—，不从配置回填';
+  const measuredNote=isNum(r.cxyMeasReplay)&&isNum(r.corMeasReplay)
+    ? 'RK弹后实测复算：取已采纳S1帧 idx='+r.corMeasIdx+
+      ' 对应的弹前/弹后 /ball_world_topic 拟合，在球心z=地面+3.3cm分别取速度；'+
+      'cor_xy=vxy_out/vxy_in='+r.cxyMeasReplay.toFixed(4)+
+      '，cor_z=−vz_out/vz_in='+r.corMeasReplay.toFixed(4)+
+      (isNum(r.corMeasClosureMs)?'，两段触地时刻差='+r.corMeasClosureMs.toFixed(2)+'ms':'')+
+      '。≈表示bag坐标只有4位小数、时间6位小数，非RK history原始double'
+    : '本抛没有可复算的RK已采纳反弹样本（无S1、未通过反弹门或旧sidecar缺复算字段），显示—';
+  return '<span style="white-space:nowrap" title="'+
+    tableEsc(sourceNote+'；'+corNote+'；'+normalCorNote+'；'+measuredNote)+'">'+
+    impactText+' / S0 cxy '+corXyText+', cor_z '+corText+
+    ' / 实测反弹 cxy '+measuredCxyText+', cor_z '+measuredCorText+
+    ' / RK旧拍头vz '+usedValue+'</span>';
+};
+
 const rk300TableHtml = () => {
   if(!RK || !reportThrows.length) return '';
+  const racketAssignments=racketImpactAssignments();
   const visualTcpSameOrigin=ARM&&String(ARM.fk_car||'').toLowerCase()==='v04';
+  const racketBlackMarker=pcRacketRows.some(r=>r.blackMarker);
   const armContractRows=[];
   const rows=reportThrows.map((th,idx)=>{
     const zPhase=throwPhaseFor(th);
@@ -2504,8 +2859,12 @@ const rk300TableHtml = () => {
           :(zPhase.pcFlight==null?'pc_flight_not_found'
             :(zPhase.offsetS==null?'insufficient_overlap'
               :(zPhase.edge?'offset_at_100ms_boundary':'quality_gate')))));
+    const rowPcFixed=(t,digits=3)=>{
+      const value=rkToPc(t);
+      return value==null?'—':value.toFixed(digits);
+    };
     const zPhaseTitle=zPhase&&zPhase.usable
-      ? 'global baseline '+rkBias.toFixed(4)+'s；本抛 PC 取样 offset '
+      ? '本抛 z(t) 只修正 PC 取样相位：tPC(sample)=tRK+global bias+'
         +tableSigned(zPhase.deltaMs)+'ms；RK字段和RK时间显示不变，所有PC取样（含视觉拍心）使用该修正。'
         +'z残差 median/p90/trim-RMSE='+(zPhase.err*100).toFixed(1)+'/'
         +(zPhase.p90*100).toFixed(1)+'/'+(zPhase.trimmedRmse*100).toFixed(1)+'cm；'
@@ -2513,7 +2872,14 @@ const rk300TableHtml = () => {
         +Math.round(zPhase.coverage*100)+'%；10ms外次优比 '+zPhase.margin.toFixed(2)
         +'×；5mm误差带宽 '+(zPhase.profileWidth*1000).toFixed(1)
         +'ms；PC/RK flight '+zPhase.pcFlight+'/'+zPhase.rkFlight
-      : '本抛 z(t) 相位修正不可用（'+zPhaseFailure+'）；依赖本抛PC取样的格（含视觉）显示—，RK字段仍按global baseline显示。';
+        +'。预测HT只用于粗配 flight，不进入评分，也未强制HT=实际触球。'
+      : '本抛 z(t) 相位修正不可用（'+zPhaseFailure+'）；依赖本抛PC取样的格（含视觉）显示—，RK字段仍按global baseline显示。'
+        +(zPhase&&zPhase.offsetS!=null
+          ? '候选诊断：offset='+tableSigned(zPhase.offsetS*1000)+'ms，z median/p90='
+            +(zPhase.err*100).toFixed(1)+'/'+(zPhase.p90*100).toFixed(1)+'cm，10ms外次优比 '
+            +(zPhase.margin==null?'—':zPhase.margin.toFixed(2))+'×，5mm误差带宽 '
+            +(zPhase.profileWidth==null?'—':(zPhase.profileWidth*1000).toFixed(1))+'ms。'
+          : '没有可成对的同抛PC/RK运动轨迹。');
     const zPhaseCell='<span'+(zPhase&&zPhase.usable?'':' style="color:#e0a24a"')+
       ' title="'+tableEsc(zPhaseTitle)+'">'+(zPhase&&zPhase.usable
         ? tableSigned(zPhase.deltaMs):'⚠—')+'</span>';
@@ -2523,32 +2889,35 @@ const rk300TableHtml = () => {
     const targetPred=lastTargetPredictionForThrow(th,runEnd);
     const targetUpdateCell=targetChange
       ? '<span title="'+tableEsc(targetPred
-          ? '最后可观察 raw target 坐标变化 t='+rkToPc(targetChange.t).toFixed(6)+'s（PC轴），target=('
+          ? '最后可观察 raw target 坐标变化 t='+rowPcFixed(targetChange.t,6)+'s（global PC轴），target=('
             +cmFmt(targetChange.x)+', '+cmFmt(targetChange.y)+')cm；对应预测 payload ct='
-            +rkToPc(targetPred.ct).toFixed(6)+'s，按 bot.t+remaining ↔ pred.ht 回配，deadline残差 '
+            +rowPcFixed(targetPred.ct,6)+'s，按 bot.t+remaining ↔ pred.ht 回配，deadline残差 '
             +(targetPred.htError*1000).toFixed(3)+'ms'
           : '已观察到最后 raw target 坐标变化，但 bot.t+remaining 无法在同抛内回配到 1ms 内的 pred.ht')+'">'
-          +rkToPc(targetChange.t).toFixed(3)
-          +(targetPred?' <span style="color:#a0a0c0">(ct '+rkToPc(targetPred.ct).toFixed(3)+')</span>':'')+'</span>'
+          +rowPcFixed(targetChange.t)
+          +(targetPred?' <span style="color:#a0a0c0">(ct '+rowPcFixed(targetPred.ct)+')</span>':'')+'</span>'
       : '—';
     const targetPredHtBaseline=targetPred?rkToPc(targetPred.ht):null;
-    const targetPredSamplePc=targetPred?pcSampleTimeForThrow(th,targetPred.ht):null;
     const targetPredHt=targetPredHtBaseline!=null?targetPredHtBaseline.toFixed(3):'—';
+    const targetPredSamplePc=targetPred?pcSampleTimeForThrow(th,targetPred.ht):null;
     const targetTruth=targetPredSamplePc!=null?pcTruthAt(targetPredSamplePc):null;
     const targetPredHit=targetPred?tableXzCm(targetPred.relX,targetPred.relZ):'—';
-    const runTargetError=runEnd
-      ? tableSigned((runEnd.tx-runEnd.x)*100)+'/'+tableSigned((runEnd.ty-runEnd.y)*100)
+    const racketCorCell=racketCorCellHtml(th,racketAssignments);
+    const actualAtTargetHt=targetChange&&isNum(targetChange.deadline)
+      ? botPoseAtImuTime(targetChange.deadline) : null;
+    const targetActualAtHtError=runEnd&&actualAtTargetHt
+      ? tableSigned((runEnd.tx-actualAtTargetHt.x)*100)+'/'+tableSigned((runEnd.ty-actualAtTargetHt.y)*100)
       : '—';
-    const targetPredCarError=runEnd&&targetPred&&Number(targetPred.stage)===1&&isNum(targetPred.carX)&&isNum(targetPred.carY)
-      ? tableSigned((targetPred.carX-runEnd.x)*100)+'/'+tableSigned((targetPred.carY-runEnd.y)*100)
+    const actualAtPredHt=targetPred?botPoseAtImuTime(targetPred.ht):null;
+    const predActualAtHtError=actualAtPredHt&&targetPred&&Number(targetPred.stage)===1&&isNum(targetPred.carX)&&isNum(targetPred.carY)
+      ? tableSigned((targetPred.carX-actualAtPredHt.x)*100)+'/'+tableSigned((targetPred.carY-actualAtPredHt.y)*100)
       : (targetPred&&Number(targetPred.stage)===0
           ? '<span title="Stage0 的 car_pred_x/y 实际填的是 raw travel target，不是真实车轨迹预测">— (S0)</span>'
           : '—');
     const accHt=accepted&&isNum(accepted.wht)?accepted.wht-RK.t0:null;
     // raw 最后更新 HT：最后进入 update_ht() 的 /predict_hit_pos 原始 ht。它用于预测/盲区账；
-    // mode=2 Coast 时旧 profile 继续执行，故绝不能把这个 raw HT 称为机械臂执行接触锚。PC真值、
-    // 球面y−车y、末次target对应击球点、车yaw、两列拍面 yaw/pitch 与实测拍速仍锚在 raw HT；
-    // TCP 五数仅在最后状态为 mode=2 时改取实际 accepted 平面过面点，避免把随挥位置冒充触球位置。
+    // mode=2 Coast 时旧 profile 继续执行，故不能把这个 raw HT 称为机械臂执行接触锚。
+    // 本表所有 @臂最后更新HT 的量（包括 TCP）仍只在这个原始 HT 取值，不另找过面时刻。
     const finalHt=accepted
       ? (accepted.finalMismatch ? null : (isNum(accepted.finalHt)?accepted.finalHt-RK.t0:accHt))
       : null;
@@ -2584,52 +2953,39 @@ const rk300TableHtml = () => {
     const acceptedTarget=accepted?tableXzCm(accepted.wx,accepted.wz):'—';
     const carYawAcc=finalHt!=null?botYawDegAt(finalHt):null;
     const carYawRate=finalHt!=null?imuYawRateDegAt(finalHt):null;
-    // TCP 五数必须同锚：正常拍取 raw 臂最后更新HT；若最后 late 状态已是 mode=2 Coast，raw ht_
-    // 虽继续移动但旧 profile 骑行，此时改取 /joint_states FK 实际穿过 controller accepted 平面的点。
-    // x/y/z 是 TCP−车心世界轴；dx/dz 是同一个 TCP 减 status 真正消费的 accepted tx/tz。
-    const rawTcp=finalHt!=null?tcpAt(finalHt):null;
-    const rawTcpYawRad=(carYawAcc!=null?carYawAcc:0)*Math.PI/180;
-    const rawTcpWorld=rawTcp
-      ? [rawTcp[0]*Math.cos(rawTcpYawRad)-rawTcp[1]*Math.sin(rawTcpYawRad),
-         rawTcp[0]*Math.sin(rawTcpYawRad)+rawTcp[1]*Math.cos(rawTcpYawRad),
-         rawTcp[2]-(isNum(armZOff)?armZOff:0)] : null;
-    const tcpSample=accepted?armTcpFiveSampleAt(accepted,finalHt):null;
-    const tcpUsesExecContact=!!(tcpSample&&tcpSample.usesExec);
-    const tcpSampleT=tcpSample?tcpSample.t:null;
-    const tcp=tcpSample?tcpSample.tcp:null;
-    const tcpYawDeg=tcpSampleT!=null?botYawDegAt(tcpSampleT):null;
-    const tcpYawRad=(tcpYawDeg!=null?tcpYawDeg:0)*Math.PI/180;
-    const tcpWorld=tcp?[tcp[0]*Math.cos(tcpYawRad)-tcp[1]*Math.sin(tcpYawRad),
-                        tcp[0]*Math.sin(tcpYawRad)+tcp[1]*Math.cos(tcpYawRad),
-                        tcp[2]-(isNum(armZOff)?armZOff:0)]:null;
-    const tcpTargetDelta=(accepted&&isNum(accepted.tgtYawExtraDeg)?accepted.tgtYawExtraDeg:0)*Math.PI/180;
-    const tcpAcceptedTarget=accepted&&isNum(accepted.tx)&&isNum(accepted.tz)
-      ? [accepted.tx*Math.cos(tcpTargetDelta),accepted.tx*Math.sin(tcpTargetDelta),accepted.tz] : null;
-    const tcpAcceptedTargetWorld=tcpAcceptedTarget
-      ? [tcpAcceptedTarget[0]*Math.cos(tcpYawRad)-tcpAcceptedTarget[1]*Math.sin(tcpYawRad),
-         tcpAcceptedTarget[0]*Math.sin(tcpYawRad)+tcpAcceptedTarget[1]*Math.cos(tcpYawRad),
-         tcpAcceptedTarget[2]-(isNum(armZOff)?armZOff:0)] : null;
-    const tcpAcceptedDx=tcpWorld&&tcpAcceptedTargetWorld
-      ? (tcpWorld[0]-tcpAcceptedTargetWorld[0])*100 : null;
-    const tcpAcceptedDz=tcpWorld&&tcpAcceptedTargetWorld
-      ? (tcpWorld[2]-tcpAcceptedTargetWorld[2])*100 : null;
+    // TCP 只保留一个合同：在 raw 最后更新 HT 插值 /joint_states FK，x/y 以同刻车 yaw 旋到
+    // 世界轴；z 用同车型刚性安装高度从 FK 安装面零点平移到机械臂中心地面点 z=0。
+    const tcp=finalHt!=null?tcpAt(finalHt):null;
+    const tcpYawDeg=carYawAcc;
+    const tcpWorld=armPointWorld(tcp,tcpYawDeg,armConstCal.zOff);
+    // last accepted 保持上游 /predict_hit_pos 的 rel_x/rel_z 原值；不按 face_yaw 或 HT yaw
+    // 重建，也不加减任何位置偏置。这里只做新口径 TCP x/z − 上游原值的数值差。
+    const tcpAccepted=accepted&&isNum(accepted.wx)&&isNum(accepted.wz)
+      ? [accepted.wx,accepted.wz] : null;
+    const tcpAcceptedDx=tcpWorld&&tcpAccepted
+      ? (tcpWorld[0]-tcpAccepted[0])*100 : null;
+    const tcpAcceptedDz=tcpWorld&&tcpAccepted
+      ? (tcpWorld[2]-tcpAccepted[1])*100 : null;
+    const tcpAcceptedErrorText=tcpAccepted
+      ? tableSigned(tcpAcceptedDx)+'/'+tableSigned(tcpAcceptedDz) : '—/—';
     const tcpCell=tcpWorld
       ? '<span title="'+tableEsc('臂系FK TCP=('+cmFmt(tcp[0])+', '+cmFmt(tcp[1])+', '
-          +cmFmt(tcp[2])+')cm @'+(tcpUsesExecContact
-            ? ('实际accepted过面 '+rkToPc(tcpSampleT).toFixed(3)+'s；最后late为mode=2 Coast，raw HT '
-               +(finalHt!=null?rkToPc(finalHt).toFixed(3):'—')+'s 已与有效profile脱钩，故本格不用raw TCP')
-            : ('臂最后更新HT '+rkToPc(tcpSampleT).toFixed(3)+'s（原始ht，未减臂内提前量）'))
-          +'；按车yaw ψ='+(tcpYawDeg!=null?tableSigned(tcpYawDeg)+'°':'—（该时刻无/bot_state，按0°）')
-          +' 旋到世界轴（xw=x·cosψ−y·sinψ、yw=x·sinψ+y·cosψ）、z−臂系z偏移'
-          +(isNum(armZOff)?cmFmt(armZOff):'0')+'cm 还原世界高度'
-          +'；last accepted目标臂系=('+cmFmt(tcpAcceptedTarget[0])+', '+cmFmt(tcpAcceptedTarget[1])+', '
-          +cmFmt(tcpAcceptedTarget[2])+')cm；tcp−last accepted dx/dz='
-          +tableSigned(tcpAcceptedDx)+'/'+tableSigned(tcpAcceptedDz)+'cm（两侧同刻同yaw旋转）'
-          +'；臂基≡车心（0标恒等式）'+htSrcNote)+'">'
+          +cmFmt(tcp[2])+')cm @臂最后更新HT '+rowPcFixed(finalHt)+'s（global PC轴；原始ht，未减臂内提前量）'
+          +'；按同刻车yaw ψ='+tableSigned(tcpYawDeg)+'° 旋到世界轴'
+          +'（xw=x·cosψ−y·sinψ、yw=x·sinψ+y·cosψ）'
+          +'；z_world=z_FK−zOffset='+cmFmt(tcp[2])+'−('+cmFmt(armConstCal.zOff)+')='
+          +cmFmt(tcpWorld[2])+'cm，zOffset=臂模型z−世界z，原点=机械臂中心地面点z=0'
+          +(tcpAccepted
+            ? ('；last accepted 直接取上游 /predict_hit_pos rel_x/z=('
+               +cmFmt(tcpAccepted[0])+', '+cmFmt(tcpAccepted[1])+')cm，不旋转、不加偏置'
+               +'；tcp−last accepted dx/dz='+tcpAcceptedErrorText+'cm')
+            : '；last accepted 未回配到上游 rel_x/z，误差不计算')
+          +htSrcNote)+'">'
           +tableXyzCm(tcpWorld[0],tcpWorld[1],tcpWorld[2])+', '
-          +tableSigned(tcpAcceptedDx)+'/'+tableSigned(tcpAcceptedDz)+'</span>'
+          +tcpAcceptedErrorText+'</span>'
       : '—';
     // 保留离 HT 最近的前/后原始曝光，不再用宽窗多项式把原始观测拟合成一个值。
+    // V04 的车底盘中心就是机械臂 base，故视觉(世界点−车心)可与同曝光 TCP 直接相减。
     const visPcT=finalHtPcSample;
     const visPair=visPcT!=null?bracketVisualRacketRows(pcRacketRows,visPcT):{before:null,after:null};
     const visRawEntry=(visSrc,sideLabel)=>{
@@ -2704,58 +3060,88 @@ const rk300TableHtml = () => {
           +(tgtSpeed!=null?tgtSpeed.toFixed(2):'—')+'/'
           +(tgtPitch!=null?tgtPitch.toFixed(1):'—')+'</span>'
       : '<span title="本抛无 accepted，或该场 arm_controller 早于可变 pitch(0805)/拍速逐拍指定(0808)，状态行不带这两个字段">—</span>';
+    // 规划球出射三量必须来自最后一条 accepted 状态；不从拍面/拍速指令反推，也不把
+    // yaw_extra（整拍补偿角）冒充目标出球 yaw。三个字段原子齐全才显示，防状态截断。
+    const tgtOutYaw=accepted&&isNum(accepted.tgtOutYaw)?accepted.tgtOutYaw:null;
+    const tgtOutPitch=accepted&&isNum(accepted.tgtOutPitch)?accepted.tgtOutPitch:null;
+    const tgtOutSpeed=accepted&&isNum(accepted.tgtOutSpeed)?accepted.tgtOutSpeed:null;
+    const tgtOutReplay=!!(accepted&&accepted.tgtOutReplay);
+    const tgtOutComplete=tgtOutYaw!=null&&tgtOutPitch!=null&&tgtOutSpeed!=null;
+    const tgtOutCell=tgtOutComplete
+      ? '<span title="'+tableEsc((tgtOutReplay?'离线重放候选（075317 原日志未记录出球三元组）：':'最后一条 accepted 自带的规划球出射需求：')
+          +'世界 yaw='+tgtOutYaw.toFixed(2)+'°（atan2(vx,vy)）；pitch='
+          +tgtOutPitch.toFixed(2)+'°、speed='+tgtOutSpeed.toFixed(2)+'m/s（RacketPrediction '
+          +'在拍面域钳位后保落点重解的球轨迹，不是拍面角/拍心速度，也不是实测回球）')+'">'
+          +(tgtOutReplay?'<span style="color:#f3b64c">重放</span> ':'')
+          +tgtOutYaw.toFixed(1)+'/'+tgtOutPitch.toFixed(1)+'/'+tgtOutSpeed.toFixed(2)+'</span>'
+      : '<span title="该场 accepted 状态未同时记录 out_yaw/out_pitch/out_speed；禁止用 yaw_extra、拍面 pitch 或挥拍 speed 代填">—</span>';
     const faceYaw=faceAnglesWorldAt(finalHt);
     const swingSpeed=racketSpeedAt(finalHt);
     const speedNote=swingSpeed
-      ? '。拍速 |v_tcp|='+swingSpeed.v.toFixed(2)+'m/s：完整 FK 解析 Jacobian 的拍心线速度，'
-          +'在 HT 处**直接插值**/joint_states（不外推——S 曲线下窗内拍速强非线性，'
-          +'线性外推会高估 40%+；速度大小与车 yaw 无关，臂系≡世界系）'
-          +'；其中 J1 项 |q̇1|·r='+swingSpeed.vj1.toFixed(2)+'m/s（r='+cmFmt(swingSpeed.r)+'cm，'
-          +'= status speed= 的口径）'
-          +(swingSpeed.cmd!=null?('；同刻指令侧 /tennis/motor_command 的 |v_cmd1|·r='
-            +swingSpeed.cmd.toFixed(2)+'m/s ⇒ 伺服差 '
-            +tableSigned(swingSpeed.v-swingSpeed.cmd)+'m/s'):'；本刻无指令帧')
+      ? '。世界拍心速度 |v_world|='+swingSpeed.speedWorld.toFixed(2)+'m/s，v_world='
+          +speedVectorText(swingSpeed.world)+'m/s：在同一 RK 物理时刻合成 R(yaw)·v_arm'
+          +' + bot_state(vx,vy,0) + yaw_speed×r；所有量都只做 50ms 内有界插值，不外推'
+          +'。六轴臂相对 |v_arm|='+swingSpeed.speedArm.toFixed(2)+'m/s，R·v_arm='
+          +speedVectorText(swingSpeed.armWorld)+'m/s；车心平移 |v_car|='
+          +swingSpeed.speedCar.toFixed(2)+'m/s，v_car='+speedVectorText(swingSpeed.carWorld)
+          +'m/s；车体 yaw 刚体项 |ω×r|='+swingSpeed.speedTurn.toFixed(2)+'m/s，ω×r='
+          +speedVectorText(swingSpeed.turnWorld)+'m/s（IMU raw yaw_speed='
+          +(swingSpeed.yawRate*180/Math.PI).toFixed(2)+'°/s；录制时臂座前移='
+          +cmFmt(swingSpeed.armForwardOffsetM)+'cm；未记录的启动 yaw bias 对近期两位小数结果无影响）'
+          +'；其中实测 J1 项 |q̇1|·r='+swingSpeed.vJ1.toFixed(2)+'m/s（r='
+          +cmFmt(swingSpeed.radiusJ1)+'cm，= status speed= 的口径）'
+          +(swingSpeed.cmdJ1!=null?('；同刻指令 J1 项 |v_cmd1|·r='
+            +swingSpeed.cmdJ1.toFixed(2)+'m/s ⇒ J1伺服差 '
+            +tableSigned(swingSpeed.vJ1-swingSpeed.cmdJ1)+'m/s'):'；本刻无指令帧')
           +(swingSpeed.contactDt!=null?('；臂内触球锚@HT'+tableSigned(swingSpeed.contactDt)
             +'ms（= 指令 J1 速度进入恒 ω 巡航平台的第一帧 = HitTrajectory 的 finish_hit_time，'
-            +'不靠实测峰值找）：指令 '+swingSpeed.cmdContact.toFixed(2)+'m/s'
-            +(swingSpeed.measContact!=null?('、实测 '+swingSpeed.measContact.toFixed(2)
-              +'m/s ⇒ 触球欠速 '+tableSigned(swingSpeed.measContact-swingSpeed.cmdContact)+'m/s'):'')):'')
-          +(swingSpeed.osc!=null?('；单点抖动量级 σ='+swingSpeed.osc.toFixed(2)+'m/s'
+            +'不靠实测峰值找）：指令J1 '+swingSpeed.cmdContactJ1.toFixed(2)+'m/s'
+            +(swingSpeed.measContactJ1!=null?('、实测J1 '+swingSpeed.measContactJ1.toFixed(2)
+              +'m/s ⇒ 触球J1欠速 '
+              +tableSigned(swingSpeed.measContactJ1-swingSpeed.cmdContactJ1)+'m/s'):'')):'')
+          +(swingSpeed.oscJ1!=null?('；J1单点抖动量级 σ='+swingSpeed.oscJ1.toFixed(2)+'m/s'
             +'（引拍段[−250,−120]ms、肯定无球时的 实测−指令 残差 std：J1 实测速度全程叠着这个'
             +'量级的伺服振荡，所以别拿单帧极值当触球探测器）'):'')
-          +(tgtSpeed!=null?('；目标(status speed=)='+tgtSpeed.toFixed(2)+'m/s，实测−目标 '
-            +tableSigned(swingSpeed.v-tgtSpeed)+'m/s'):'')
-      : '。本刻 50ms 内无 /joint_states 覆盖，拍速无值';
+          +(tgtSpeed!=null?('；目标J1(status speed=)='+tgtSpeed.toFixed(2)
+            +'m/s，实测J1−目标 '+tableSigned(swingSpeed.vJ1-tgtSpeed)+'m/s'):'')
+      : '。本刻无法合成世界拍速：需要 50ms 内同时有六轴 /joint_states、bot_state '
+          +'imu_t 上的 yaw/vx/vy、IMU yaw_speed，以及录制时 arm_forward_offset_m；不回退 arm-only';
     const speedTxt=' <span style="color:#a0a0c0">'
-      +(swingSpeed?swingSpeed.v.toFixed(2)+'m/s':'—m/s')+'</span>';
+      +(swingSpeed?swingSpeed.speedWorld.toFixed(2)+'m/s':'—m/s')+'</span>';
     const faceYawCell=(faceYaw||swingSpeed)
       ? '<span title="'+tableEsc((faceYaw
           ? ('臂系FK face_yaw='+tableSigned(faceYaw.fy)+'°（冲击前窗['
             +'−80,−6]ms '+faceYaw.n+'帧线性外推@臂最后更新HT，ψ̇='+tableSigned(faceYaw.rate)+'°/s）'
-            +'；车yaw='+tableSigned(faceYaw.carYaw)+'°（RK /bot_state yaw@imu_t=raw HT）'
-            +'；世界ψ=face_yaw−车yaw，口径同PC回球yaw=atan2(x,y)；纯RK/Arm值，不受PC zPhase影响且不含δ6球侧偏置'
+            +(isNum(faceYaw.botYaw)
+              ? ('；车yaw='+tableSigned(faceYaw.botYaw)+'°（RK /bot_state yaw@imu_t=raw HT）')
+              : '；RK raw HT 处无有效 /bot_state yaw，世界yaw显示—')
+            +'；世界ψ=face_yaw−车yaw，口径同PC回球yaw=atan2(x,y)；纯RK/Arm值，不受zPhase影响且不含δ6球侧偏置'
             +'。pitch='+tableSigned(faceYaw.pitch)+'°（同窗同帧拟合的 asin(n_z)，正=开面上仰，'
             +'θ̇='+tableSigned(faceYaw.pitchRate)+'°/s）——**不减车yaw**：J1/BASE_ROT 纯 z 转不动 n_z，'
             +'臂系pitch≡世界pitch；θ̇≈0 故 pitch 对时序免疫，与右列 pitch 之差 = θ̇×12ms')
-          : '该 HT 无拍面角（冲击前窗内 <2 帧 FK state）')
+          : '该 HT 冲击前窗内 <2 帧 FK state，拍面角不可用')
           +speedNote+htSrcNote)+'">'
           +(faceYaw?tableSigned(faceYaw.deg)+'/'+tableSigned(faceYaw.pitch):'—/—')
           +speedTxt+'</span>'
       : '—';
     const faceYawPre=faceAnglesWorldPreAt(finalHt);
-    // HT−12ms 探针上的实测拍速：只取该刻的插值值与同刻指令值（触球锚/振荡 σ 是整拍量，
-    // 已在左列悬停里给过，不重复算）。与左列拍速之差 = 这 12ms 里 J1 加速掉的量。
+    // HT−12ms 探针上的世界拍速：同一套三维向量合成与同刻 J1 指令；触球锚/J1振荡是整拍量，
+    // 已在左列悬停里给过。与左列之差同时包含臂、车心平移和车 yaw 项的变化。
     const swingSpeedPre=finalHt!=null?racketSpeedRawAt(finalHt-FACE_YAW_PRE_S):null;
     const speedPreNote=swingSpeedPre
-      ? '。拍速 |v_tcp|='+swingSpeedPre.v.toFixed(2)+'m/s（同左列口径，在 HT−12ms 处插值）'
-          +(swingSpeedPre.cmd!=null?('；同刻指令侧 |v_cmd1|·r='+swingSpeedPre.cmd.toFixed(2)
-            +'m/s ⇒ 伺服差 '+tableSigned(swingSpeedPre.v-swingSpeedPre.cmd)+'m/s'):'')
-          +(swingSpeed?('；与左列(@HT)之差 '+tableSigned(swingSpeedPre.v-swingSpeed.v)
-            +'m/s（负=这 12ms 里仍在加速，正=实测反而掉了；单点抖动 σ 见左列悬停，本场'
-            +' σ 与这个差同量级，逐拍符号别当结论）'):'')
-      : '。HT−12ms 处 50ms 内无 /joint_states 覆盖，拍速无值';
+      ? '。世界拍心 |v_world|='+swingSpeedPre.speedWorld.toFixed(2)+'m/s，v_world='
+          +speedVectorText(swingSpeedPre.world)+'m/s（HT−12ms 同刻向量合成）'
+          +'；六轴臂相对='+swingSpeedPre.speedArm.toFixed(2)+'m/s；车心平移='
+          +swingSpeedPre.speedCar.toFixed(2)+'m/s；车 yaw 刚体项='
+          +swingSpeedPre.speedTurn.toFixed(2)+'m/s'
+          +(swingSpeedPre.cmdJ1!=null?('；同刻指令J1='+swingSpeedPre.cmdJ1.toFixed(2)
+            +'m/s，实测J1−指令J1='+tableSigned(swingSpeedPre.vJ1-swingSpeedPre.cmdJ1)+'m/s'):'')
+          +(swingSpeed?('；世界拍速相对左列(@HT)之差 '
+            +tableSigned(swingSpeedPre.speedWorld-swingSpeed.speedWorld)
+            +'m/s（含臂、车平移、车 yaw 三项变化；J1单点抖动 σ 见左列悬停）'):'')
+      : '。HT−12ms 无法合成世界拍速：六轴、车体或录制配置任一合同缺失即显示—';
     const speedPreTxt=' <span style="color:#a0a0c0">'
-      +(swingSpeedPre?swingSpeedPre.v.toFixed(2)+'m/s':'—m/s')+'</span>';
+      +(swingSpeedPre?swingSpeedPre.speedWorld.toFixed(2)+'m/s':'—m/s')+'</span>';
     const faceYawPreCell=(faceYawPre||swingSpeedPre)
       ? '<span title="'+tableEsc((faceYawPre
           ? ('臂系FK face_yaw='+tableSigned(faceYawPre.fy)+'°（冲击前窗[−80,−6]ms '
@@ -2775,14 +3161,13 @@ const rk300TableHtml = () => {
     // 车yaw@raw臂最后更新HT：与右侧拍面/预测真值列同锚；mode=2 时不等于执行接触时刻。
     // 取 /bot_state yaw 瞬时值——车控 accept AprilTag 定位后 yaw 由 IMU 连续更新、
     // HT 结束后才用 AprilTag 重定位，故 HT 前采样点无重定位台阶；挥拍位姿伪迹只塌陷位置不动 yaw。
-    // 悬停给 IMU yaw_speed（零滞后）换算的 10ms 时序灵敏度；右侧世界拍面 yaw 直接减同一 RK yaw。
+    // 悬停给 IMU yaw_speed（零滞后）换算的 10ms 时序灵敏度；右侧主拍面 yaw 直接减同一个 RK yaw。
     const carYawCell=carYawAcc!=null
-      ? '<span title="'+tableEsc('/bot_state yaw@臂最后更新HT '+rkToPc(finalHt).toFixed(3)+'s（PC轴，'
+      ? '<span title="'+tableEsc('/bot_state yaw@臂最后更新HT '+rowPcFixed(finalHt)+'s（global PC轴，'
           +'臂受理的最后一条预测的原始 ht，未减臂内提前量）：AprilTag accept 后由 IMU 连续更新，'
           +'HT 结束后才重定位，采样点无台阶'
           +(carYawRate!=null?('；IMU yaw_speed='+tableSigned(carYawRate)+'°/s（零滞后陀螺，'
-            +'10ms 时序误差≈'+(carYawRate>=0?'+':'')+(carYawRate*0.01).toFixed(2)+'°车yaw）'):'；本场无 IMU yaw_speed')
-          +'；右侧世界拍面 yaw 减去同一 RK /bot_state yaw')+'">'
+            +'10ms 时序误差≈'+(carYawRate>=0?'+':'')+(carYawRate*0.01).toFixed(2)+'°车yaw）'):'；本场无 IMU yaw_speed'))+'">'
           +tableSigned(carYawAcc)+'</span>'
       : '<span title="无 accepted/臂最后更新HT，或该时刻 50ms 内无 /bot_state">—</span>';
     // 最后更新→挥拍起：臂受理的最后一条预测的到达时刻 − 挥拍段起点(老触球−HIT_T)。
@@ -2790,18 +3175,18 @@ const rk300TableHtml = () => {
     const updT=accepted&&isNum(accepted.lastUpdateT)?accepted.lastUpdateT:null;
     const swingStart=accepted&&isNum(accepted.start)?accepted.start:null;
     const updGapCell=(updT!=null&&swingStart!=null)
-      ? '<span title="'+tableEsc('最后受理更新 t='+rkToPc(updT).toFixed(3)+'s（PC轴）'
-          +'；挥拍起 t='+rkToPc(swingStart).toFixed(3)+'s（=老触球−HIT_T 0.25s）'
-          +'；最后一条 accepted t='+rkToPc(accepted.lastAcceptT).toFixed(3)+'s（其后 '
+      ? '<span title="'+tableEsc('最后受理更新 t='+rowPcFixed(updT)+'s（global PC轴）'
+          +'；挥拍起 t='+rowPcFixed(swingStart)+'s（=老触球−HIT_T 0.25s）'
+          +'；最后一条 accepted t='+rowPcFixed(accepted.lastAcceptT)+'s（其后 '
           +(rsw?rsw.n:0)+' 条只存触球时刻不换目标）'
           +(rsw
             ? (rsw.continuousSweep
               ? '；连续sweep收到并写入ht_ '+rsw.n+' 条late raw HT：老触球 '
-                +rkToPc(rsw.oldDone).toFixed(3)+'s → 最后raw请求 '+rkToPc(rsw.newDone).toFixed(3)
+                +rowPcFixed(rsw.oldDone)+'s → 最后raw请求 '+rowPcFixed(rsw.newDone)
                 +'s（'+tableSigned(rsw.delta)+'ms）'
                 +(rsw.nCoast?('；'+rsw.nCoast+' 条回报mode=2 Coast=骑旧profile，不代表轨迹采用该raw HT'):'')
-              : '；重定相触发 t='+rkToPc(rsw.trig).toFixed(3)+'s（老触球−100ms）：老触球 '
-                +rkToPc(rsw.oldDone).toFixed(3)+'s → 新触球 '+rkToPc(rsw.newDone).toFixed(3)+'s（'
+              : '；重定相触发 t='+rowPcFixed(rsw.trig)+'s（老触球−100ms）：老触球 '
+                +rowPcFixed(rsw.oldDone)+'s → 新触球 '+rowPcFixed(rsw.newDone)+'s（'
                 +tableSigned(rsw.delta)+'ms，剩余 '+(rsw.remain*1000).toFixed(0)+'ms）'
                 +(rsw.ok?' ✓生效':' ✗剩余<60ms放弃'))
             : '；本拍挥拍窗内无新预测，未触发重定相'))+'">'
@@ -2813,8 +3198,8 @@ const rk300TableHtml = () => {
     const blindBad=!!(accepted&&accepted.finalMismatch);
     const blind=(finalHt!=null&&finalCt!=null&&!blindBad)?(finalHt-finalCt)*1000:null;
     const blindCell=blind!=null
-      ? '<span title="'+tableEsc('臂最后更新消息 ct='+rkToPc(finalCt).toFixed(3)+'s（最晚一颗球的观测时刻）'
-          +'、ht='+rkToPc(finalHt).toFixed(3)+'s（预测击球时刻，原始值未减臂内提前量'
+      ? '<span title="'+tableEsc('臂最后更新消息 ct='+rowPcFixed(finalCt)+'s（最晚一颗球的观测时刻）'
+          +'、ht='+rowPcFixed(finalHt)+'s（global PC轴；预测击球时刻，原始值未减臂内提前量'
           +(armConstCal.adv!=null?(armConstCal.adv*1000).toFixed(0)+'ms':'')+'）'
           +'；这段是纯外推、无新观测的盲区'+htSrcNote)+'">'+blind.toFixed(1)+'</span>'
       : (blindBad
@@ -2827,8 +3212,8 @@ const rk300TableHtml = () => {
     // 同减臂内 10ms，故与臂内触球时刻之差完全等价。未采纳时显示候选值并置灰。
     const dHtCell=rsw
       ? '<span'+(rsw.ok?'':' style="color:#a0a0c0"')
-          +' title="'+tableEsc('挥拍时 ht='+rkToPc(rsw.oldDone+HIT_TIME_ADVANCE_SEC).toFixed(3)
-          +'s → 更新后 ht='+rkToPc(rsw.newDone+HIT_TIME_ADVANCE_SEC).toFixed(3)+'s'
+          +' title="'+tableEsc('挥拍时 ht='+rowPcFixed(rsw.oldDone+HIT_TIME_ADVANCE_SEC)
+          +'s → 更新后 ht='+rowPcFixed(rsw.newDone+HIT_TIME_ADVANCE_SEC)+'s'
           +'；正=新预测把击球点推晚。触球拍速是派生量，会随剩余时长一起变'
           +(rsw.continuousSweep?'；连续sweep仅确认该raw HT进入update_ht，是否形成有效profile须看mode/执行轨迹':'')
           +(rsw.ok?'':'；剩余'+(rsw.remain*1000).toFixed(0)+'ms<60ms，控制器放弃重定相，实际仍走老时间轴'))+'">'
@@ -2846,6 +3231,53 @@ const rk300TableHtml = () => {
         tableSigned(ret.yaw)+'/'+tableSigned(ret.pitch)+' <span style="color:#a0a0c0">'+ret.speed.toFixed(1)+'m/s'
         +(returnDtMs==null?'':' Δt'+tableSigned(returnDtMs)+'ms')+'</span></span>'
       : '—';
+    // 实测等效 e_n：PC 入/出球世界速度与同一实际触球时刻的世界拍心速度都先投影到
+    // 拍面前向法线，再按 u_out,n=-e_n*u_in,n 求解。PC/RK world 轴沿用本场共同场地标定合同；
+    // tHit 通过本抛 zPhase 从 PC 取样轴反解回 RK，不能拿 raw HT 或固定 HT−12ms 代替。
+    const enHitRk=ret&&finalHt!=null&&finalHtPcSample!=null
+      ? finalHt+(ret.tHit-finalHtPcSample) : null;
+    const enFaceTimeOk=enHitRk!=null&&enHitRk>=finalHt-0.08&&enHitRk<=finalHt+0.02;
+    const enFace=enFaceTimeOk?faceAnglesWorldAt(finalHt,enHitRk):null;
+    const enRacket=enFaceTimeOk?racketSpeedRawAt(enHitRk):null;
+    const enNormal=enFace&&enFace.deg!=null?faceNormalWorld(enFace.deg,enFace.pitch):null;
+    const enResult=ret&&ret.incoming&&enRacket&&enNormal
+      ? racketNormalRestitution(
+          [ret.incoming.vx,ret.incoming.vy,ret.incoming.vz],
+          [ret.vx,ret.vy,ret.vz],enRacket.world,enNormal)
+      : null;
+    const enMissingReason=!ret
+      ? 'PC 入/出弧未同时通过回球质量门'
+      : (!ret.incoming
+        ? 'PC 来球末段三轴拟合未通过：需 ≥5 点、跨度 ≥60ms、vy<−1m/s、max|残差|≤12cm'
+        : (enHitRk==null
+          ? '缺 raw臂最后更新HT 或本抛 zPhase，无法把实际触球时刻映回 RK'
+          : (!enFaceTimeOk
+            ? '实际触球距 raw HT 超出冲击前拍面拟合可信区间 [−80,+20]ms'
+            : (!enFace||enFace.deg==null
+              ? '实际触球时刻缺冲击前拍面法向或同刻车 yaw'
+              : (!enRacket
+                ? '实际触球时刻缺六轴+车体合成的世界拍心速度'
+                : '法向闭合速度 ≤1m/s，分母不可信')))));
+    const enCell=enResult
+      ? '<span'+((enResult.en<0||enResult.en>1)?' style="color:#e0a24a"':'')
+          +' title="'+tableEsc('实测 e_n,eff=−u_out,n/u_in,n='
+            +enResult.en.toFixed(4)+'；u_in,n=(v_in−v_r)·n='
+            +enResult.uInN.toFixed(3)+'m/s，u_out,n=(v_out−v_r)·n='
+            +enResult.uOutN.toFixed(3)+'m/s，法向闭合速度='
+            +enResult.closing.toFixed(3)+'m/s'
+            +'；v_in='+speedVectorText([ret.incoming.vx,ret.incoming.vy,ret.incoming.vz])
+            +'m/s，v_out='+speedVectorText([ret.vx,ret.vy,ret.vz])
+            +'m/s，冲击前世界拍心 v_r='+speedVectorText(enRacket.world)+'m/s'
+            +'；拍面前向 n='+speedVectorText(enResult.normal)+'，yaw/pitch='
+            +tableSigned(enFace.deg)+'/'+tableSigned(enFace.pitch)+'°'
+            +'；实际触球 tPC='+ret.tHit.toFixed(3)+'s → tRK='+enHitRk.toFixed(3)
+            +'s（相对 raw HT '+tableSigned((enHitRk-finalHt)*1000)+'ms，本抛 zPhase 反解）'
+            +'；来球拟合 '+ret.incoming.n+'点/'+Math.round(ret.incoming.span*1000)
+            +'ms，max|残差|='+(ret.incoming.maxRes*100).toFixed(1)+'cm'
+            +'；同一冲击前 v_r 同时用于入/出相对速度。这是拍心刚性速度近似下的逐拍等效值，'
+            +'不是材料常数，也不是落地 cor_z/cxy 或世界y等效e；负值/>1保留诊断，不钳位')+'">'
+          +enResult.en.toFixed(3)+'</span>'
+      : '<span title="'+tableEsc(enMissingReason)+'">—</span>';
     // RK 全量无污染观测（球世界三轴拟合 × 车实际 x/y 外推）在臂最后更新HT 上量出的真值，
     // 供右边两列共用：dy = 球面到车 y 面的缺口 = 时序误差的空间形态；
     // dx/dz = 球心相对车中心的落点（拍面上的位置，不扣球半径）= 击球点真值。
@@ -2876,7 +3308,7 @@ const rk300TableHtml = () => {
       : '';
     // [[hit-plane-shift-core-end]]
     const truthNote=gapFin
-      ? '真值取 RK 全量无污染观测@臂最后更新HT '+rkToPc(finalHt).toFixed(3)+'s（世界轴，不转车yaw）：'
+      ? '真值取 RK 全量无污染观测@臂最后更新HT '+rowPcFixed(finalHt)+'s（global PC轴；世界轴，不转车yaw）：'
         +'球世界 '+gapFin.n+'点三轴共用（窗[ht−450,−25]ms，z≥15cm'
         +(gapFin.n<gapFin.nWin?('，按y轴3σ剔'+(gapFin.nWin-gapFin.n)+'点'):'')+'，rms x/y/z='
         +cmFmt(gapFin.rmsX)+'/'+cmFmt(gapFin.rms)+'/'+cmFmt(gapFin.rmsZ)
@@ -2920,7 +3352,7 @@ const rk300TableHtml = () => {
           +'；正=预测点在真实球位的 +x 侧/上方（臂瞄偏的方向）'
           +'；两侧都是世界轴、各自相对各自的车（预测用同条消息的 car_pred_x，真值用车实际x），'
           +'故不含 yaw 旋转项；预测取末次target对应消息（ht='
-          +(targetPredHtBaseline!=null?targetPredHtBaseline.toFixed(3):'—')+'s）'
+          +(targetPredHtBaseline!=null?targetPredHtBaseline.toFixed(3):'—')+'s，global PC轴）'
           +'；真值与左列「球面y−车y」是同一份 RK 全量拟合、同一个取值时刻（臂最后更新HT）'
           +'；'+truthNote)+'">'
           +cmSigned(aimDx)+'/'+cmSigned(aimDz)+'</span>'
@@ -2931,23 +3363,23 @@ const rk300TableHtml = () => {
         +' lead='+(targetPred.lead*1000).toFixed(1)+'ms / msgs='+(th.msgs||0)
       : '末次target无对应预测 / msgs='+(th.msgs||0);
     if(!targetPred||!isNum(targetPred.ht)||!isNum(targetPred.relX)||!isNum(targetPred.relZ)){
-      return '<tr><td>'+(idx+1)+'</td><td>'+zPhaseCell+'</td><td>'+targetUpdateCell+'</td><td>'+targetPredHt+'</td><td>'+targetPredHit+'</td><td>'+runTargetError+'</td><td>'+targetPredCarError+'</td><td>'+acceptedTarget+'</td>'+
-        '<td>'+pcTruthCell(targetTruth,true,targetPredSamplePc)+'</td><td>'+pcTruthCell(truthAcc,true,finalHtPcSample)+'</td><td>'+tcpCell+'</td><td>'+visCell+'</td><td>'+updGapCell+'</td>'+
+      return '<tr><td>'+(idx+1)+'</td><td>'+zPhaseCell+'</td><td>'+targetUpdateCell+'</td><td>'+targetPredHt+'</td><td>'+targetPredHit+'</td><td>'+targetActualAtHtError+'</td><td>'+predActualAtHtError+'</td><td>'+acceptedTarget+'</td>'+
+        '<td>'+pcTruthCell(targetTruth,true,targetPredSamplePc,true)+'</td><td>'+pcTruthCell(truthAcc,true,finalHtPcSample)+'</td><td>'+tcpCell+'</td><td>'+visCell+'</td><td>'+updGapCell+'</td>'+
         '<td>'+blindCell+'</td><td>'+dHtCell+'</td><td>'+gapCell+'</td><td>'+aimCell+'</td>'+
-        '<td>'+carYawCell+'</td><td>'+tgtSpeedCell+'</td>'+
+        '<td>'+carYawCell+'</td><td>'+tgtSpeedCell+'</td><td>'+tgtOutCell+'</td>'+
         '<td>'+faceYawCell+'</td><td>'+faceYawPreCell+'</td>'+
-        '<td>'+returnCell+'</td>'+
-        '<td>'+targetInfo+'</td><td class="armTblNote"><div>'+rejectNote+'</div></td></tr>';
+        '<td>'+returnCell+'</td><td>'+enCell+'</td>'+
+        '<td>'+targetInfo+'</td><td class="armTblNote"><div>'+rejectNote+'</div></td><td>'+racketCorCell+'</td></tr>';
     }
     return '<tr><td>'+(idx+1)+'</td>'+
       '<td>'+zPhaseCell+'</td>'+
       '<td>'+targetUpdateCell+'</td>'+
       '<td>'+targetPredHt+'</td>'+
       '<td>'+targetPredHit+'</td>'+
-      '<td>'+runTargetError+'</td>'+
-      '<td>'+targetPredCarError+'</td>'+
+      '<td>'+targetActualAtHtError+'</td>'+
+      '<td>'+predActualAtHtError+'</td>'+
       '<td>'+acceptedTarget+'</td>'+
-      '<td>'+pcTruthCell(targetTruth,true,targetPredSamplePc)+'</td>'+
+      '<td>'+pcTruthCell(targetTruth,true,targetPredSamplePc,true)+'</td>'+
       '<td>'+pcTruthCell(truthAcc,true,finalHtPcSample)+'</td>'+
       '<td>'+tcpCell+'</td>'+
       '<td>'+visCell+'</td>'+
@@ -2958,10 +3390,11 @@ const rk300TableHtml = () => {
       '<td>'+aimCell+'</td>'+
       '<td>'+carYawCell+'</td>'+
       '<td>'+tgtSpeedCell+'</td>'+
+      '<td>'+tgtOutCell+'</td>'+
       '<td>'+faceYawCell+'</td>'+
       '<td>'+faceYawPreCell+'</td>'+
-      '<td>'+returnCell+'</td>'+
-      '<td>'+targetInfo+'</td><td class="armTblNote"><div>'+rejectNote+'</div></td></tr>';
+      '<td>'+returnCell+'</td><td>'+enCell+'</td>'+
+      '<td>'+targetInfo+'</td><td class="armTblNote"><div>'+rejectNote+'</div></td><td>'+racketCorCell+'</td></tr>';
   });
   window.__armHitContract={
     schema:'arm_final_ht/v4',
@@ -2988,41 +3421,43 @@ const rk300TableHtml = () => {
   const throwAlignSummary='<div style="font-size:11px;color:'+
     (phaseSummaryGood?'#7fbf9f':'#e0a24a')+
     ';margin:0 0 6px">逐抛 PC 取样 zPhase：'+usablePhysical.length+'/'+physicalPhases.length+
-    ' 个独立 PC/RK flight pair 通过（报告行 '+alignedRows+'/'+reportThrows.length+' 可用）；失败只隐藏依赖 local PC 取样的格（含视觉），'+
-    'RK字段仍用global baseline。offset 范围 '+(usablePhysical.length
+    ' 个独立 PC/RK flight pair 通过（报告行 '+alignedRows+'/'+reportThrows.length+' 可用）；失败只隐藏依赖 local PC 取样的格（含视觉），'
+    +'RK字段仍用global baseline。offset 范围 '+(usablePhysical.length
       ? tableSigned(Math.min(...usablePhysical.map(p=>p.deltaMs))):'—')+'～'+(usablePhysical.length
       ? tableSigned(Math.max(...usablePhysical.map(p=>p.deltaMs))):'—')+'ms。</div>';
   return throwAlignSummary+'<div class="armTblWrap"><table class="armTbl"><thead><tr>'+
     '<th>#</th><th title="每抛用同一颗球的 PC/RK z(t) 在global baseline上估一个不超过100ms的PC取样offset；HT只粗配flight，不进入评分。所有PC取样（含视觉）应用该offset，RK字段不应用">PC取样 zPhase<br>offset(ms)</th>'+
     '<th title="上行=RUN内最后一次可观察 raw target_x/y 坐标变化的 bot_state.t；下行=用该帧 t+remaining 回配到同抛 pred.ht 后，那条预测消息自己的 payload ct。两者只按global baseline映射，逐抛offset不改RK时间">最后改target t / 对应ct<br>(s,global PC轴)</th>'+
     '<th>对应预测 HT<br>(s,global PC轴)</th>'+
-    '<th>对应预测击球 rel_x/z(cm)</th><th>车RUN末帧 目标−实际 dx/dy(cm)<br>(RK世界系)</th>'+
-    '<th title="同一条对应预测的 car_pred_x/y − RUN 末帧实际 x/y。对应消息由最后 target 变化帧的 t+remaining 与 pred.ht 回配；Stage0 的 car_pred 是 raw target，不冒充轨迹预测">末次target对应预测车@HT−RUN末实际 dx/dy(cm)<br>(RK世界系)</th>'+
-    '<th title="'+tableEsc('臂 /tennis/status 自述的最终执行目标（臂系 cm）。回配到原始 '+
-      '/predict_hit_pos 的成功率 '+_armHit.nMatch+'/'+_armHit.nAcc+' 条'+
-      '（主键=序号对齐 δ='+(armPredAlign.delta!=null?armPredAlign.delta:'—')+'）。'+
-      '本场自标定的臂端口径：x = rel_x×'+(armConstCal.xScale!=null?armConstCal.xScale.toFixed(5):'—')+
-      (armConstCal.xScale!=null&&armConstCal.xScale>1
-        ? '（≡1/cos '+(Math.acos(1/armConstCal.xScale)*180/Math.PI).toFixed(1)+'°，'+
-          'receive_hit 里的 kHitYawExtraRad 整体多转）' : '')+
-      '、z = rel_z'+(armConstCal.zOff!=null?armConstCal.zOff.toFixed(4):'—')+'m、'+
-      '臂内提前量 '+(armConstCal.adv!=null?(armConstCal.adv*1000).toFixed(0)+'ms':'—')+
-      '。这三个量都随 arm_controller 改版跳变，逐场标定、不写死')+'">'+
-    '机械臂最后accepted目标 x/z(cm)</th>'+
-    '<th>PC真值@对应预测HT+zPhase x/y/z(cm)</th>'+
+    '<th>对应预测击球 rel_x/z(cm)</th>'+
+    '<th title="末次 target_x/y − /bot_state 实际 x/y；实际位置严格在 imu_t=target deadline 上有界插值，phase/target/deadline 仍按 bot_state.t 事件轴">末次target目标−实际车@HT<br>dx/dy(cm)<br>(RK世界系)</th>'+
+    '<th title="同一条对应预测的 car_pred_x/y − /bot_state 实际 x/y；两侧都在 pred.ht，实际位置严格按 imu_t 有界插值。对应消息仍由最后 target 变化帧的 bot_state.t+remaining 与 pred.ht 回配；Stage0 的 car_pred 是 raw target，不冒充轨迹预测">末次target对应预测车@HT<br>−实际车@HT dx/dy(cm)<br>(RK世界系)</th>'+
+    '<th title="'+tableEsc('最后一条 /tennis/status accepted 回配到它实际消费的上游 '+
+      '/predict_hit_pos；本列直接显示 payload rel_x/rel_z 原值，不做 face_yaw、车 yaw 或位置偏置变换。'+
+      '回配成功率 '+_armHit.nMatch+'/'+_armHit.nAcc+' 条（主键=序号对齐 δ='+
+      (armPredAlign.delta!=null?armPredAlign.delta:'—')+'）')+'">'+
+    '机械臂最后accepted目标<br>x/z(cm)</th>'+
+    '<th title="x=球心world_x−车体中心world_x；y=(球心world_y−R球3.3cm)−车体中心world_y；z=球心world_z。三轴在global HT映射后只给PC取样时刻加本抛zPhase，世界轴不转车yaw">PC真值@对应预测HT+zPhase<br>x/y/z(cm)<br>(y为球接触面)</th>'+
     '<th title="与左列同一套入弧拟合真值，只把global评估锚换成raw臂最后更新HT，再给PC取样时刻加本抛zPhase。mode=2 Coast时'+
-    '该raw HT不是机械臂执行接触锚；右侧 TCP 五数会仅对这种行改取实际 accepted 平面过面点'+
+    '该raw HT不是机械臂执行接触锚；右侧 TCP 仍严格使用这个 raw HT，不另找过面时刻'+
     '（连续sweep时=最后进入update_ht的 late raw ht，否则=最后一条 accepted raw ht；'+
     '未减臂内提前量）。两列之差=真值随 ht 变化移动的量'+
     '（球速≈10m/s 时 1ms≈1cm）">'+
-    'PC真值@臂最后更新HT+zPhase x/y/z(cm)</th>'+
-    '<th title="'+tableEsc('五个数使用同一个 TCP 取样点和同刻车yaw：前三个是拍心−车心世界轴 '+
-    'x/y/z，后两个是该 TCP − controller last accepted tx/tz 的世界轴 dx/dz。正常抛取 raw 臂最后'+
-    '更新HT；最后状态为 mode=2 Coast 时 raw ht_ 已与有效 profile 脱钩，仅这种行改取实际 accepted '+
-    '平面过面点。'+armFkCarNote+'。悬停看臂系原值、旋转与 Coast 修正明细')+'">'+
-    'TCP−车心@臂最后更新HT x/y/z(cm,世界轴)<br>tcp−last accepted（dx，dz）</th>'+
-    '<th title="'+tableEsc('四相机固定黑标拍心−同曝光车心，世界轴。每格保留距 raw 臂最后更新HT+zPhase 35ms 内最近的前、后原始曝光；视觉帧映回RK/TCP时也使用同一抛zPhase。')+'">'+
-    '视觉拍心−车心@臂最后更新HT+zPhase前/后 x/z(cm,世界轴)</th>'+
+    'PC真值@臂最后更新HT+zPhase<br>x/y/z(cm)</th>'+
+    '<th title="'+tableEsc('前三个数严格使用 raw 臂最后更新HT：TCP x/y 按同刻车yaw旋到世界轴，'+
+    '不做车心平移；z 用车型刚性安装高度从 FK 安装面零点换到机械臂中心地面点 z=0。'+
+    '后两个直接用该 TCP x/z 减上游 last accepted 的原始 rel_x/rel_z；accepted 侧不做 face_yaw、'+
+    '车 yaw 或位置偏置变换。mode=2 Coast 也不换时刻。'+armFkCarNote+'。悬停看 yaw 与 z 高度换算')+'">'+
+    'TCP@臂最后更新HT x/y/z(cm,世界轴)<br>相对机械臂中心地面点z=0<br>tcp−last accepted（dx，dz）</th>'+
+    '<th title="'+tableEsc((racketBlackMarker
+      ? '四相机黑色拍心标记中心三角化'
+      : '离线多相机实测拍心三角化')+
+    '−同曝光车心，世界轴。每格只保留距 raw 臂最后更新HT+zPhase 35ms 内最近的前、后原始曝光和 signed dt，'+
+    '不做宽窗拟合。'+(visualTcpSameOrigin
+      ? '本场 V04 的车底盘中心=机械臂 base，因此同时显示视觉−同曝光TCP dx/dz。'
+      : '本车型未确认车心与机械臂 base 同原点，不计算视觉−TCP。')+
+    '悬停看世界坐标、车心、同曝光 TCP 与每帧质检。')+'">'+
+    '视觉拍心−车心@臂最后更新HT+zPhase前/后<br>x/z(cm,世界轴)<br>视觉−同曝光TCP（dx，dz）</th>'+
     '<th title="臂受理的最后一条 /predict_hit_pos 到达时刻 − 挥拍段起点(老触球−HIT_T 0.25s)；'+
     '正=更新落在挥拍开始之后（0803 起挥拍窗内不再拒收，这些消息就是 ht 重定相的养料）。'+
     '悬停看两个绝对时刻与重定相是否生效">最后更新−挥拍起<br>(ms)</th>'+
@@ -3031,7 +3466,7 @@ const rk300TableHtml = () => {
     '已被 update_ht 消费）；旧版重定相生效时=最后一条被采纳的 late ht saved；未触发/剩余不足时=最后一条 accepted'+
     '（典型 300~335ms）。这段时间预测纯外推、没有任何新观测进来，即本拍的信息盲区。'+
     '⚠— = 重定相生效但该条回配失败，拿不到同源 ht/ct，不出数（不退回 accepted 冒充）">'+
-    '盲区 ht−ct@臂最后更新<br>(ms)</th>'+
+    '盲区 ht−ct<br>@臂最后更新HT<br>(ms)</th>'+
     '<th title="挥拍时用的 ht（最后一条 accepted）→ 挥拍中重定相更新后的 ht，正=新预测把击球点推晚；'+
     '两者同为原始 ht，与臂内触球时刻（各减同一个本场自标定提前量）之差等价。灰字(未采纳)=剩余不足 60ms 控制器放弃了重定相">'+
     'Δht 重定相<br>(ms)</th>'+
@@ -3039,38 +3474,45 @@ const rk300TableHtml = () => {
     '车实际x/y挥拍前外推）量出的 (球心y−R球3.3cm)−车y，世界轴，单位cm。车y面≡拍面，'+
     '故 0=该 ht 正好是真实触球，正=那一刻球面还没够到拍面(ht 偏早)，负=球已穿过(ht 偏晚)。'+
     '悬停看闭合速度、等效时序(ms)与球/车两侧的拟合明细">'+
-    '球面y−车y @臂最后更新HT<br>(cm, RK全量真值)</th>'+
+    '球面y−车y<br>@臂最后更新HT<br>(cm, RK全量真值)</th>'+
     '<th title="末次target对应消息预测的击球点 (x,z) − 真值 (x,z)，单位cm。'+
     '这里的「真值」与左列同一份：RK 全量无污染观测（球世界三轴二次拟合 × 车实际x/y挥拍前外推，'+
     '不含任何预测量），取值时刻同样是raw臂最后更新HT；mode=2 Coast时它不是机械臂执行接触锚。'+
     '两侧都是世界轴且各自相对各自的车：预测侧=消息世界x−同条的 car_pred_x、z 用 rel_z(车中心z≡地面0)；'+
     '真值侧=球心x−车实际x、球心z。故不含车体系↔世界轴的 yaw 旋转项。'+
     '正=预测点落在真实球位的 +x 侧/上方，即臂被瞄偏的方向">'+
-    '击球点@末次target预测 − RK全量真值@臂最后更新HT<br>dx/dz(cm, 世界轴)</th>'+
+    '击球点@末次target预测<br>− RK全量真值@臂最后更新HT<br>dx/dz(cm, 世界轴)</th>'+
     '<th title="车体 yaw@臂最后更新HT（最后进入update_ht的预测原始ht，未减臂内提前量；与左侧两列'+
     '击球真值、右侧两列拍面yaw,pitch 同锚）：取 /bot_state 瞬时值——车控 accept AprilTag 定位后 yaw 由 '+
     'IMU 连续更新、HT 结束后才重定位，故采样点无重定位台阶，挥拍位姿伪迹只塌陷位置不动 yaw。'+
-    '悬停看 IMU yaw_speed 换算的 10ms 时序灵敏度；右侧世界拍面 yaw 直接减同一 RK yaw">'+
-    '车yaw@臂最后更新HT(°)</th>'+
+    '悬停看 IMU yaw_speed 换算的 10ms 时序灵敏度；右侧拍面yaw,pitch@臂最后更新HT 列直接减同一 RK yaw，不读取PC yaw">'+
+    '车yaw@臂最后更新HT<br>(°)</th>'+
     '<th title="该次挥拍最后一条 accepted 状态自带的计划量：目标触球拍速（m/s，拍心，过完各级'+
     '钳位后的实际计划值，口径 2·|行程|/hit_time·x 且只算 J1）/ 目标拍面仰角（°，0805 起随来球'+
     '俯冲角变，臂系≡世界系）。悬停看 speed_req(原始指令)、shortened(引拍被夹 rad)、face_yaw 目标。'+
     '注意：speed 是受理时按零起速算的账，挥拍段在首帧建、并在 ht 重定相触发点用当刻(q,v)重建，'+
     '起速非零会抬高真实触球速度，与右列实测对照时以右列悬停的「同刻指令侧」为准">'+
     '目标挥拍速度/pitch<br>(m/s, °)</th>'+
-    '<th title="拍面法向（FK link6 +X）的世界 yaw / pitch，同一份冲击前窗[−80,−6]ms 线性拟合；'+
-    '灰字为实测拍心速度 |v_tcp|（m/s，完整 FK 解析 Jacobian，HT 处直接插值不外推）。'+
-    'yaw=face_yaw−车yaw（车侧直接取 RK /bot_state yaw@imu_t=raw HT，不受PC zPhase影响）；pitch=asin(n_z) 不减车yaw——J1/BASE_ROT 纯 z 转'+
+    '<th title="最后一条 accepted 状态原子记录的规划球出射需求：世界 yaw=atan2(vx,vy)；pitch/speed 为 RacketPrediction 在拍面域钳位后、保落点重解得到的球轨迹。不是 yaw_extra、拍面角、拍心速度，也不是 PC 实测回球">'+
+    '目标规划出球<br>yaw/pitch/speed<br>(°,°,m/s;世界系)</th>'+
+    '<th title="拍面法向（车型配置轴；V04 为 FK link6 +Y）的世界 yaw / pitch，同一份冲击前窗[−80,−6]ms 线性拟合；'+
+    '灰字为世界拍心速度 |v_world|：六轴 Jacobian 三维速度旋到世界系后，向量叠加同刻车心 vx/vy 与 '+
+    'IMU yaw_speed×(车心到拍心杆臂)；车体位姿/速度按 bot_state imu_t，IMU t 已是物理采样时刻。'+
+    '任一合同缺失即显示—，不退回 arm-only。'+
+    'yaw=face_yaw−车yaw（车侧直接取 RK /bot_state yaw@imu_t=raw HT，不受PC zPhase影响）；'+
+    'pitch=asin(n_z) 不减车yaw——J1/BASE_ROT 纯 z 转'+
     '不动 n_z，臂系 pitch≡世界 pitch，正=开面上仰。悬停看两个角速度（ψ̇ 几百°/s 时序敏感、'+
-    'θ̇≈0 对时序免疫），以及拍速的 J1 分量、同刻指令值、臂内触球锚（指令速度平台首帧）上的'+
-    '指令/实测与触球欠速、单点抖动 σ">'+
-    '拍面yaw,pitch,speed@臂最后更新HT(°,°,m/s;世界系)</th>'+
+    'θ̇≈0 对时序免疫），以及六轴臂相对、车心平移、车 yaw 刚体项三个速度分量；J1 指令/实测、'+
+    '臂内触球锚与抖动只按 J1 同口径比较">'+
+    '拍面yaw,pitch / 世界拍心speed<br>@臂最后更新HT<br>(°,°,m/s;世界系)</th>'+
     '<th title="同左列同一份拟合/同一套拍速口径，只把取值时刻挪到 HT−12ms（角度落在窗内为纯插值，'+
     '拍速为插值）。−12ms 是固定探针，且本场用指令速度平台首帧定位的臂内触球锚中位就在 HT−11ms，'+
     '故本列基本踩在真实触球上；与左列之差 = 12ms 时序误差的代价——yaw 上是 ψ̇×12ms（度级）、'+
-    'pitch 上≈0、拍速上是这 12ms 里 J1 还在加速的量">'+
-    '拍面yaw,pitch,speed@臂最后更新HT−12ms(°,世界系)</th>'+
-    '<th>PC回球 yaw/俯仰(°) / speed / Δt(ms)</th><th>消息</th><th>备注</th></tr></thead>'+
+    'pitch 上≈0、世界拍速差同时含臂、车心平移和车 yaw 三项变化">'+
+    '拍面yaw,pitch / 世界拍心speed<br>@臂最后更新HT−12ms<br>(°,°,m/s;世界系)</th>'+
+    '<th title="Δt=PC入/出弧交点触球时刻−raw臂最后更新HT的PC取样锚；RK HT保持global baseline，只在PC查询/比较侧加本抛zPhase，质量不过门则本格—">PC回球<br>yaw/俯仰(°) / speed / Δt(ms)</th>'+
+    '<th title="逐拍实测等效法向恢复系数：e_n=−((v_out−v_r)·n)/((v_in−v_r)·n)。PC 来/回球、完整六轴+车体世界拍心速度和拍面前向法线都取同一实际触球时刻；tHit 用本抛 zPhase 从 PC 轴反解到 RK。缺任一合同或法向闭合速度≤1m/s即—，不回退总速标量/J1；负值或>1保留诊断。它不是材料常数，也不是落地 cor_z/cxy 或世界y等效e。">实测 e_n,eff<br>(拍面法向)</th><th>消息</th><th>备注</th>'+
+    '<th style="white-space:nowrap" title="racket_impact/v3 按 contact_anchor_t_rk 保序回配；该时刻是RK ball_world固定高度外推锚点，不是视频直接观测impact。拍头bbox中心速度拟合窗口为锚点前125ms至后35ms。触球锚与vision_evaluated分层显示；只有状态一致，且measurement、bundle、原始bbox观测、帧数/时跨/重投影证据齐全的accepted记录才显示vz。vz_world_mps是球拍头bbox几何中心bundle世界z速度代理，不是校准拍面速度，也不是直接观测球自转；拍头上行/下行只推导上旋/下旋倾向，且未用于本场S0。S0 cor_xy/cor_z、RK弹后实测复算、历史旧rvz是三条独立证据。">PC视频判型 / S0 cxy, cor_z / 实测反弹 cxy, cor_z / RK旧拍头vz</th></tr></thead>'+
     '<tbody>'+rows.join('')+'</tbody></table></div>';
 };
 
@@ -3080,15 +3522,15 @@ const armAcceptedTableHtml = () => {
   const hits=armHitMarks.filter(h=>h.label==='hit');
   if(!hits.length) return '<div style="color:#a0a0c0">本场没有 accepted hit。</div>';
   const rows=hits.map(h=>{
-    const recvPc=isNum(h.lastAcceptT)?rkToPc(h.lastAcceptT):null;
     const sourceOk=isNum(h.wct)&&isNum(h.wht)&&isNum(h.wx)&&isNum(h.wz);
     if(!sourceOk){
-      return '<tr><td>—</td><td>'+tableFmt(recvPc,3)+'</td><td>—</td><td>—</td><td>—</td><td>无法回配</td>'+
+      return '<tr><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>无法回配</td>'+
         '<td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>updates='+(h.n||1)+'</td><td>—</td></tr>';
     }
     const accCt=h.wct-RK.t0;
     const accHt=h.wht-RK.t0;
     const th=matchThrowByAcceptedCt(accCt);
+    const recvPc=isNum(h.lastAcceptT)?rkToPc(h.lastAcceptT):null;
     const accCtPc=rkToPc(accCt);
     const accHtPcBaseline=rkToPc(accHt);
     const accHtPcSample=th?pcSampleTimeForThrow(th,accHt):null;
@@ -3106,13 +3548,13 @@ const armAcceptedTableHtml = () => {
       ' / updates='+(h.n||1);
     return '<tr><td>'+tableFmt(throwNo,0)+'</td>'+
       '<td>'+tableFmt(recvPc,3)+'</td>'+
-      '<td>'+accCtPc.toFixed(3)+'</td>'+
-      '<td>'+accHtPcBaseline.toFixed(3)+'</td>'+
+      '<td>'+tableFmt(accCtPc,3)+'</td>'+
+      '<td>'+tableFmt(accHtPcBaseline,3)+'</td>'+
       '<td>'+((accHt-accCt)*1000).toFixed(1)+'</td>'+
       '<td>'+tableXzCm(h.wx,h.wz)+'</td>'+
       '<td>'+pcTruthCell(truth,false,accHtPcSample)+'</td>'+
       '<td>'+cmSigned(dx)+'/'+cmSigned(dz)+'</td>'+
-      '<td>'+(has300?rkToPc(th.ref300Ht).toFixed(3):'—')+'</td>'+
+      '<td>'+(has300?tableFmt(rkToPc(th.ref300Ht),3):'—')+'</td>'+
       '<td>'+(has300?tableXzCm(th.ref300X,th.ref300Z):'—')+'</td>'+
       '<td>'+tableSigned(dHt)+'</td>'+
       '<td>'+cmSigned(dX)+'/'+cmSigned(dZ)+'</td>'+
@@ -3234,20 +3676,24 @@ buildPlots[0] = () => {
 // RK Car Move：每次抛球后的底盘移动，bot_state 原生 ~100Hz 逐帧回放。
 // 分段 = phase 离开 WAIT（RK 收到该抛目标才 RUN，天然一抛一段），回到 WAIT 结束
 // （含 BRAKE_IN_SWING / BRAKE_AFTER_SWING），前后各补 0.5s 上下文。
-// 老 JSON（重提取前）无 phase/vx 等字段：退回 target_x 非空段分段，缺的量显示 —。
+// phase/target/remaining 属于发布事件轴 bot_state.t；x/y/yaw/v 属于物理轴 imu_t。
+// 老 JSON 缺 imu_t 时物理量显示 —，不回退到发布时刻冒充。
 buildPlots[1] = () => {
   if(!RK) return;
   const numv = v => (typeof v==='number' && Number.isFinite(v)) ? v : null;
-  const bT=ts(RK.bot), bY=k=>ys(RK.bot,k);
+  const bT=ts(RK.bot), bY=k=>ys(RK.bot,k), bPoseT=bY('imu_t')||[];
   const cols={x:bY('x'), y:bY('y'), yaw:bY('yaw'), vx:bY('vx'), vy:bY('vy'),
     phase:bY('phase'), steer:bY('steer_angle'), rem:bY('remaining'),
     tx:bY('target_x'), ty:bY('target_y')};
   const rows=[];
   for(let i=0;i<bT.length;i++){
-    const t=numv(Number(bT[i]));
+    const t=numv(bT[i]);
     if(t===null) continue;
-    rows.push({t, x:numv(cols.x[i]), y:numv(cols.y[i]), yaw:numv(cols.yaw[i]),
-      vx:numv(cols.vx[i]), vy:numv(cols.vy[i]),
+    const poseT=numv(bPoseT[i]);
+    rows.push({t, poseT,
+      x:poseT===null?null:numv(cols.x[i]), y:poseT===null?null:numv(cols.y[i]),
+      yaw:poseT===null?null:numv(cols.yaw[i]),
+      vx:poseT===null?null:numv(cols.vx[i]), vy:poseT===null?null:numv(cols.vy[i]),
       phase:cols.phase[i]!=null?String(cols.phase[i]):null,
       steer:numv(cols.steer[i]), rem:numv(cols.rem[i]),
       tx:numv(cols.tx[i]), ty:numv(cols.ty[i])});
@@ -3394,15 +3840,16 @@ buildPlots[1] = () => {
   const DYN_IDX=[2,3,4,5,6,7];
   const setSide=f=>{
     V.frame.textContent=`${cur+1} / ${seg.frames.length}`;
-    V.tRk.textContent=`${f.t.toFixed(3)} s`;
-    V.tPc.textContent=`${rkToPc(f.t).toFixed(3)} s`;
+    V.tRk.textContent=f.poseT===null?`— (发布 ${f.t.toFixed(3)} s)`
+      :`${f.poseT.toFixed(3)} s (发布 ${f.t.toFixed(3)} s)`;
+    V.tPc.textContent=f.poseT===null?'—':`${rkToPc(f.poseT).toFixed(3)} s`;
     V.phase.textContent=f.phase!==null?f.phase:'—';
     V.pos.textContent=(f.x!==null&&f.y!==null)?`(${f.x.toFixed(3)}, ${f.y.toFixed(3)}) m`:'—';
     const spd=(f.vx!==null&&f.vy!==null)?Math.hypot(f.vx,f.vy):null;
     V.spd.textContent=spd===null?'—':`${spd.toFixed(3)} m/s`;
     V.vxy.textContent=f.vx===null?'—':`${f.vx.toFixed(3)} / ${f.vy.toFixed(3)} m/s`;
     V.yaw.textContent=deg(f.yaw);
-    const w=lutAt(imuWLut,f.t,0.06);
+    const w=f.poseT===null?null:lutAt(imuWLut,f.poseT,0.06);
     V.imuW.textContent=w===null?'—':`${w.toFixed(3)} rad/s`;
     V.steer.textContent=deg(f.steer);
     // 目标 steer：/chassis_can/steer_cmd MIT 位置设定点。BRAKE_IN/AFTER_SWING 不发 steer 帧，
@@ -3431,8 +3878,8 @@ buildPlots[1] = () => {
     const f=seg.frames[cur];
     slider.value=String(cur);
     clock.textContent = rkAxisAligned
-      ? `帧 ${cur+1}/${seg.frames.length} · PC=${rkToPc(f.t).toFixed(2)}s`
-      : `帧 ${cur+1}/${seg.frames.length} · RK=${f.t.toFixed(2)}s（未对齐）`;
+      ? `帧 ${cur+1}/${seg.frames.length} · PC(imu)=${f.poseT===null?'—':rkToPc(f.poseT).toFixed(2)+'s'}`
+      : `帧 ${cur+1}/${seg.frames.length} · imu_t=${f.poseT===null?'—':f.poseT.toFixed(2)+'s'}（未对齐）`;
     setSide(f);
     const d=dyn(f);
     Plotly.restyle('c1',{
@@ -3772,6 +4219,12 @@ buildPlots[5] = () => {
     hovertemplate:`t=%{x:.3f}s<br>${name}=%{y:.4f}<extra>${name}</extra>`,
     ...extra,
   });
+  const botPoseTr = (key,name,axis,color,extra={}) => g2({
+    x:shifted(ys(RK.bot,'imu_t')||[]), y:ys(RK.bot,key), name, mode:'markers',
+    marker:{color,size:3}, line:{color,width:1.4}, yaxis:axis, xaxis:'x',
+    hovertemplate:`imu_t=%{x:.3f}s<br>${name}=%{y:.4f}<extra>${name}</extra>`,
+    ...extra,
+  });
   const rkWorldTr = (key,name,color,extra={}) => tr(RK.world,key,name,'y',color,'markers',{
     customdata:ts(RK.world).map((_,i)=>[
       ys(RK.world,'result_t')[i],
@@ -3864,18 +4317,19 @@ buildPlots[5] = () => {
     rkRefTr('rel_z','RK Ref Z','#84cc16'),
     pcCarTr('x','PC Car X','#d946ef'),
     pcCarTr('y','PC Car Y','#c084fc'),
-    // 机械臂 FK TCP（与 RK 数据同轴，经 rkToPc 到 PC 轴；z 减 armZOff 还原世界系高度）
+    // 机械臂 FK TCP：每个 state 用同刻车 yaw 旋到世界轴，原点为机械臂中心且 z=0。
     ...(armAligned ? (()=>{
       const tArm=armTcpRows.map(s=>rkToPc(s.t));
-      const val=k=>armTcpRows.map(s=>(k===2&&armZOff!=null)?s.tcp[2]-armZOff:s.tcp[k]);
+      const tcpWorldRows=armTcpRows.map(s=>armPointWorld(s.tcp,botYawDegAt(s.t),armConstCal.zOff));
+      const val=k=>tcpWorldRows.map(p=>p?p[k]:null);
       const mk=(k,name,color,extra={})=>g2({x:tArm, y:val(k), name, mode:'markers',
         marker:{color,size:2.5}, yaxis:'y', xaxis:'x',
         hovertemplate:`t=%{x:.3f}s<br>${name}=%{y:.4f}m<extra>${name}</extra>`, ...extra});
-      return [mk(0,'Arm TCP X','#22d3ee',{visible:'legendonly'}),
-              mk(1,'Arm TCP Y','#67e8f9',{visible:'legendonly'}),
-              mk(2,'Arm TCP Z','#06b6d4')];
+      return [mk(0,'Arm TCP world X@arm origin','#22d3ee',{visible:'legendonly'}),
+              mk(1,'Arm TCP world Y@arm origin','#67e8f9',{visible:'legendonly'}),
+              mk(2,'Arm TCP Z@arm origin','#06b6d4')];
     })() : []),
-    // 视觉拍心（annotate 离线三角测量，世界系→车体系，与 Arm TCP 同口径可直接叠比）
+    // 视觉拍心保留车心原点，与 Arm TCP 的机械臂中心原点不同，不直接比较。
     ...(pcRacketRows.length ? (()=>{
       const rows=pcRacketRows.map(r=>{
         const rel=relToCar(r,carAt(r.t));       // 车位姿缺失或该刻无 yaw ⇒ null，丢点
@@ -3891,12 +4345,12 @@ buildPlots[5] = () => {
     tr(RK.estimate,'x','RK Estimate X','y','#facc15','markers',{visible:'legendonly',marker:{color:'#facc15',size:4}}),
     tr(RK.estimate,'y','RK Estimate Y','y','#fde047','markers',{visible:'legendonly',marker:{color:'#fde047',size:4}}),
     tr(RK.estimate,'z','RK Estimate Z','y','#f1c40f','markers',{visible:'legendonly',marker:{color:'#f1c40f',size:4}}),
-    tr(RK.bot,'x','Bot X','y','#67e8c3'),
-    tr(RK.bot,'y','Bot Y','y','#9fffce'),
-    g2({x:shifted(ts(RK.bot)), y:ys(RK.bot,'yaw').map(v=>isNum(v)?v*10:null), name:'Bot Yaw x10', mode:'markers',
+    botPoseTr('x','Bot X','y','#67e8c3'),
+    botPoseTr('y','Bot Y','y','#9fffce'),
+    g2({x:shifted(ys(RK.bot,'imu_t')||[]), y:ys(RK.bot,'yaw').map(v=>isNum(v)?v*10:null), name:'Bot Yaw x10', mode:'markers',
       customdata:ys(RK.bot,'yaw'),
       marker:{color:'#5eead4',size:2.5,symbol:'diamond'}, yaxis:'y3', xaxis:'x',
-      hovertemplate:'t=%{x:.3f}s<br>Bot Yaw=%{customdata:.4f}rad<br>display=%{y:.3f}<extra>Bot Yaw x10</extra>',
+      hovertemplate:'imu_t=%{x:.3f}s<br>Bot Yaw=%{customdata:.4f}rad<br>display=%{y:.3f}<extra>Bot Yaw x10</extra>',
       visible:'legendonly'}),
     tr(RK.bot,'target_x','Bot Target X','y','#ffd27f','markers',{visible:'legendonly'}),
     tr(RK.bot,'target_y','Bot Target Y','y','#ff9f7f','markers',{visible:'legendonly'}),
@@ -4203,6 +4657,10 @@ def main() -> None:
     parser.add_argument("--input", default="curve3_output/curve3_result.json")
     parser.add_argument("--racket-json", default=None)
     parser.add_argument(
+        "--racket-impact-json", default=None,
+        help="球拍头bbox中心bundle vz侧车；仅在显式提供时加载",
+    )
+    parser.add_argument(
         "--arm-json", default=None,
         help="extract_arm_bag.py 输出的机械臂 JSON；缺省时自动探测 <input>_arm.json",
     )
@@ -4234,6 +4692,7 @@ def main() -> None:
         args.input,
         out,
         args.racket_json,
+        args.racket_impact_json,
         arm_json,
         rk_tracking_json,
         args.rk_time_bias,

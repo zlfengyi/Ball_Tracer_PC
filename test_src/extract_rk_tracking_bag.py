@@ -32,6 +32,11 @@ CONFIG_TOPICS = {
     "/tennis/config": "arm",
 }
 
+_TENNIS_BALL_RADIUS_M = 0.033
+_GRAVITY_MPS2 = 9.8
+_STAGE1_LAMBDA_MIN = 0.02
+_STAGE1_LAMBDA_MAX = 0.40
+
 
 def _finite(value) -> bool:
     return isinstance(value, (int, float)) and math.isfinite(value)
@@ -69,6 +74,301 @@ def _append_xyz(target: dict, t: float, payload: dict, *, stage=None) -> None:
     target["z"].append(float(z))
     if stage is not None:
         target.setdefault("stage", []).append(stage)
+
+
+def _solve2(m00, m01, m11, r0, r1) -> tuple[float, float]:
+    det = m00 * m11 - m01 * m01
+    if abs(det) < 1e-18:
+        raise ValueError("singular 2x2 bounce fit")
+    return (
+        (r0 * m11 - m01 * r1) / det,
+        (m00 * r1 - m01 * r0) / det,
+    )
+
+
+def _solve3(m00, m01, m02, m11, m12, m22, r0, r1, r2):
+    det = (
+        m00 * (m11 * m22 - m12 * m12)
+        - m01 * (m01 * m22 - m12 * m02)
+        + m02 * (m01 * m12 - m11 * m02)
+    )
+    if abs(det) < 1e-24:
+        raise ValueError("singular 3x3 bounce fit")
+    da = (
+        r0 * (m11 * m22 - m12 * m12)
+        - m01 * (r1 * m22 - m12 * r2)
+        + m02 * (r1 * m12 - m11 * r2)
+    )
+    db = (
+        m00 * (r1 * m22 - m12 * r2)
+        - r0 * (m01 * m22 - m12 * m02)
+        + m02 * (m01 * r2 - r1 * m02)
+    )
+    dc = (
+        m00 * (m11 * r2 - r1 * m12)
+        - m01 * (m01 * r2 - r1 * m02)
+        + r0 * (m01 * m12 - m11 * m02)
+    )
+    return da / det, db / det, dc / det
+
+
+def _fit_free_curve(obs: list[dict]) -> dict:
+    if len(obs) < 3:
+        raise ValueError("too few free-curve points")
+    t_ref = float(obs[0]["t"])
+    s0 = s1 = s2 = s3 = s4 = 0.0
+    bx0 = bx1 = by0 = by1 = bz0 = bz1 = bz2 = 0.0
+    for point in obs:
+        dt = float(point["t"]) - t_ref
+        dt2 = dt * dt
+        x, y, z = float(point["x"]), float(point["y"]), float(point["z"])
+        s0 += 1.0
+        s1 += dt
+        s2 += dt2
+        s3 += dt2 * dt
+        s4 += dt2 * dt2
+        bx0 += x
+        bx1 += dt * x
+        by0 += y
+        by1 += dt * y
+        bz0 += z
+        bz1 += dt * z
+        bz2 += dt2 * z
+    ax, vx = _solve2(s0, s1, s2, bx0, bx1)
+    ay, vy = _solve2(s0, s1, s2, by0, by1)
+    az, vz, cz = _solve3(s0, s1, s2, s2, s3, s4, bz0, bz1, bz2)
+    return {
+        "t_ref": t_ref,
+        "ax": ax,
+        "vx": vx,
+        "ay": ay,
+        "vy": vy,
+        "az": az,
+        "vz": vz,
+        "cz": cz,
+        "lam": 0.0,
+        "g": 0.0,
+    }
+
+
+def _fit_coupled_curve(obs: list[dict], lam: float, g_eff: float) -> dict:
+    if len(obs) < 3 or lam <= 1e-6 or g_eff <= 0.0:
+        raise ValueError("invalid coupled-curve inputs")
+    t_ref = float(obs[0]["t"])
+    p0 = p1 = p2 = 0.0
+    rx0 = rx1 = ry0 = ry1 = rz0 = rz1 = 0.0
+    for point in obs:
+        dt = float(point["t"]) - t_ref
+        phi = -math.expm1(-lam * dt) / lam
+        x, y, z = float(point["x"]), float(point["y"]), float(point["z"])
+        adjusted_z = z + (g_eff / lam) * dt
+        p0 += 1.0
+        p1 += phi
+        p2 += phi * phi
+        rx0 += x
+        rx1 += phi * x
+        ry0 += y
+        ry1 += phi * y
+        rz0 += adjusted_z
+        rz1 += phi * adjusted_z
+    ax, vx = _solve2(p0, p1, p2, rx0, rx1)
+    ay, vy = _solve2(p0, p1, p2, ry0, ry1)
+    az, wz = _solve2(p0, p1, p2, rz0, rz1)
+    return {
+        "t_ref": t_ref,
+        "ax": ax,
+        "vx": vx,
+        "ay": ay,
+        "vy": vy,
+        "az": az,
+        "vz": wz - g_eff / lam,
+        "cz": 0.0,
+        "lam": lam,
+        "g": g_eff,
+    }
+
+
+def _curve_velocity(curve: dict, t: float) -> tuple[float, float, float]:
+    dt = t - curve["t_ref"]
+    lam = curve["lam"]
+    if lam > 0.0:
+        decay = math.exp(-lam * dt)
+        g_over_lam = curve["g"] / lam
+        return (
+            curve["vx"] * decay,
+            curve["vy"] * decay,
+            (curve["vz"] + g_over_lam) * decay - g_over_lam,
+        )
+    return curve["vx"], curve["vy"], curve["vz"] + 2.0 * curve["cz"] * dt
+
+
+def _curve_z(curve: dict, t: float) -> float:
+    dt = t - curve["t_ref"]
+    lam = curve["lam"]
+    if lam > 0.0:
+        phi = -math.expm1(-lam * dt) / lam
+        g_over_lam = curve["g"] / lam
+        return curve["az"] + (curve["vz"] + g_over_lam) * phi - g_over_lam * dt
+    return curve["az"] + curve["vz"] * dt + curve["cz"] * dt * dt
+
+
+def _fit_stage1_curve(obs: list[dict], config: dict, g_eff: float) -> dict:
+    fixed_lam = float(config["stage1_drag_lambda"])
+    if fixed_lam > 1e-6:
+        return _fit_coupled_curve(obs, fixed_lam, g_eff)
+    drag_k = float(config["stage1_drag_k"])
+    if drag_k <= 1e-9:
+        raise ValueError("stage1 adaptive drag is disabled")
+    curve = _fit_free_curve(obs)
+    for _ in range(2):
+        speed = math.sqrt(sum(v * v for v in _curve_velocity(curve, float(obs[-1]["t"]))))
+        lam = min(_STAGE1_LAMBDA_MAX, max(_STAGE1_LAMBDA_MIN, drag_k * speed))
+        curve = _fit_coupled_curve(obs, lam, g_eff)
+    return curve
+
+
+def _free_contact_time(curve: dict, contact_z: float) -> float:
+    a, b, c = curve["cz"], curve["vz"], curve["az"] - contact_z
+    if abs(a) < 1e-12:
+        raise ValueError("free curve has no quadratic contact root")
+    disc = b * b - 4.0 * a * c
+    if disc < 0.0:
+        raise ValueError("free curve misses contact height")
+    root = math.sqrt(disc)
+    candidates = [
+        (-b - root) / (2.0 * a) + curve["t_ref"],
+        (-b + root) / (2.0 * a) + curve["t_ref"],
+    ]
+    valid = [t for t in candidates if t >= curve["t_ref"] - 1e-6]
+    if not valid:
+        raise ValueError("free contact root precedes fit")
+    return max(valid)
+
+
+def _coupled_contact_time(curve: dict, contact_z: float) -> float:
+    lo, hi = curve["t_ref"] - 0.5, curve["t_ref"]
+    if not (_curve_z(curve, lo) < contact_z and _curve_z(curve, hi) >= contact_z):
+        raise ValueError("coupled curve misses rising contact height")
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        if _curve_z(curve, mid) < contact_z:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def _replay_bounce_sample(pre: list[dict], post: list[dict], config: dict, az_eff: float):
+    # 这条历史回填只支持本次两场实际使用的 S0 无水平阻力路径；配置变了就不伪造值。
+    if len(pre) < 6 or len(post) < 6:
+        raise ValueError("too few gated bounce points")
+    if abs(float(config["s0_drag_k"])) > 1e-9:
+        raise ValueError("S0 drag replay is unsupported")
+    g_eff = _GRAVITY_MPS2 + float(config["s1_az_blend"]) * (
+        float(az_eff) - _GRAVITY_MPS2
+    )
+    curve0 = _fit_free_curve(pre)
+    curve1 = _fit_stage1_curve(post, config, g_eff)
+    contact_z = float(config["ground_z"]) + _TENNIS_BALL_RADIUS_M
+    t_pre = _free_contact_time(curve0, contact_z)
+    t_post = _coupled_contact_time(curve1, contact_z)
+    vx_in, vy_in, vz_in = _curve_velocity(curve0, t_pre)
+    vx_out, vy_out, vz_out = _curve_velocity(curve1, t_post)
+    vxy_in, vxy_out = math.hypot(vx_in, vy_in), math.hypot(vx_out, vy_out)
+    closure_ms = (t_post - t_pre) * 1000.0
+    if not (
+        vz_in < 0.0
+        and vz_out > 0.0
+        and vxy_in > 1e-6
+        and vxy_out >= 0.0
+        and abs(closure_ms) <= 25.0
+    ):
+        raise ValueError("quantized bounce replay fails physical/closure gates")
+    cor, cxy = -vz_out / vz_in, vxy_out / vxy_in
+    if not (0.70 <= cor <= 0.95 and 0.35 <= cxy <= 0.90):
+        raise ValueError("quantized bounce replay is outside RK coefficient gates")
+    return cor, cxy, closure_ms
+
+
+def _replay_bounce_measurements(
+    rows: list[tuple[str, int, dict]], config_announce: dict
+) -> dict[int, tuple[float, float, float]]:
+    """Return values only on accepted S1 rows.
+
+    Values are recomputed from the quantized bag payloads; they are not direct RK
+    BounceSample/history fields.
+    """
+    bot_config = config_announce.get("bot_center", {}).get("params", {})
+    required = (
+        "ground_z",
+        "s0_drag_k",
+        "stage1_drag_k",
+        "stage1_drag_lambda",
+        "s1_az_blend",
+    )
+    if not all(_finite(bot_config.get(key)) for key in required):
+        return {}
+
+    world: list[dict] = []
+    world_index_by_t: dict[float, int] = {}
+    last_s0 = None
+    last_online_n = None
+    replay: dict[int, tuple[float, float, float]] = {}
+    for row_index, (topic, _stamp_ns, payload) in enumerate(rows):
+        if topic == "/ball_world_topic":
+            if all(_finite(payload.get(key)) for key in ("t", "x", "y", "z")):
+                world_index_by_t[round(float(payload["t"]), 6)] = len(world)
+                world.append(payload)
+            continue
+        if topic != "/predict_hit_pos":
+            continue
+
+        stage = payload.get("stage")
+        online_n = payload.get("online_n")
+        if stage == 0:
+            last_s0 = payload
+        if not _finite(online_n):
+            continue
+        online_n = int(online_n)
+        increments_once = last_online_n is not None and online_n == last_online_n + 1
+        last_online_n = online_n
+        if not (
+            increments_once
+            and stage == 1
+            and payload.get("bounce_rej") == "ok"
+            and payload.get("n_bounce_fit") == 6
+            and last_s0 is not None
+            and _finite(payload.get("ct"))
+            and _finite(payload.get("n_points"))
+            and _finite(last_s0.get("ct"))
+            and _finite(last_s0.get("n_points"))
+            and _finite(last_s0.get("az_eff"))
+        ):
+            continue
+
+        n_post = 6
+        n_pre = int(payload["n_points"]) - n_post
+        if n_pre != int(last_s0["n_points"]):
+            continue
+        current_world = world_index_by_t.get(round(float(payload["ct"]), 6))
+        last_s0_world = world_index_by_t.get(round(float(last_s0["ct"]), 6))
+        if (
+            current_world is None
+            or last_s0_world is None
+            or n_pre < 3
+            or last_s0_world - n_pre + 1 < 0
+            or current_world - n_post + 1 <= last_s0_world
+        ):
+            continue
+        pre = world[last_s0_world - n_pre + 1 : last_s0_world + 1]
+        post = world[current_world - n_post + 1 : current_world + 1]
+        try:
+            replay[row_index] = _replay_bounce_sample(
+                pre, post, bot_config, float(last_s0["az_eff"])
+            )
+        except (ArithmeticError, OverflowError, ValueError):
+            continue
+    return replay
 
 
 def main() -> int:
@@ -136,6 +436,8 @@ def main() -> int:
                 (result_t - shot_t) * 1000.0,
             )
 
+    bounce_replay_by_row = _replay_bounce_measurements(rows, config_announce)
+
     ball = _new_series()
     world = _new_series()
     pred = _new_series()
@@ -152,7 +454,7 @@ def main() -> int:
     xy_world = {"t": [], "x": [], "y": [], "z": []}
     xy_pred = {"t": [], "x": [], "y": [], "z": [], "stage": []}
 
-    for topic, _stamp_ns, payload in rows:
+    for row_index, (topic, _stamp_ns, payload) in enumerate(rows):
         payload_t = _payload_time(topic, payload)
         if payload_t is None:
             continue
@@ -195,6 +497,9 @@ def main() -> int:
             ht = payload.get("ht")
             duration = (ht - payload_t) if _finite(ht) else payload.get("duration")
             stage = payload.get("stage")
+            cor_meas, cxy_meas, closure_ms = bounce_replay_by_row.get(
+                row_index, (None, None, None)
+            )
             _add(
                 pred,
                 t,
@@ -210,6 +515,12 @@ def main() -> int:
                 car_pred_x=payload.get("car_pred_x"),
                 car_pred_y=payload.get("car_pred_y"),
                 n_bounce_fit=payload.get("n_bounce_fit"),
+                rvz=payload.get("rvz"),
+                cor_xy_eff=payload.get("cor_xy_eff"),
+                cor_eff=payload.get("cor_eff"),
+                cor_meas_replay=cor_meas,
+                cxy_meas_replay=cxy_meas,
+                cor_meas_closure_ms=closure_ms,
             )
             _append_xyz(xy_pred, t, payload, stage=stage)
         elif key == "estimate_loc_topic":
@@ -334,6 +645,10 @@ def main() -> int:
         "bag_dir": str(args.bag.resolve()),
         "time_axis": "rk_payload_time_relative_s",
         "t0": t0,
+        "bounce_measurement_replay": {
+            "semantics": "recomputed from quantized bag /ball_world_topic; not direct RK BounceSample/history",
+            "selection": "first S1 row with online_n +1, bounce_rej=ok, n_bounce_fit=6",
+        },
         "config_announce": config_announce,
         "counts": counts,
         "ball": ball,

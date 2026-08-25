@@ -73,8 +73,8 @@ def _read_bag(bag_dir: Path) -> tuple[list, list, list]:
                 elif channel.topic == "/predict_hit_pos":
                     pred.append(payload)
                 elif channel.topic == "/bot_state":
-                    if payload.get("t") is not None and payload.get("y") is not None:
-                        bot.append((float(payload["t"]), float(payload["y"])))
+                    if payload.get("imu_t") is not None and payload.get("y") is not None:
+                        bot.append((float(payload["imu_t"]), float(payload["y"])))
     est.sort(key=lambda r: r[0])
     bot.sort(key=lambda r: r[0])
     return est, pred, bot

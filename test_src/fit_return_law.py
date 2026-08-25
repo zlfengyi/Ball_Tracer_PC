@@ -370,7 +370,7 @@ def parse_arm_events(arm):
     return out
 
 
-def arm_at_contact(states, st_t, cl, bot_t, bot_ch, rk_t0):
+def arm_at_contact(states, st_t, cl, bot_pose_t, bot_ch, rk_t0):
     t_c = cl["contact_rk"]
     i0, i1 = np.searchsorted(st_t, [t_c - 0.06, t_c + 0.06])
     t_cross = None
@@ -401,7 +401,7 @@ def arm_at_contact(states, st_t, cl, bot_t, bot_ch, rk_t0):
         fps.append(math.degrees(math.asin(max(-1.0, min(1.0, n2)))))
     A1 = np.vstack([np.ones(len(win)), tt]).T
     sol_p, *_ = np.linalg.lstsq(A1, np.array(fps), rcond=None)
-    j0, j1_ = np.searchsorted(bot_t, [t_c - rk_t0 - 0.05, t_c - rk_t0 + 0.05])
+    j0, j1_ = np.searchsorted(bot_pose_t, [t_c - rk_t0 - 0.05, t_c - rk_t0 + 0.05])
     car_vy = None
     vals = [v for v in bot_ch["vy"][j0:j1_] if v is not None]
     if vals:
@@ -453,8 +453,15 @@ def main():
     states = arm["states"]
     st_t = np.array([s["t"] for s in states])
     clusters = parse_arm_events(arm)
-    bot_t = np.array(rk["bot"]["t"])
-    bot_ch = rk["bot"]["y"]
+    bot_y = rk["bot"]["y"]
+    bot_pose_rows = [
+        (float(t), float(vy))
+        for t, vy in zip(bot_y["imu_t"], bot_y["vy"])
+        if isinstance(t, (int, float)) and math.isfinite(t)
+        and isinstance(vy, (int, float)) and math.isfinite(vy)
+    ]
+    bot_pose_t = np.array([r[0] for r in bot_pose_rows])
+    bot_ch = {"vy": [r[1] for r in bot_pose_rows]}
     rk_t0 = rk["t0"]
 
     rets = []
@@ -485,7 +492,7 @@ def main():
         best = min(clusters, key=lambda c: abs(c["contact_rk"] - (ret["tHit"] + o_star)))
         a = None
         if abs(best["contact_rk"] - (ret["tHit"] + o_star)) < 0.8:
-            a = arm_at_contact(states, st_t, best, bot_t, bot_ch, rk_t0)
+            a = arm_at_contact(states, st_t, best, bot_pose_t, bot_ch, rk_t0)
         if not (inc and land and a and a["car_vy"] is not None):
             print(f"i={r['i']:<2d} 提取不完整，跳过（inc={bool(inc)} land={bool(land)} arm={bool(a)}）")
             continue

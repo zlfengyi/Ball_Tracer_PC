@@ -2,7 +2,7 @@
 """回归测试：All-in-One 表 "PC回球 yaw/俯仰" 列的 [[pc-return-core]] 统计。
 
 合成一次抛球+回球（含重力、观测噪声、触球遮挡断档），验证：
-  1. 干净回球给出正确 yaw/俯仰/速率，且对锚点 ±80ms 偏差鲁棒；
+  1. 干净回球给出正确来/回球三维速度、yaw/俯仰/速率，且对锚点 ±80ms 偏差鲁棒；
   2. 挥空（y 不反向）不认定回球；
   3. 贴地静止球观测（z<0.12）不污染结果；
   4. 出弧断档后检测器接上别的球（>12m/s 跳变）被截断，方向仍来自真实首段。
@@ -170,6 +170,13 @@ def test_clean_return_direction(tmp_path: Path, anchor_offset: float) -> None:
     assert abs(ret["pitch"] - PITCH_TRUTH) < 2.5
     assert abs(ret["speed"] - SPEED_TRUTH) < 0.4
     assert ret["n"] >= 5
+    incoming = ret["incoming"]
+    assert incoming is not None
+    assert incoming["vx"] == pytest.approx(V_IN[0], abs=0.25)
+    assert incoming["vy"] == pytest.approx(V_IN[1], abs=0.25)
+    assert incoming["vz"] == pytest.approx(V_IN[2], abs=0.35)
+    assert incoming["n"] >= 5
+    assert incoming["maxRes"] <= 0.12
 
 
 @pytest.mark.skipif(NODE is None, reason="需要 node")
