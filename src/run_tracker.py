@@ -94,6 +94,7 @@ from src.ros2_support import (
     cyclonedds_file_uri,
     ensure_ros2_environment,
     make_best_effort_qos,
+    make_topic_qos,
 )
 from src.tile_manager import TileManager, TileRect
 
@@ -311,6 +312,8 @@ def _submit_latest(
 # 载荷 t 就是这一帧状态的时刻，最合适。ball_world 之类不行——它的 t 是相机曝光时刻，
 # 中间隔着 ~56ms 视觉管线，会把桥整体推偏（虽然定窗够用，但没必要引入已知偏差）。
 _CLOCK_BRIDGE_TOPIC = "/bot_state"
+_BALL_WORLD_TOPIC = "/ball_world_topic"
+_TIME_OFFSET_TOPIC = "/pc_rk_time_offset"
 
 
 def clock_bridge_stats(offsets: list[float], *, source: str) -> dict | None:
@@ -477,7 +480,7 @@ class RosbagRecorderProcess:
 class DirectRos2Sink:
     mode = "direct"
 
-    def __init__(self) -> None:
+    def __init__(self, *, enable_time_alignment: bool = False) -> None:
         ensure_ros2_environment()
         import rclpy
         from rclpy.executors import SingleThreadedExecutor
@@ -489,9 +492,19 @@ class DirectRos2Sink:
         self._msg_type = String
         self._pub_lock = threading.Lock()
         self._car_count = 0
+        self._world_ball_count = 0
         self._spin_stop = threading.Event()
         self._bridge_lock = threading.Lock()
         self._bridge_offsets: list[float] = []
+        if enable_time_alignment:
+            from src.online_time_alignment import OnlineThrowTimeAligner
+
+            self._time_aligner = OnlineThrowTimeAligner()
+        else:
+            self._time_aligner = None
+        self._alignment_queue: queue.Queue[tuple | None] | None = None
+        self._alignment_thread: threading.Thread | None = None
+        self._alignment_error: Exception | None = None
         self._rclpy.init(args=None)
         self._node = Node("ball_tracer_tracker")
         self._car_pub = self._node.create_publisher(
@@ -505,6 +518,28 @@ class DirectRos2Sink:
         self._bridge_sub = self._node.create_subscription(
             String, _CLOCK_BRIDGE_TOPIC, self._on_bridge_msg, make_best_effort_qos()
         )
+        if self._time_aligner is not None:
+            self._world_ball_pub = self._node.create_publisher(
+                String, "/pc_world_ball_loc", make_best_effort_qos()
+            )
+            self._time_offset_pub = self._node.create_publisher(
+                String,
+                _TIME_OFFSET_TOPIC,
+                make_topic_qos(_TIME_OFFSET_TOPIC, depth=4),
+            )
+            self._ball_world_sub = self._node.create_subscription(
+                String,
+                _BALL_WORLD_TOPIC,
+                self._on_ball_world_msg,
+                make_best_effort_qos(depth=64),
+            )
+            self._alignment_queue = queue.Queue()
+            self._alignment_thread = threading.Thread(
+                target=self._alignment_loop,
+                name="OnlineTimeAlignment",
+                daemon=True,
+            )
+            self._alignment_thread.start()
         self._executor = self._executor_type()
         self._executor.add_node(self._node)
         self._spin_thread = threading.Thread(
@@ -520,6 +555,25 @@ class DirectRos2Sink:
                 ("/pc_car_loc", 1),
             ],
         )
+        if self._time_aligner is not None:
+            print(
+                "  在线逐抛对时 enabled "
+                "(/ball_world_topic; arrival 只认同一抛；payload 时间戳拟合)",
+                flush=True,
+            )
+            print(
+                "  对时成功后 /pc_car_loc 与 /pc_world_ball_loc 才开始发布，"
+                "且都带 rk_timestamp；每次成功对时发布 "
+                f"{_TIME_OFFSET_TOPIC}",
+                flush=True,
+            )
+            _print_ros_comm_config(
+                "ROS2 online alignment",
+                [
+                    ("/pc_world_ball_loc", 1),
+                    (_TIME_OFFSET_TOPIC, 4),
+                ],
+            )
 
     def _spin_loop(self) -> None:
         while not self._spin_stop.is_set():
@@ -536,11 +590,125 @@ class DirectRos2Sink:
         with self._bridge_lock:
             self._bridge_offsets.append(recv_pc - float(rk_t))
 
+    def _on_ball_world_msg(self, msg) -> None:
+        arrival_pc = time.perf_counter()
+        try:
+            payload = json.loads(msg.data)
+        except Exception:
+            return
+        alignment_queue = self._alignment_queue
+        if alignment_queue is not None:
+            alignment_queue.put(("rk", payload, arrival_pc))
+
+    def _alignment_loop(self) -> None:
+        alignment_queue = self._alignment_queue
+        aligner = self._time_aligner
+        if alignment_queue is None or aligner is None:
+            return
+        try:
+            while True:
+                try:
+                    item = alignment_queue.get(timeout=0.1)
+                except queue.Empty:
+                    self._handle_alignment_result(
+                        aligner.expire(now_arrival_pc=time.perf_counter())
+                    )
+                    continue
+                if item is None:
+                    return
+                kind, payload, arrival_pc = item
+                try:
+                    if kind == "pc":
+                        bounce_time = payload.get("bounce_time")
+                        result = aligner.add_pc(
+                            t=float(payload["t"]),
+                            x=float(payload["x"]),
+                            y=float(payload["y"]),
+                            z=float(payload["z"]),
+                            arrival_pc=float(arrival_pc),
+                            tracker_state=payload.get("tracker_state"),
+                            bounce_time=(
+                                float(bounce_time)
+                                if bounce_time is not None else None
+                            ),
+                        )
+                    else:
+                        result = aligner.add_rk(
+                            payload,
+                            arrival_pc=float(arrival_pc),
+                        )
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    # One malformed payload is dirty input, not a worker
+                    # failure.  It cannot mutate a collector before parsing.
+                    continue
+                self._handle_alignment_result(result)
+        except Exception as exc:
+            self._alignment_error = exc
+            print(f"  在线对时 worker fatal: {exc!r}", flush=True)
+
+    def _handle_alignment_result(self, result: dict | None) -> None:
+        if result is None:
+            return
+        if result["accepted"]:
+            publish_pc = time.perf_counter()
+            pc_minus_rk = float(result["pc_minus_rk"])
+            self._publish(self._time_offset_pub, {
+                "topic": "pc_rk_time_offset",
+                "update": int(result["update"]),
+                "pc_minus_rk_s": round(pc_minus_rk, 9),
+                "pc_timestamp": round(publish_pc, 6),
+                "rk_timestamp": round(publish_pc - pc_minus_rk, 6),
+            })
+            print(
+                "  在线对时更新 "
+                f"#{result['update']}: pc_minus_rk="
+                f"{result['pc_minus_rk']:+.6f}s "
+                f"(delta={result['delta_ms']:+.1f}ms, "
+                f"err={result['err'] * 100:.2f}cm, n={result['n']})",
+                flush=True,
+            )
+            return
+        features = result.get("features")
+        if not isinstance(features, dict):
+            features = {}
+        print(
+            "  在线对时拒绝 "
+            f"attempt#{result.get('attempt', '?')}: "
+            f"reason={result.get('reason', 'unknown')} "
+            "features="
+            f"{json.dumps(features, ensure_ascii=False, sort_keys=True)} "
+            "(保留上一 offset)",
+            flush=True,
+        )
+
     def clock_bridge(self) -> dict | None:
         """`pc_minus_rk` 直接就是报告要的绝对轴偏移：PC perf ≈ RK t + pc_minus_rk。"""
         with self._bridge_lock:
             offsets = list(self._bridge_offsets)
         return clock_bridge_stats(offsets, source=_CLOCK_BRIDGE_TOPIC)
+
+    def add_pc_ball(self, payload: dict) -> None:
+        alignment_queue = self._alignment_queue
+        if alignment_queue is not None:
+            alignment_queue.put(("pc", payload, time.perf_counter()))
+        if self._time_aligner is None:
+            return
+        aligned = self._with_rk_timestamp({
+            "topic": "world_ball_loc",
+            "x": round(float(payload["x"]), 4),
+            "y": round(float(payload["y"]), 4),
+            "z": round(float(payload["z"]), 4),
+            "t": round(float(payload["t"]), 6),
+        })
+        if aligned is None:
+            return
+        self._world_ball_count += 1
+        self._publish(self._world_ball_pub, aligned)
+
+    def time_alignment(self) -> dict | None:
+        if self._time_aligner is None:
+            return None
+        return self._time_aligner.snapshot()
 
     def _publish(self, publisher, payload: dict) -> None:
         msg = self._msg_type()
@@ -548,7 +716,31 @@ class DirectRos2Sink:
         with self._pub_lock:
             publisher.publish(msg)
 
+    def _with_rk_timestamp(self, payload: dict) -> dict | None:
+        if self._time_aligner is None:
+            return payload
+        offset = self._time_aligner.current_offset()
+        pc_t = payload.get("t")
+        if (
+            offset is None
+            or not isinstance(pc_t, (int, float))
+            or not math.isfinite(float(pc_t))
+        ):
+            return None
+        return {
+            **payload,
+            "rk_timestamp": round(float(pc_t) - offset, 6),
+        }
+
     def publish_car_loc(self, payload: dict) -> None:
+        if self._time_aligner is not None:
+            aligned = self._with_rk_timestamp(payload)
+            # The opt-in contract has one stable payload shape: both RK-facing
+            # observation topics start only after an accepted offset exists and
+            # therefore always carry rk_timestamp.
+            if aligned is None:
+                return
+            payload = aligned
         self._car_count += 1
         self._publish(self._car_pub, payload)
         print(
@@ -566,17 +758,56 @@ class DirectRos2Sink:
     def close(self) -> None:
         self._spin_stop.set()
         self._spin_thread.join(timeout=2.0)
-        self._executor.shutdown()
-        self._executor.remove_node(self._node)
-        self._node.destroy_node()
-        if self._rclpy.ok():
+        if self._time_aligner is None:
+            self._executor.shutdown()
+            self._executor.remove_node(self._node)
+            self._node.destroy_node()
+            if self._rclpy.ok():
+                self._rclpy.shutdown()
+            print("  ROS2 直连已关闭")
+            return
+
+        executor_shutdown = False
+        rclpy_shutdown = False
+        if self._spin_thread.is_alive():
+            self._executor.shutdown(timeout_sec=2.0)
+            executor_shutdown = True
+            self._spin_thread.join(timeout=2.0)
+        if self._spin_thread.is_alive() and self._rclpy.ok():
+            self._rclpy.shutdown()
+            rclpy_shutdown = True
+            self._spin_thread.join(timeout=2.0)
+        close_errors = []
+        spin_stopped = not self._spin_thread.is_alive()
+        if not spin_stopped:
+            close_errors.append("ROS2 spin thread did not stop")
+        if spin_stopped and self._alignment_queue is not None:
+            self._alignment_queue.put(None)
+        if spin_stopped and self._alignment_thread is not None:
+            self._alignment_thread.join(timeout=10.0)
+            if self._alignment_thread.is_alive():
+                close_errors.append("online alignment queue did not drain")
+        if self._alignment_error is not None:
+            close_errors.append(
+                f"online alignment worker failed: {self._alignment_error!r}"
+            )
+        if not executor_shutdown:
+            self._executor.shutdown()
+        if spin_stopped:
+            self._executor.remove_node(self._node)
+            self._node.destroy_node()
+        if not rclpy_shutdown and self._rclpy.ok():
             self._rclpy.shutdown()
         print("  ROS2 直连已关闭")
+        if close_errors:
+            raise RuntimeError("; ".join(close_errors))
 
 
-def _create_ros2_sink(mode: str):
+def _create_ros2_sink(mode: str, *, enable_time_alignment: bool = False):
     if mode == "off":
         return NullRos2Sink()
+    if enable_time_alignment:
+        return DirectRos2Sink(enable_time_alignment=True)
     return DirectRos2Sink()
 
 
@@ -1772,6 +2003,11 @@ def main() -> int:
         help="ROS2 output mode",
     )
     parser.add_argument(
+        "--online-time-align",
+        action="store_true",
+        help="订阅 RK /ball_world_topic；仅在 PC/RK 都完整看到越网、落地和反弹后阶段时，逐抛更新 PC-minus-RK offset",
+    )
+    parser.add_argument(
         "--full-res-video", action="store_true",
         help="保存每相机全分辨率视频（多个 mp4，无拼接、无 badge；编码慢、丢帧多，但保留原图细节供训练数据用）"
     )
@@ -1819,6 +2055,8 @@ def main() -> int:
              "给了就覆盖 --car。与 --car 二选一，都不给直接报错",
     )
     args = parser.parse_args()
+    if args.online_time_align and args.ros2_mode == "off":
+        parser.error("--online-time-align requires ROS2; --ros2-mode off is invalid")
     if args.car_config is None:
         if args.car is None:
             parser.error(
@@ -2001,7 +2239,13 @@ def main() -> int:
         print("  小车定位: disabled")
 
     # ── ROS2 边车子进程（rosbag 录制 / 发送 sink）──
-    _ros2_sink = _create_ros2_sink(args.ros2_mode)
+    if args.online_time_align:
+        _ros2_sink = _create_ros2_sink(
+            args.ros2_mode,
+            enable_time_alignment=True,
+        )
+    else:
+        _ros2_sink = _create_ros2_sink(args.ros2_mode)
 
     if save_logs:
         _rosbag_proc = RosbagRecorderProcess(bag_dir=output_dir / f"{run_id}_rosbag")
@@ -2566,6 +2810,15 @@ def main() -> int:
                     # 在 tracker.update() 刚返回的时刻抓 perf_counter，作为本预测的
                     # 算完时间。compute_latency = compute_done_t - ct 即算几 ms 延迟。
                     compute_done_t = time.perf_counter()
+                    if args.online_time_align:
+                        _ros2_sink.add_pc_ball({
+                            "t": exposure_pc,
+                            "x": ball3d.x,
+                            "y": ball3d.y,
+                            "z": ball3d.z,
+                            "tracker_state": tracker_result.state.value,
+                            "bounce_time": tracker.bounce_time,
+                        })
                 else:
                     for sn in ball_cands:
                         tile_mgr.on_2d_detected(sn, frame_tiles[sn])
@@ -2747,6 +3000,11 @@ def main() -> int:
             # PC↔RK 时钟桥（见 DirectRos2Sink.clock_bridge）。报告端拿它当第一优先的
             # 搜索窗来源：不依赖本场有没有球、有没有看到 tag，空场次也能对上。
             "rk_clock_bridge": _ros2_sink.clock_bridge(),
+            **({
+                # 新入口逐抛维护的在线绝对映射。只保存质量门通过的
+                # pc_minus_rk；失败抛保留旧值，history 留下拒绝原因。
+                "rk_time_alignment": _ros2_sink.time_alignment(),
+            } if args.online_time_align else {}),
             "racket_impact": {
                 **racket_impact_cfg,
                 "control_usage": "record_only",

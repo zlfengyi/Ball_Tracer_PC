@@ -36,6 +36,7 @@ param(
     # 而相机/标定还会静默用错另一层的那套。
     [ValidateSet('auto', '16', '18')]
     [string]$Floor = 'auto',
+    [switch]$EnableRkTimeAlign,
     [switch]$ProbeOnly
 )
 
@@ -345,6 +346,9 @@ Write-Host "Car: $Car$(if (-not [string]::IsNullOrWhiteSpace($CarConfig)) { " (o
 Write-Host "Car RK IP: $carRkIp"
 Write-Host "Tracker PC IP: $trackerPcIp"
 Write-Host "CycloneDDS config: $cycloneXml"
+if ($EnableRkTimeAlign) {
+    Write-Host "Online PC/RK per-throw time alignment: enabled"
+}
 
 if ($ProbeOnly) {
     exit 0
@@ -397,6 +401,9 @@ if ($ExposureUs -gt 0) {
 }
 if ($GainDb -ge 0) {
     $args += @("--gain-db", $GainDb.ToString())
+}
+if ($EnableRkTimeAlign) {
+    $args += "--online-time-align"
 }
 
 & $selection.Python @args

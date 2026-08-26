@@ -37,6 +37,7 @@ ROS2_TRACKER_PEERS = (RK_CAR_IP,) if RK_CAR_IP else tuple(CAR_RK_IPS.values())
 ROS2_BEST_EFFORT_DEPTH = 1
 ROS2_RELIABLE_TOPICS = frozenset(
     {
+        "/pc_rk_time_offset",
         "/predict_hit_pos",
     }
 )

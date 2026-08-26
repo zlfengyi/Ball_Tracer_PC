@@ -7,6 +7,9 @@
 - 对应实现：`src/run_tracker.py`
 - 当前 ROS2 输出模式：`auto | direct | off`，默认 `direct`
 - 统计口径：只算当前主线真正会发布的 topic，不把历史桥接脚本当成主线接口
+- opt-in 入口 `.\run_tracker_with_predict.ps1` 另增
+  `/pc_world_ball_loc` 和 `/pc_rk_time_offset`；其逐抛对时合同见
+  `RUN_TRACKER_WITH_PREDICT.md`
 
 ## 总览
 
