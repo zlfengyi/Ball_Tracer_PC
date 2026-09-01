@@ -8,6 +8,11 @@ Only complete incoming throws are eligible: each side must observe the ball
 cross y=8 m toward the car, descend into a bounce, and then rise in
 stage 1.  A completed PC/RK pair is consumed exactly once.  Failed fits never
 replace the last accepted offset.
+
+Spatial agreement is judged translation-invariant: the median XY
+displacement between the two world-frame tracks is the car's pose belief
+error (which stays large until the first accepted offset unblocks
+/pc_car_loc) and is reported as ``xy_shift``, never gated on.
 """
 
 from __future__ import annotations
@@ -45,8 +50,8 @@ _CONSUMED_TAIL_S = 1.25
 _MAX_OFFSET_DELTA_S = 0.10
 _MAX_ACCEPTED_OFFSET_JUMP_S = 0.030
 _RIVAL_GAP_S = 0.01
-_MAX_XY_MEDIAN_M = 1.35
-_MAX_XY_P90_M = 1.50
+_MAX_XY_RES_MEDIAN_M = 0.30
+_MAX_XY_RES_P90_M = 0.60
 
 
 @dataclass(frozen=True)
@@ -1015,17 +1020,18 @@ class OnlineThrowTimeAligner:
             extra.update(xy)
             features.update({
                 "xy_n": xy["xy_n"],
-                "xy_median": xy["xy_median"],
-                "xy_p90": xy["xy_p90"],
+                "xy_shift": xy["xy_shift"],
+                "xy_res_median": xy["xy_res_median"],
+                "xy_res_p90": xy["xy_res_p90"],
             })
             if (
                 reason is None
                 and (
                     xy["xy_n"] < 8
-                    or xy["xy_median"] is None
-                    or xy["xy_median"] > _MAX_XY_MEDIAN_M
-                    or xy["xy_p90"] is None
-                    or xy["xy_p90"] > _MAX_XY_P90_M
+                    or xy["xy_res_median"] is None
+                    or xy["xy_res_median"] > _MAX_XY_RES_MEDIAN_M
+                    or xy["xy_res_p90"] is None
+                    or xy["xy_res_p90"] > _MAX_XY_RES_P90_M
                 )
             ):
                 reason = "spatial_residual"
@@ -1140,7 +1146,7 @@ class OnlineThrowTimeAligner:
         pc_minus_rk: float,
     ) -> dict:
         pc_times = [point.t for point in pc_points]
-        distances = []
+        deltas = []
         matched_times = []
         for point in rk_points:
             t_pc = point.t + pc_minus_rk
@@ -1148,16 +1154,37 @@ class OnlineThrowTimeAligner:
             pc_y = cls._interp_axis(pc_points, pc_times, t_pc, "y")
             if pc_x is None or pc_y is None:
                 continue
-            distances.append(math.hypot(pc_x - point.x, pc_y - point.y))
+            deltas.append((pc_x - point.x, pc_y - point.y))
             matched_times.append(t_pc)
-        if not distances:
-            return {"xy_n": 0, "xy_median": None, "xy_p90": None}
-        ordered = sorted(distances)
-        p90_index = min(len(ordered) - 1, math.ceil(0.9 * len(ordered)) - 1)
+        if not deltas:
+            return {
+                "xy_n": 0,
+                "xy_shift_x": None,
+                "xy_shift_y": None,
+                "xy_shift": None,
+                "xy_res_median": None,
+                "xy_res_p90": None,
+            }
+        # A constant PC-minus-RK displacement is the car's world-pose belief
+        # error (RK world ball = onboard observation + bot pose), not wrong-
+        # throw evidence; before the first accepted offset unblocks
+        # /pc_car_loc that error has no way to shrink, so gate only the
+        # de-translated residual shape.
+        shift_x = _upper_median([dx for dx, _ in deltas])
+        shift_y = _upper_median([dy for _, dy in deltas])
+        residuals = sorted(
+            math.hypot(dx - shift_x, dy - shift_y) for dx, dy in deltas
+        )
+        p90_index = min(
+            len(residuals) - 1, math.ceil(0.9 * len(residuals)) - 1
+        )
         return {
-            "xy_n": len(ordered),
-            "xy_median": _upper_median(ordered),
-            "xy_p90": ordered[p90_index],
+            "xy_n": len(residuals),
+            "xy_shift_x": shift_x,
+            "xy_shift_y": shift_y,
+            "xy_shift": math.hypot(shift_x, shift_y),
+            "xy_res_median": _upper_median(residuals),
+            "xy_res_p90": residuals[p90_index],
             "xy_span": matched_times[-1] - matched_times[0],
         }
 

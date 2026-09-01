@@ -150,7 +150,11 @@ The primary rejection reasons are intentionally specific:
 - `first_bounce_incomplete` / `bounce_invalid` / `stage1_incomplete`: the first
   landing or its rising tail was missing or physically inconsistent;
 - `flight_curve_dirty` / `spatial_residual` / `bounce_mismatch`: the retained
-  samples disagree spatially or around the bounce;
+  samples disagree spatially or around the bounce. Spatial agreement is
+  translation-invariant: the median XY displacement between the two tracks is
+  the car's pose belief error (reported as `xy_shift`, largest before the first
+  accepted offset has unblocked `/pc_car_loc`) and never rejects a throw; only
+  the de-translated residuals (`xy_res_median` / `xy_res_p90`) gate;
 - `insufficient_overlap` / `insufficient_coverage`: too little bounded
   timestamp overlap remained;
 - `shape_residual`, `ambiguous_rival`, `wide_profile`, `search_edge`, or

@@ -348,8 +348,8 @@ def test_existing_offset_rejects_40ms_z_phase_wrong_track_with_one_metre_xy_bias
     assert rejection["features"]["offset_jump_ms"] == pytest.approx(
         40.2, abs=1.0
     )
-    assert rejection["features"]["xy_median"] < 1.35
-    assert rejection["features"]["xy_p90"] < 1.50
+    assert rejection["features"]["xy_shift"] == pytest.approx(1.09, abs=0.05)
+    assert rejection["features"]["xy_res_median"] < 0.05
     snapshot = aligner.snapshot()
     assert snapshot["updates"] == 1
     assert snapshot["attempts"] == 2
@@ -662,8 +662,9 @@ def test_dynamic_arrival_spatial_gate_keeps_fast_same_ball_then_xy_fit_confirms(
     assert len(results) == 1 and results[0]["accepted"] is True
     features = results[0]["features"]
     assert 2.50 < features["max_spatial_gap_m"] < 3.30
-    assert features["xy_median"] < 0.01
-    assert features["xy_p90"] < 0.01
+    assert features["xy_shift"] < 0.01
+    assert features["xy_res_median"] < 0.01
+    assert features["xy_res_p90"] < 0.01
 
 
 def test_arrival_separated_tracks_cannot_be_fitted_as_one_throw():
@@ -840,7 +841,13 @@ def test_three_consecutive_spatial_conflicts_kill_confirmed_track_and_keep_offse
     assert snapshot["reason_counts"] == {"joint_identity_lost": 1}
 
 
-def test_z_correlated_wrong_ball_with_two_metre_xy_bias_is_rejected():
+# tracker_20260901_084648: the car parked 1.33 m from the config init pose,
+# bot_state had no motion and (deadlocked) no /pc_car_loc corrections, so a
+# constant XY translation sat on every RK ball point and the raw-distance
+# gate rejected every throw of the session by centimetres.  A constant
+# translation is pose belief error, not wrong-ball evidence.
+@pytest.mark.parametrize("bias", [1.36, 2.0])
+def test_constant_xy_translation_is_pose_belief_error_and_still_aligns(bias):
     aligner = OnlineThrowTimeAligner()
     events = []
     for arrival_pc, source, payload in _throw_events(
@@ -848,7 +855,31 @@ def test_z_correlated_wrong_ball_with_two_metre_xy_bias_is_rejected():
         pc_minus_rk=3.5,
     ):
         if source == "pc":
-            payload = {**payload, "x": payload["x"] + 2.0}
+            payload = {**payload, "x": payload["x"] + bias}
+        events.append((arrival_pc, source, payload))
+
+    results = _feed(aligner, events)
+
+    assert len(results) == 1
+    accepted = results[0]
+    assert accepted["accepted"] is True
+    assert accepted["features"]["xy_n"] >= 8
+    assert accepted["features"]["xy_shift"] == pytest.approx(bias, abs=0.05)
+    assert accepted["features"]["xy_res_median"] < 0.05
+    assert aligner.current_offset() == pytest.approx(3.5, abs=0.005)
+    assert aligner.snapshot()["reason_counts"] == {}
+
+
+def test_time_varying_xy_skew_is_a_wrong_track_and_still_rejects():
+    aligner = OnlineThrowTimeAligner()
+    events = []
+    for arrival_pc, source, payload in _throw_events(
+        rk_start=700.0,
+        pc_minus_rk=2.5,
+    ):
+        if source == "pc":
+            physical_t = payload["t"] - 700.0 - 2.5
+            payload = {**payload, "x": payload["x"] + 2.0 * physical_t}
         events.append((arrival_pc, source, payload))
 
     results = _feed(aligner, events)
@@ -858,8 +889,7 @@ def test_z_correlated_wrong_ball_with_two_metre_xy_bias_is_rejected():
     assert rejection["accepted"] is False
     assert rejection["reason"] == "spatial_residual"
     assert rejection["features"]["xy_n"] >= 8
-    assert rejection["features"]["xy_median"] == pytest.approx(2.0, abs=0.01)
-    assert rejection["features"]["xy_p90"] == pytest.approx(2.0, abs=0.01)
+    assert rejection["features"]["xy_res_median"] > 0.30
     assert aligner.current_offset() is None
     assert aligner.snapshot()["reason_counts"] == {"spatial_residual": 1}
 
