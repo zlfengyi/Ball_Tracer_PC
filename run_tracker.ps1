@@ -10,7 +10,8 @@ param(
     [int]$RosDomainId = 2,
     [string]$CameraConfig = '',
     # 曝光临时覆盖（不改配置文件）。0 / 负数 = 用配置文件里的值。
-    # 18F 相机 Gain 上限只有 12.78dB 且出厂就顶格，**亮度只能靠曝光换**，-GainDb 基本没用。
+    # 18F 相机模拟 Gain 上限只有 12.78dB 且出厂就顶格，-GainDb 基本没用；
+    # -DigitalShift 可调数字增益，但不会改善传感器信噪比，并会增加高光截断风险。
     # 曝光越长运动拖影越大，回球段最吃亏（像面速度 ~1400px/s，是来球段的 2~3 倍）：
     # 9000μs 拖影 12.6px、和球直径（13~18px）同量级，2026-08-09 场击球后连丢 4 帧、
     # 回球统计整场为空。当前默认 9000μs 是光线过暗下的被动选择（当晚亮度一路下滑），
@@ -18,6 +19,7 @@ param(
     # 光线一好转就调短：-ExposureUs 6000（拖影 8.4px）或 4000（5.6px，回球段最稳）
     [double]$ExposureUs = 0,
     [double]$GainDb = -1,
+    [Nullable[double]]$DigitalShift = $null,
     [string]$CalibrationConfig = '',
     # 车型必选，没有默认值：两台车的车载 AprilTag 布局完全不同，选错了车定位会静默
     # 偏几十 cm、yaw 还可能翻 180°（拟合照样收敛，只有 car_loc 重投影会从 ~2px 涨到
@@ -401,6 +403,9 @@ if ($ExposureUs -gt 0) {
 }
 if ($GainDb -ge 0) {
     $args += @("--gain-db", $GainDb.ToString())
+}
+if ($null -ne $DigitalShift) {
+    $args += @("--digital-shift", $DigitalShift.ToString())
 }
 if ($EnableRkTimeAlign) {
     $args += "--online-time-align"

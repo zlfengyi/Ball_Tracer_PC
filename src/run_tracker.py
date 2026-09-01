@@ -2016,7 +2016,7 @@ def main() -> int:
         default=str(config_dir / "camera.json"),
         help="相机采集配置",
     )
-    # 曝光/增益按当场光照临时覆盖，不用改配置文件。
+    # 曝光/模拟增益/Digital Shift 按当场光照临时覆盖，不用改配置文件。
     # 曝光直接决定运动拖影：blur_px = v_img(px/s) × T。整条弹道里回球段像面速度最高
     # （出拍后向上横切，~1400px/s，是来球段 200~900px/s 的 2~3 倍），所以最先在那里
     # 成片漏检。2026-08-09 场实测：T=9ms 时回球段拖影 11~13px，与球本身直径 13~18px
@@ -2029,7 +2029,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--gain-db", type=float, default=None,
-        help="覆盖相机增益（dB）；配合 --exposure-us 补回亮度（+6dB ≈ 亮度×2）",
+        help="覆盖相机模拟增益（dB）；配合 --exposure-us 补回亮度（+6dB ≈ 亮度×2）",
+    )
+    parser.add_argument(
+        "--digital-shift", type=float, default=None,
+        help="覆盖相机 Digital Shift；给值后自动启用 DigitalShiftEnable",
     )
     parser.add_argument(
         "--calib-config",
@@ -2283,10 +2287,12 @@ def main() -> int:
         capture_overrides["exposure_us"] = float(args.exposure_us)
     if args.gain_db is not None:
         capture_overrides["gain_db"] = float(args.gain_db)
+    if args.digital_shift is not None:
+        capture_overrides["digital_shift"] = float(args.digital_shift)
     with SyncCapture.from_config(args.camera_config, **capture_overrides) as cap:
         sync_sns = cap.sync_serials
         capture_fps = cap.fps
-        # 相机实际生效的曝光/增益（读回，不是配置里写的值——越界写入会被相机拒绝）。
+        # 相机实际生效的曝光/模拟增益/数字增益（读回，不是配置里写的值）。
         # 曝光是回球段能不能连续检出的决定因素：拖影 px ≈ 像面速度 × 曝光，
         # 回球段像面速度 ~1400px/s，球本身才 13~18px 宽。
         camera_settings = cap.camera_settings()
@@ -2295,8 +2301,13 @@ def main() -> int:
         for _sn in sync_sns:
             _s = camera_settings.get(_sn)
             if _s:
+                _shift = (
+                    f"  Digital Shift {float(_s['digital_shift']):.2f} "
+                    f"({'enabled' if _s.get('digital_shift_enabled') else 'disabled'})"
+                    if "digital_shift" in _s else ""
+                )
                 print(f"    {_sn}: 曝光 {_s.get('exposure_us', float('nan')):.0f}μs  "
-                      f"增益 {_s.get('gain_db', float('nan')):.2f}dB")
+                      f"模拟增益 {_s.get('gain_db', float('nan')):.2f}dB{_shift}")
 
         # 确认当前采集相机与标定文件一致
         missing = [sn for sn in calib_serials if sn not in sync_sns]
@@ -2969,7 +2980,7 @@ def main() -> int:
             "first_frame_exposure_pc": first_frame_exposure_pc,
             "serials": cam_serials,
             "camera_config_path": str(Path(args.camera_config).resolve()),
-            # 逐相机读回的实际曝光/增益。拖影 px ≈ v_img(px/s) × 曝光(s)，
+            # 逐相机读回的实际曝光/模拟增益/数字增益。拖影 px ≈ v_img(px/s) × 曝光(s)，
             # 回球段 v_img ~1400px/s 是全弹道最高，最先在那里成片漏检
             "camera_settings": camera_settings,
             "camera_capture_overrides": capture_overrides,

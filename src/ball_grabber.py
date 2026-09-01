@@ -346,6 +346,7 @@ def open_camera(
     full_frame: bool = False,
     exposure_us: float = 0.0,
     gain_db: float = -1.0,
+    digital_shift: Optional[float] = None,
     pixel_format: str = "",
     roi_offset_y: int = 0,
     roi_height: int = 0,
@@ -542,7 +543,7 @@ def open_camera(
                 f"PixelFormat={pixel_format}",
             )
 
-        # ── 曝光 / 增益 ──
+        # ── 曝光 / 模拟增益 / 数字增益 ──
         # SetFloatValue 越界不抛异常、只返回错误码（如 0x80000102）。以前这里连返回值都不看，
         # 于是"配置里写了但相机没接受"完全无声：MV-CS050 的 Gain 上限只有 12.78dB，
         # 写 20 会被静默丢弃、实际仍跑在旧增益上。超界只告警不抛，避免因一个参数写不进去
@@ -575,6 +576,13 @@ def open_camera(
             except Exception:
                 pass
             _try_set_float("Gain", gain_db, "dB")
+
+        if digital_shift is not None:
+            ret = cam.MV_CC_SetBoolValue("DigitalShiftEnable", True)
+            if int(ret) != 0:
+                print(f"[相机 {serial}] 警告: DigitalShiftEnable=True 未被接受 "
+                      f"(ret=0x{int(ret) & 0xFFFFFFFF:08x})")
+            _try_set_float("DigitalShift", digital_shift, "")
 
         # ── 自定义 ROI（X 轴：宽度裁剪）──
         if roi_width > 0:
@@ -861,6 +869,7 @@ class SyncCapture:
         recalib_every: int = 10,
         exposure_us: float = 0.0,
         gain_db: float = -1.0,
+        digital_shift: Optional[float] = None,
         pixel_format: str = "",
         slave_params: Optional[dict[str, dict]] = None,
     ):
@@ -901,6 +910,7 @@ class SyncCapture:
                     line_source=master_line_source,
                     exposure_us=exposure_us,
                     gain_db=gain_db,
+                    digital_shift=digital_shift,
                     pixel_format=pixel_format,
                     roi_height=16 if master_min_bandwidth else 0,
                     _st_dev_list=st_dev_list,
@@ -914,6 +924,7 @@ class SyncCapture:
                         full_frame=True,
                         exposure_us=exposure_us,
                         gain_db=gain_db,
+                        digital_shift=digital_shift,
                         pixel_format=pixel_format,
                         roi_offset_y=params.get("roi_offset_y", 0),
                         roi_height=params.get("roi_height", 0),
@@ -934,6 +945,7 @@ class SyncCapture:
                         full_frame=True,
                         exposure_us=exposure_us,
                         gain_db=gain_db,
+                        digital_shift=digital_shift,
                         pixel_format=pixel_format,
                         roi_offset_y=params.get("roi_offset_y", 0),
                         roi_height=params.get("roi_height", 0),
@@ -1032,17 +1044,27 @@ class SyncCapture:
         """参与同步输出的相机序列号列表（get_frames 返回的相机）。"""
         return list(self._sync_serials)
 
-    def camera_settings(self) -> dict[str, dict[str, float]]:
-        """逐相机读回相机**实际生效**的曝光/增益。
+    def camera_settings(self) -> dict[str, dict[str, float | bool]]:
+        """逐相机读回相机**实际生效**的曝光/模拟增益/数字增益。
 
         不能用帧头的 fExposureTime —— MV-CS050 这一档根本不填该字段（实测恒为 0）。
         写进 session json 是为了事后能直接判定"这场是不是曝光太长导致回球段拖影漏检"，
         而不是靠 git 翻配置反推（配置可能被 --exposure-us 覆盖，或越界写入被相机拒绝）。
         """
-        out: dict[str, dict[str, float]] = {}
+        out: dict[str, dict[str, float | bool]] = {}
         for sn, cam in self._cameras.items():
-            entry: dict[str, float] = {}
-            for node, key in (("ExposureTime", "exposure_us"), ("Gain", "gain_db")):
+            entry: dict[str, float | bool] = {}
+            try:
+                enabled = ctypes.c_bool()
+                if int(cam.MV_CC_GetBoolValue("DigitalShiftEnable", enabled)) == 0:
+                    entry["digital_shift_enabled"] = bool(enabled.value)
+            except Exception:
+                pass
+            for node, key in (
+                ("ExposureTime", "exposure_us"),
+                ("Gain", "gain_db"),
+                ("DigitalShift", "digital_shift"),
+            ):
                 try:
                     val = MVCC_FLOATVALUE()
                     if int(cam.MV_CC_GetFloatValue(node, val)) == 0:
