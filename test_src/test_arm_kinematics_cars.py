@@ -23,42 +23,29 @@ SRC_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SRC_DIR))
 import extract_arm_bag as eab  # noqa: E402
 
-# 臂端导出的黄金向量（逐条抄进来，免得测试依赖隔壁 tennis-man checkout 的存在与分支）。
-# 来源：v03 = origin/c++version:cpp/arm_controller_cpp/assets/test_vectors.json
-#      v04 = arm_controller-unify@0e1104f:cpp/arm_controller_cpp/assets/v04/test_vectors.json
-# 每条 = (x, z, q6)：臂端 face_lookup/ik_hit 声称该位形把拍心放在 (x, y≈0, z)。
-GOLDEN = {
-    "v03": [
-        (1.0, 1.15,
-         [-1.085469451873422e-07, 0.25659757569089414, 1.4400962568581046,
-          1.6966939525489886, 1.8854693266225223e-07, 0.31415906535899574]),
-        (1.0, 1.136,
-         [-0.00939710960437435, 0.251369198185597, 1.4556222108187986,
-          1.687440562872557, 0.015974784544359796, 0.3243621562537498]),
-        (1.0, 1.22,
-         [0.0, 0.2548373386138545, 1.2085464803674686, 1.463383818981323, 0.0, 0.0]),
-        (0.8, 1.0,
-         [0.0, -0.021913096108918673, 2.3326005193252524, 2.3106874232163337, 0.0, 0.0]),
-    ],
-    "v04": [
-        (1.0, 1.15,
-         [-0.051970737187912314, 0.2909985676928369, 1.553974563237923,
-          1.7222877928352092, 0.09118969644015855, 0.3053721642437658]),
-        (1.0, 1.136,
-         [-0.062136554915039145, 0.2899976768804198, 1.5641746368566103,
-          1.7115920079545708, 0.1090724415160484, 0.31239731944623406]),
-        (1.0, 1.22,
-         [0.0, 0.32228456810630046, 1.510894547632402,
-          1.8331791157387016, 0.0, 0.0]),
-        (0.8, 1.0,
-         [0.0, 0.3661559666399792, 2.534715766627718,
-          2.9008717332676968, 0.0, 0.0]),
-    ],
-}
+# 黄金向量直接读臂端标准 checkout 导出的资产（cpp/arm_controller_cpp/assets/<car>/test_vectors.json，
+# ik_hit / face_lookup 两组）：每条 = (x, z, q6)，臂端声称该位形把拍心放在 (x, y≈0, z)。
+# 不再逐条抄进来——2026-09-05 用户定：报告端只认那一份标准文件，改标定不用来这里同步常数。
+ASSETS_ROOT = eab.ARM_CONTROLLER_ROOT / "cpp" / "arm_controller_cpp" / "assets"
+
+
+def _golden(car: str) -> list[tuple[float, float, list[float]]]:
+    vectors = json.loads((ASSETS_ROOT / car / "test_vectors.json").read_text(encoding="utf-8"))
+    rows = [(r["x"], r["z"], list(r["q5"]) + [0.0]) for r in vectors["ik_hit"]]
+    rows += [(r["x"], r["z"], list(r["q"])) for r in vectors["face_lookup"]]
+    assert rows, f"{car}: test_vectors.json 没有 ik_hit/face_lookup 向量"
+    return rows
+
+
+GOLDEN = {"v03": _golden("v03"), "v04": _golden("v04")}
 
 
 def test_v04_tcp_distance_matches_current_calibration():
-    assert eab.CAR_MODELS["v04"].tcp_distance == pytest.approx(0.548946367, abs=1e-12)
+    cak = eab.standard_v04_kinematics()
+    yaml_tool_x = cak.read_car_kinematics("v04")["tool_x"]
+    j6_x = float(cak.JOINTS[-1]["local0"][0, 3])
+    assert eab.CAR_MODELS["v04"].tcp_distance == pytest.approx(cak.TCP_DISTANCE, abs=1e-12)
+    assert cak.TCP_DISTANCE == pytest.approx(float(yaml_tool_x) - j6_x, abs=1e-12)  # 真值 = yaml tool_x
 
 
 @pytest.mark.parametrize("car", sorted(GOLDEN))

@@ -2,7 +2,9 @@
 """从 tracker rosbag 提取机械臂数据为 {run_id}_arm.json。
 
 必须在 ROS2 环境中运行（经 ros2/run_ros2.bat 启动），依赖 rosbag2_py。
-TCP 正解使用本文件内置的 FK，不依赖 tennis-man/arm_controller 源码路径。
+TCP 正解：v0.3 用本文件内置的 USD 链；v0.4 直接引用标准文件——tennis-man/arm_controller 的
+compact_arm_kinematics + config/cars/v04.yaml（零位 offset_rad、tool_x、hit_pos_z_offset_m 都在那里，
+2026-09-05 用户定：臂端 FK 与报告 FK 只认这一份真值；路径可用 TENNIS_MAN_ARM_CONTROLLER 覆盖）。
 
 ⚠ 车型（--car v03|v04）决定用哪条 FK 链，**没有默认值**：两台车的肩高、连杆与拍心标定距离
 均不同，选错不会报错、只会让整场 TCP 偏几厘米。不给 --car 时从同目录的 tracker JSON
@@ -37,6 +39,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import statistics
 import sys
@@ -47,12 +50,10 @@ import numpy as np
 
 
 # ── 车型运动学（v0.3 / v0.4 是两台不同的臂）────────────────────────────────────
-# 逐值抄自 arm_controller.compact_arm_kinematics：v03 = a266857（USD
-# tennis_arm_j5j6_7_6_world），v04 = arm_controller-unify@0e1104f（URDF
-# 000-zongzhuang-02-urdf + 2026-08-19 甜点标定）。抄进来是为了报告端自洽——出 arm JSON
-# 不该依赖隔壁 arm_controller checkout；真值源仍是
-# arm_controller-unify/cpp/arm_controller_cpp/config/cars/<car>.yaml 的 kinematics 段，
-# 两侧一致性由 test_src/test_arm_kinematics_cars.py 拿臂端导出的黄金向量守着。
+# v03：逐值抄自 arm_controller.compact_arm_kinematics@a266857（USD tennis_arm_j5j6_7_6_world）。
+# v04：**不抄**，从标准 checkout 加载 compact_arm_kinematics 并 use_car("v04")——关节表、工具轴、
+# 甜点距离（yaml kinematics.tool_x 反推）全部来自 config/cars/v04.yaml 这一份真值。
+# 一致性由 test_src/test_arm_kinematics_cars.py 拿臂端导出的黄金向量（assets/<car>/test_vectors.json）守着。
 #
 # ⚠ 拿错车算 TCP **不会报错**，只会整场偏几厘米：当前资产用 v0.3 链交叉计算 v0.4
 #   黄金位形时 x 远约 2cm、z 低约 12cm，而拍面 yaw/pitch 两车逐拍恒等（旋转链一致）——
@@ -60,7 +61,6 @@ import numpy as np
 #   故本模块**没有默认车型**：先 use_car()（或 car_for_tracker_json 推断）再调 fk()。
 SHORT_JOINT_NAMES = ("joint1", "joint2", "joint3", "joint4", "joint5", "joint6")
 _V03_ROOT_LINK = "/tennis_arm_j5j6_7_6/Geometry/base_link"
-_V04_ROOT_LINK = "base_link"
 ROOT_LINK = _V03_ROOT_LINK          # use_car() 重绑；留着是给老调用点的名字
 
 
@@ -151,44 +151,6 @@ BASE_ROT = np.array(
     ]
 )
 
-# ── v0.4：origin/unify/car-config 的 compact_arm_kinematics（URDF 000-zongzhuang-02）。
-# 原始 URDF 的 joint1..joint5 转向与控制器已验证的电机角相反，方向折进 axis（q 仍是控制器角）；
-# world_to_base 把 base_link 沿 Y 平移 −45mm，正好抵掉 joint1 的 +45mm 局部原点。
-_V04_JOINT_ANGLE_DIRECTIONS = (-1.0, -1.0, -1.0, -1.0, -1.0, 1.0)
-_V04_URDF_JOINTS = (
-    ("joint1", "base_link", "J1_Link",
-     (0.0, 0.0450000000000024, 0.508499999999985), (1.0, 0.0, 0.0, 0.0),
-     (0.0, 0.0, -1.0)),
-    ("joint2", "J1_Link", "J2_Link",
-     (0.00159154943091333, -0.0423500000000004, 0.212900100000015),
-     (1.0, 0.0, 0.0, 0.0), (0.0, -1.0, 0.0)),
-    ("joint3", "J2_Link", "J3_Link",
-     (-0.00137018988116389, 0.082450000000001, 0.440524801747144),
-     (1.0, 0.0, 0.0, 0.0), (0.0, -1.0, 0.0)),
-    ("joint4", "J3_Link", "J4_Link",
-     (0.0, -0.00232998088473323, 0.3), (1.0, 0.0, 0.0, 0.0),
-     (0.0, 1.0, 0.0)),
-    ("joint5", "J4_Link", "J5_Link",
-     (0.0, -0.0372576309598127, 0.0578865999999858), (1.0, 0.0, 0.0, 0.0),
-     (0.0, 0.0, -1.0)),
-    ("joint6", "J5_Link", "J6_Link",
-     (0.0215000000000001, 0.0, 0.10025), (1.0, 0.0, 0.0, 0.0),
-     (1.0, 0.0, 0.0)),
-)
-_IDENTITY_POSE = _pose((0.0, 0.0, 0.0), (1.0, 0.0, 0.0, 0.0))
-_V04_JOINTS = tuple(
-    {
-        "name": name,
-        "parent": parent,
-        "child": child,
-        "axis": np.asarray(axis, dtype=float) * direction,
-        "local0": _pose(origin, quat),
-        "local1": _IDENTITY_POSE,
-    }
-    for (name, parent, child, origin, quat, axis), direction
-    in zip(_V04_URDF_JOINTS, _V04_JOINT_ANGLE_DIRECTIONS)
-)
-_V04_WORLD_TO_BASE = _pose((0.0, -0.0450000000000024, 0.0), (1.0, 0.0, 0.0, 0.0))
 
 
 class CarModel(NamedTuple):
@@ -203,6 +165,42 @@ class CarModel(NamedTuple):
     face_normal_in_link6: np.ndarray
     tcp_distance: float
 
+# ── v0.4：标准运动学（唯一真值 = tennis-man/arm_controller 的 compact_arm_kinematics + config/cars/v04.yaml）
+ARM_CONTROLLER_ROOT = Path(os.environ.get("TENNIS_MAN_ARM_CONTROLLER", "D:/tennis-man/arm_controller"))
+_STANDARD_V04 = None
+
+
+def standard_v04_kinematics():
+    """加载标准 checkout 的 compact_arm_kinematics 并切到 v04（缓存）。缺 checkout 直接报错，不回退。"""
+    global _STANDARD_V04
+    if _STANDARD_V04 is None:
+        import importlib.util
+
+        path = ARM_CONTROLLER_ROOT / "src" / "arm_controller" / "compact_arm_kinematics.py"
+        if not path.is_file():
+            raise SystemExit(
+                f"标准运动学不存在：{path}（设 TENNIS_MAN_ARM_CONTROLLER 指向 arm_controller checkout）")
+        spec = importlib.util.spec_from_file_location("standard_compact_arm_kinematics", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.use_car("v04")
+        _STANDARD_V04 = module
+    return _STANDARD_V04
+
+
+def _standard_v04_model() -> "CarModel":
+    cak = standard_v04_kinematics()
+    return CarModel(
+        car="v04",
+        source_model=f"{cak.URDF_PATH} + config/cars/v04.yaml",
+        root_link=cak.ROOT_LINK,
+        base_transform=cak.WORLD_TO_BASE,
+        joints=cak.JOINTS,
+        tool_axis_in_link6=cak.TOOL_AXIS_IN_LINK6,
+        face_normal_in_link6=cak.FACE_NORMAL_IN_LINK6,
+        tcp_distance=float(cak.TCP_DISTANCE),
+    )
+
 
 CAR_MODELS = {
     "v03": CarModel(
@@ -215,16 +213,7 @@ CAR_MODELS = {
         face_normal_in_link6=np.array([1.0, 0.0, 0.0]),
         tcp_distance=0.62,
     ),
-    "v04": CarModel(
-        car="v04",
-        source_model="src/arm_controller/urdf/000-zongzhuang-02-urdf.urdf",
-        root_link=_V04_ROOT_LINK,
-        base_transform=_V04_WORLD_TO_BASE,
-        joints=_V04_JOINTS,
-        tool_axis_in_link6=np.array([1.0, 0.0, 0.0]),
-        face_normal_in_link6=np.array([0.0, 1.0, 0.0]),
-        tcp_distance=0.548946367,
-    ),
+    "v04": _standard_v04_model(),
 }
 
 # tracker JSON 的 config.car_config_path 文件名 → 车型（src/run_tracker.py CAR_LAYOUT_CONFIGS 的逆）。

@@ -170,3 +170,11 @@ KEY  p_racket_rel_base_in_world(by vision): (...)
 ```powershell
 $env:ROS_DOMAIN_ID='2'
 ```
+
+## v0.4 静态位姿标定（2026-09-05）
+
+`capture_v04_ht_replay.py`（`run_v04_ht_replay.ps1 -Execute [-Plan session|sweep]`）让臂用 `inspect` 走到静态位姿、停住、四相机同步拍照；
+`analyze_v04_ht_replay.py <dir> --black-marker` 出 FK vs 视觉；`fit_v04_joint_zeros.py` 拟零位/工具偏置。
+运动学真值只有一份：`D:\tennis-man\arm_controller` 的 `config/cars/v04.yaml` + `compact_arm_kinematics.py`（报告端 `extract_arm_bag.py` 也引用它）。
+结论与坑见 `tennis-man/memory/v04-joint-zero-calibration-0905.md`（定零位只能用 x/z 平面拟合；扫描点必须按控制器 face_table 的 ok 掩膜选；
+起臂栈前先确认没有别的会话在用板子——见 `arm-multi-session-arbitration-0905.md`）。
