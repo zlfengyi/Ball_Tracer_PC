@@ -10,7 +10,7 @@
   python test_src/test_car_localizer.py --field 18        # 18 楼场地
   python test_src/test_car_localizer.py --exposure 10000 --gain 25
 
-注意：18 楼相机正装，需先 `$env:BALL_TRACER_CAMERA_REVERSE_180='0'`
+注意：18 楼相机正装，ReverseX/Y 已写死在 src/ball_grabber.py，无需再设环境变量
 （run_tracker.ps1 里对应 -CameraReverse180 0）。
 """
 

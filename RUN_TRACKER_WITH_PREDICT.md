@@ -3,7 +3,7 @@
 Launch with:
 
 ```powershell
-.\run_tracker_with_predict.ps1 -Car v04 -Floor 18
+.\run_tracker_with_predict.ps1 -Car v04
 ```
 
 The launcher is a thin opt-in over `run_tracker.ps1`; camera, floor, ROS2 and

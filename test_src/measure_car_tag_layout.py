@@ -23,7 +23,6 @@
      全体带偏。
 
 用法（18 楼场地，相机正装需关翻转）：
-  $env:BALL_TRACER_CAMERA_REVERSE_180='0'
   python test_src/measure_car_tag_layout.py --field 18
 """
 from __future__ import annotations

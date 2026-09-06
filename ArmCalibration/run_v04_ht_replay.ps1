@@ -52,9 +52,6 @@ if ($Execute) {
     Remove-Item Env:FASTRTPS_DEFAULT_PROFILES_FILE -ErrorAction SilentlyContinue
     Remove-Item Env:FASTDDS_DEFAULT_PROFILES_FILE -ErrorAction SilentlyContinue
     $env:MVS_MVIMPORT_DIR = $mvsImport
-    $env:BALL_TRACER_CAMERA_REVERSE_180 = '0'
-    $env:BALL_TRACER_CAMERA_REVERSE_X = '0'
-    $env:BALL_TRACER_CAMERA_REVERSE_Y = '0'
     $env:BALL_TRACER_SOFTWARE_ROTATE_180 = '0'
 }
 

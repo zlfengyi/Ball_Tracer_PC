@@ -31,9 +31,6 @@ from scipy.optimize import least_squares
 
 
 # 18F calibration images are not rotated. Set this before importing ball_grabber.
-os.environ["BALL_TRACER_CAMERA_REVERSE_180"] = "0"
-os.environ["BALL_TRACER_CAMERA_REVERSE_X"] = "0"
-os.environ["BALL_TRACER_CAMERA_REVERSE_Y"] = "0"
 os.environ["BALL_TRACER_SOFTWARE_ROTATE_180"] = "0"
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]

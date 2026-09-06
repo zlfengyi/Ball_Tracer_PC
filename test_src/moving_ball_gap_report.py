@@ -2,7 +2,7 @@
 """动球 × 静相机 实验分析（四象限最后一格）。v2：不依赖 AprilTag。
 
 前提：RK 侧 run_moving_ball_static_camera.sh 定角保持相机，手抛球横穿视场；
-PC 侧 run_tracker_18.ps1 照常录（→ _rk_tracking.json）。
+PC 侧 run_tracker.ps1 照常录（→ _rk_tracking.json）。
 
 对齐策略（tag 可无）：
   1) 时轴：|v|(t) 速度形状 + z(t) 高度形状（均为坐标系不变量）扫 bias；

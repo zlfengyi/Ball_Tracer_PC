@@ -97,9 +97,13 @@ def _env_bool(name: str, default: bool) -> bool:
     return default if raw is None else raw
 
 
-_ENV_CAMERA_REVERSE_180 = _env_bool("BALL_TRACER_CAMERA_REVERSE_180", True)
-_ENV_CAMERA_REVERSE_X = _env_optional_bool("BALL_TRACER_CAMERA_REVERSE_X")
-_ENV_CAMERA_REVERSE_Y = _env_optional_bool("BALL_TRACER_CAMERA_REVERSE_Y")
+# 18F 四相机正装，ReverseX/Y 恒为 False。这两个是**相机里的持久状态**，之前只有显式
+# 传值或设了环境变量才写，且环境变量的默认值还是 16F 时代的 True —— 任何不经启动脚本
+# 直接开相机的工具（标定采集、临时脚本）都会把四台相机翻成 180°，而且留在相机里。
+# 0906 实测这种状态下 tag 照常解码（AprilTag 旋转不变）但位置整体转半圈，车位姿飞到
+# y=50m / 重投影 620px。现在无条件按这里写死，不再留环境变量后门。
+_CAMERA_REVERSE_X = False
+_CAMERA_REVERSE_Y = False
 _ENV_SOFTWARE_ROTATE_180 = _env_bool("BALL_TRACER_SOFTWARE_ROTATE_180", False)
 
 
@@ -376,13 +380,9 @@ def open_camera(
     serial = str(serial).strip()
 
     if reverse_x is None:
-        reverse_x = _ENV_CAMERA_REVERSE_X
-        if reverse_x is None:
-            reverse_x = _ENV_CAMERA_REVERSE_180
+        reverse_x = _CAMERA_REVERSE_X
     if reverse_y is None:
-        reverse_y = _ENV_CAMERA_REVERSE_Y
-        if reverse_y is None:
-            reverse_y = _ENV_CAMERA_REVERSE_180
+        reverse_y = _CAMERA_REVERSE_Y
 
     if _st_dev_list is None:
         st_list = MV_CC_DEVICE_INFO_LIST()
@@ -609,10 +609,8 @@ def open_camera(
                 pass
 
         # 相机侧 180° 反转必须在 StartGrabbing 之前设置。
-        if reverse_x is not None:
-            _check(cam.MV_CC_SetBoolValue("ReverseX", bool(reverse_x)), f"ReverseX={reverse_x}")
-        if reverse_y is not None:
-            _check(cam.MV_CC_SetBoolValue("ReverseY", bool(reverse_y)), f"ReverseY={reverse_y}")
+        _check(cam.MV_CC_SetBoolValue("ReverseX", bool(reverse_x)), f"ReverseX={reverse_x}")
+        _check(cam.MV_CC_SetBoolValue("ReverseY", bool(reverse_y)), f"ReverseY={reverse_y}")
 
         _check(cam.MV_CC_StartGrabbing(), f"StartGrabbing({serial})")
         return cam
