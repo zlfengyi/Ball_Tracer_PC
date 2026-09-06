@@ -4,7 +4,7 @@
     "track_timeout_s": 0.3,
     "search_hold_frames": 4,
     "min_cameras_for_3d": 2,
-    "ball_detection_disabled_serials": ["029"],
+    "ball_detection_disabled_serials": [],
     "max_reproj_error_px": 15.0,
     "ball_max_candidates_per_camera": 1,
     "ball_require_exactly_one": false,

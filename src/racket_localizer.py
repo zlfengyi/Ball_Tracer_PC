@@ -19,7 +19,7 @@ from yolo_model.racket_pose import RacketPose
 
 
 _SRC_DIR = Path(__file__).resolve().parent
-_DEFAULT_CALIB_CONFIG = _SRC_DIR / "config" / "four_camera_calib.json"
+_DEFAULT_CALIB_CONFIG = _SRC_DIR / "config" / "four_camera_calib_18.json"
 _DEFAULT_RACKET_MODEL = _SRC_DIR.parent / "yolo_model" / "racket.onnx"
 _DEFAULT_RACKET_POSE_MODEL = _SRC_DIR.parent / "yolo_model" / "racket_pose.onnx"
 _CENTER_KEYPOINT_IDS = (0, 1, 2, 3)

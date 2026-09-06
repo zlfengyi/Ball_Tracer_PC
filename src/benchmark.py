@@ -2,7 +2,7 @@
 """
 性能基准测试：使用 SyncCapture 连续同步取图并统计各项性能指标。
 
-从 config/camera.json 加载相机配置（主从相机、曝光、ROI 等）。
+从 config/camera_18.json 加载相机配置（主从相机、曝光、ROI 等）。
 
 监测指标：
   1) exposure_start_pc spread — 硬件同步精度（μs 级）
@@ -66,7 +66,7 @@ def main():
     parser.add_argument("--save", action="store_true", help="保存第一组同步图片")
     args = parser.parse_args()
 
-    print("正在加载配置 (config/camera.json)...")
+    print("正在加载配置 (config/camera_18.json)...")
     with SyncCapture.from_config() as cap:
         all_serials = cap.sync_serials
         print(f"=== Ball Tracer 性能基准测试 ===")

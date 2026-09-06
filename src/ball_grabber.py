@@ -4,15 +4,13 @@
 
 ═══════════════════════════  系统方案概述  ═══════════════════════════
 
-硬件：
-  - 相机型号：海康 MV-CS050-10GC (GigE Vision, 500万像素, BayerRG8)
-  - 16 楼配置使用主相机 Line 输出触发从相机
-  - 18 楼配置使用 GigE Action Command 同步触发四台相机
+硬件（18F，唯一在用的场地）：
+  - 相机型号：海康 MV-CS032-60GC (GigE Vision, 320万像素, BayerRG8)
+  - GigE Action Command 广播同步触发四台相机
+  - 相机正装，ReverseX/Y 恒 False（见 _CAMERA_REVERSE_X/Y）
 
 相机参数：
-  - 16 楼使用 config/camera.json
-  - 18 楼使用 config/camera_18.json
-  - 曝光、增益、帧率和触发参数只在对应配置中维护
+  - config/camera_18.json —— 曝光、增益、帧率、触发、底部裁剪只在这里维护
 
 时间同步：
   - 每台相机的 ImageGrabber 启动时校准 PC↔设备时钟偏移 (GevTimestampControlLatch)
@@ -36,7 +34,7 @@
   - frame_to_numpy() Frame 原始数据 → numpy BGR/Mono（旋转由启动入口设置）
   - ImageGrabber     后台取帧线程（带时间偏移校准）
   - SyncCapture      多相机同步采集上下文管理器
-  - SyncCapture.from_config()  从 config/camera.json 创建
+  - SyncCapture.from_config()  从 config/camera_18.json 创建
 """
 
 from __future__ import annotations
@@ -1024,10 +1022,10 @@ class SyncCapture:
 
     @classmethod
     def from_config(cls, config_path: str = "", **overrides):
-        """从 JSON 配置文件创建 SyncCapture。默认路径 config/camera.json。"""
+        """从 JSON 配置文件创建 SyncCapture。默认路径 config/camera_18.json。"""
         import json
         if not config_path:
-            config_path = str(Path(__file__).resolve().parent / "config" / "camera.json")
+            config_path = str(Path(__file__).resolve().parent / "config" / "camera_18.json")
         with open(config_path, encoding="utf-8") as f:
             cfg = json.load(f)
         cfg.update(overrides)

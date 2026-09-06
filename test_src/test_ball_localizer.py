@@ -60,7 +60,7 @@ def main():
     detector = BallDetector()
     print(f"  模型: {detector.model_path}")
 
-    print("[2/3] 初始化 BallLocalizer (four_camera_calib.json)...")
+    print("[2/3] 初始化 BallLocalizer (four_camera_calib_18.json)...")
     localizer = BallLocalizer(detector=detector)
     cam_serials = localizer.serials
     print(f"  相机: {cam_serials}")

@@ -73,7 +73,7 @@ def main():
     parser.add_argument("--images", type=str, required=True,
                         help="图片目录 (相对于 calibration/)")
     parser.add_argument("--serials", type=str, nargs="+", default=None,
-                        help="相机序列号 (默认: 从 camera.json 读取)")
+                        help="相机序列号 (默认: 从 camera_18.json 读取)")
     parser.add_argument("--range-start", type=int, default=1)
     parser.add_argument("--range-end", type=int, default=500)
     parser.add_argument("--inner-cols", type=int, default=8)
@@ -90,12 +90,12 @@ def main():
     if args.serials:
         serials = args.serials
     else:
-        camera_json = project_root / "src" / "config" / "camera.json"
+        camera_json = project_root / "src" / "config" / "camera_18.json"
         with open(camera_json, encoding="utf-8") as f:
             cam_cfg = json.load(f)
         serials = cam_cfg.get("slave_serials", [])
         if not serials:
-            print("错误: camera.json 中无 slave_serials")
+            print("错误: camera_18.json 中无 slave_serials")
             sys.exit(1)
 
     pattern = (args.inner_cols, args.inner_rows)

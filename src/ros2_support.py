@@ -22,7 +22,7 @@ ROS2_ROOT = Path(
 ROS2_SITE_PACKAGES = ROS2_ROOT / "Lib" / "site-packages"
 ROS2_SCRIPTS_DIR = ROS2_ROOT / "Scripts"
 ROS2_BIN_DIR = ROS2_ROOT / "bin"
-CYCLONEDDS_XML_PATH = Path(__file__).resolve().parent.parent / "ros2" / "cyclonedds.xml"
+CYCLONEDDS_XML_PATH = Path(__file__).resolve().parent.parent / "ros2" / "cyclonedds_18.xml"
 ROS2_DLL_DIRS = (
     ROS2_ROOT,
     ROS2_ROOT / "Library" / "mingw-w64" / "bin",

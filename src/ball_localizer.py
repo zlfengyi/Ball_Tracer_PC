@@ -9,7 +9,7 @@
   4. 多视图 DLT 三角测量求 3D 世界坐标
   5. 计算重投影误差评估定位精度
 
-默认标定参数从 src/config/four_camera_calib.json 加载。
+默认标定参数从 src/config/four_camera_calib_18.json 加载。
 
 管线中两种使用方式：
   A. locate(images)  — 检测 + 三角测量一步到位
@@ -32,7 +32,7 @@ from .ball_detector import BallDetector, BallDetection
 from .cv_linalg import matvec, projection_matrix, smallest_right_singular_vector
 
 _SRC_DIR = Path(__file__).resolve().parent
-_DEFAULT_CALIB_CONFIG = _SRC_DIR / "config" / "four_camera_calib.json"
+_DEFAULT_CALIB_CONFIG = _SRC_DIR / "config" / "four_camera_calib_18.json"
 _WORLD_SCALE_M_PER_MM = 1.0 / 1000.0
 # 多假设三角化默认参数（与 config/tracker.json 的同名项对齐；这里只是库的兜底值）
 _DEFAULT_MAX_REPROJ_PX = 15.0
@@ -65,10 +65,10 @@ class BallLocalizer:
 
     用法::
 
-        localizer = BallLocalizer()  # 自动加载 config/four_camera_calib.json
+        localizer = BallLocalizer()  # 自动加载 config/four_camera_calib_18.json
         result = localizer.locate({
-            "DA7403103": img1,
-            "DA8571029": img2,
+            "DB0260414": img1,
+            "DB0260373": img2,
             "DA7403087": img3,
             "DA8474746": img4,
         })

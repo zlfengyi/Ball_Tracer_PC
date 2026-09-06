@@ -29,7 +29,7 @@ from src.arm_poe import ArmPoePositionModel
 from src.racket_localizer import RacketDetection, RacketLocalizer
 
 
-DEFAULT_CAMERA_CALIB_PATH = project_root / "src" / "config" / "four_camera_calib.json"
+DEFAULT_CAMERA_CALIB_PATH = project_root / "src" / "config" / "four_camera_calib_18.json"
 DEFAULT_POE_CONFIG_PATH = project_root / "src" / "config" / "arm_poe_racket_center.json"
 DEFAULT_RACKET_MODEL_PATH = project_root / "yolo_model" / "racket.onnx"
 DEFAULT_RACKET_POSE_MODEL_PATH = project_root / "yolo_model" / "racket_pose.onnx"

@@ -26,8 +26,8 @@ src/config/vehicle_v04.json；v0.3 车的布局仍在 src/config/arm_poe_racket_
 用法：
   localizer = CarLocalizer()
   result = localizer.locate({
-      "DA7403103": img1,
-      "DA8571029": img2,
+      "DB0260414": img1,
+      "DB0260373": img2,
       "DA7403087": img3,
       "DA8474746": img4,
   })
@@ -54,7 +54,7 @@ from .cv_linalg import (
 )
 
 _SRC_DIR = Path(__file__).resolve().parent
-_DEFAULT_CALIB_CONFIG = _SRC_DIR / "config" / "four_camera_calib.json"
+_DEFAULT_CALIB_CONFIG = _SRC_DIR / "config" / "four_camera_calib_18.json"
 _DEFAULT_VEHICLE_CONFIG = _SRC_DIR / "config" / "vehicle_v04.json"
 _WORLD_SCALE_M_PER_MM = 1.0 / 1000.0
 _HUBER_DELTA_PX = 3.0

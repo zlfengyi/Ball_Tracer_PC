@@ -36,9 +36,9 @@ def main():
     parser.add_argument("--field", default="",
                         help="场地后缀（如 18）；空 = 默认场地")
     parser.add_argument("--exposure", type=float, default=0,
-                        help="曝光时间 μs (默认 0=使用 camera.json)")
+                        help="曝光时间 μs (默认 0=使用 camera_18.json)")
     parser.add_argument("--gain", type=float, default=-1,
-                        help="增益 dB (默认 -1=使用 camera.json)")
+                        help="增益 dB (默认 -1=使用 camera_18.json)")
     args = parser.parse_args()
 
     suffix = f"_{args.field}" if args.field else ""

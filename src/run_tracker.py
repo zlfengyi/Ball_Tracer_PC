@@ -195,11 +195,12 @@ def _print_ros_comm_config(prefix: str, topic_specs: list[tuple[str, int]]) -> N
 # ══════════════════════════════════════════════════════════════════════════
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
+# 拼接视频里四宫格的固定顺序（18F；与 master + slaves 的自然顺序一致）
 STITCHED_SERIAL_ORDER = [
-    "DA7403103",  # 103
-    "DA8474746",  # 746
-    "DA7403087",  # 087
-    "DA8571029",  # 029
+    "DB0260414",  # 414 master
+    "DB0260373",  # 373
+    "DB0260405",  # 405
+    "DB0260378",  # 378
 ]
 
 
@@ -2013,7 +2014,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--camera-config",
-        default=str(config_dir / "camera.json"),
+        default=str(config_dir / "camera_18.json"),
         help="相机采集配置",
     )
     # 曝光/模拟增益/Digital Shift 按当场光照临时覆盖，不用改配置文件。
@@ -2037,7 +2038,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--calib-config",
-        default=str(config_dir / "four_camera_calib.json"),
+        default=str(config_dir / "four_camera_calib_18.json"),
         help="相机标定与外参配置",
     )
     # 车型必须显式选，**没有默认值**。两台车的 AprilTag 布局完全不同，选错了车

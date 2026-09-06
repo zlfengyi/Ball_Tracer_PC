@@ -4,19 +4,19 @@
 
 ## 当前 Tracker 默认事实
 
-- Tracker 默认使用四相机 rig：
-  - `src/config/camera.json`
-  - `src/config/four_camera_calib.json`
-- 当前默认相机序列号：
-  - 主相机 `DA7403103`
-  - 从相机 `DA8571029`
-  - 从相机 `DA7403087`
-  - 从相机 `DA8474746`
+- Tracker 默认使用四相机 rig（18F 是唯一在用的场地；16F 那套配置已于 `2026-09-06` 删除）：
+  - `src/config/camera_18.json`
+  - `src/config/four_camera_calib_18.json`
+- 当前默认相机序列号（海康 MV-CS032-60GC，action 广播触发）：
+  - 主相机 `DB0260414`
+  - 从相机 `DB0260373`
+  - 从相机 `DB0260405`
+  - 从相机 `DB0260378`
 - 当前默认采集参数：
-  - 全画幅 `2048x1536`
-  - `35fps`
+  - `2048x1304`（`roi_height`，底部裁掉 232 行 = 15.1%；`OffsetY` 恒 0，所以保留像素的坐标与全幅逐点相同，标定不用改）
+  - `40fps`（`acquisition_frame_rate=48`；单机千兆口的悬崖在 43~44 之间，实测 44 会塌到 27fps）
   - `3000us` 曝光
-  - `23.5dB` 增益
+  - `12.78dB` 增益 + `16.5` digital shift
 - Tracker 的 YOLO 分片默认是：
   - `1280x1280` 切片
   - 压缩到 `640x640` 推理
@@ -76,8 +76,8 @@
 ## 协作提醒
 
 - 如果更换相机 rig，必须同时检查：
-  - `src/config/camera.json`
-  - `src/config/four_camera_calib.json`
+  - `src/config/camera_18.json`
+  - `src/config/four_camera_calib_18.json`
   - `src/config/tracker.json`
 - `multi_calib.json` / 三目配置只保留作历史结果，不应再作为 tracker 默认入口。
 
@@ -88,9 +88,12 @@
 - `ReverseY` returned `0x80000106` (`MV_E_GC_ACCESS`) when written during grabbing, but became writable after `MV_CC_StopGrabbing()`. In practice, these nodes should be configured before `MV_CC_StartGrabbing()`.
 - The SDK also exposes `MV_CC_RotateImage(...)`, but that is SDK-side rotation on acquired image data, not camera-side orientation.
 - Independent probe on `2026-03-24` captured one frame without reverse and one frame with pre-grab `ReverseX=True, ReverseY=True`; the hardware-rotated frame matched the software `180deg` baseline strongly (`corr_rot180=0.958849` vs `corr_direct=-0.158286`, `mae_rot180=9.281` vs `mae_direct=84.769`).
-- `src/ball_grabber.py` now supports temporary environment switches for A/B tests without changing defaults:
-  - `BALL_TRACER_CAMERA_REVERSE_180=1` (or `BALL_TRACER_CAMERA_REVERSE_X/Y`)
-  - `BALL_TRACER_SOFTWARE_ROTATE_180=0`
+- `BALL_TRACER_CAMERA_REVERSE_180` / `_X` / `_Y` 这组 A/B 开关已于 `2026-09-06` **删除**。
+  它们的默认值还是 16F 的 `True`，而 `ReverseX/Y` 是**相机里的持久状态**：任何不经启动脚本
+  直接开相机的脚本都会把四台相机翻 180° 并留在相机里，tag 照常解码（检测器旋转不变）但
+  像素整体转半圈，实测车位姿飞到 `y=50m` / 重投影 `620px`。现在 `_CAMERA_REVERSE_X/Y` 在
+  `src/ball_grabber.py` 里写死为 `False`（18F 正装），并在每次 `open_camera` 时无条件写入。
+  `BALL_TRACER_SOFTWARE_ROTATE_180` 保留（纯软件旋转，默认 `0`，没有残留状态问题）。
 - With `BALL_TRACER_CAMERA_REVERSE_180=1` and `BALL_TRACER_SOFTWARE_ROTATE_180=0`, a real `run_tracker.ps1 -Duration 15 -NoVideo` run on `2026-03-24` reached `33.8 fps` (`519` frames / `15.4s`), close to the configured `35 fps`.
 - `2026-03-24`: tracker mainline units are now meters end-to-end for ball 3D, car 3D, Curve3 state, JSON outputs, HTML, and ROS2 publish payloads.
 - `src/run_tracker.py` now writes `config.distance_unit = "m"` into tracker JSON. Downstream tools should treat older JSON without that field as legacy mm data.

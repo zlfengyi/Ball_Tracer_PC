@@ -22,7 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from ArmCalibration.common import ARM_DATA_ROOT, load_json, rel_or_abs, save_json
 
 
-DEFAULT_CAMERA_CALIB_PATH = PROJECT_ROOT / "src" / "config" / "four_camera_calib.json"
+DEFAULT_CAMERA_CALIB_PATH = PROJECT_ROOT / "src" / "config" / "four_camera_calib_18.json"
 DEFAULT_EXPORT_CONFIG_PATH = PROJECT_ROOT / "src" / "config" / "arm_poe_racket_center.json"
 
 # vehicle_reference（车载 AprilTag 布局）由 test_src/measure_car_tag_layout.py
@@ -84,7 +84,7 @@ def parse_args() -> argparse.Namespace:
         "--camera-calib",
         type=str,
         default=str(DEFAULT_CAMERA_CALIB_PATH),
-        help="Path to four_camera_calib.json.",
+        help="Path to four_camera_calib_18.json.",
     )
     parser.add_argument(
         "--init-reproj-threshold",
@@ -1052,7 +1052,7 @@ def build_export_config(
         },
         "frames": {
             "world": {
-                "definition": "ground-registered world frame from four_camera_calib.json",
+                "definition": "ground-registered world frame from four_camera_calib_18.json",
                 "ground_plane_world_z": base["ground_plane_world_z"],
             },
             "base": {

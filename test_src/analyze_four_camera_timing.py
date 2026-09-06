@@ -149,7 +149,7 @@ def main() -> int:
     output_dir = Path(args.output_dir) / f"four_camera_timing_{session_id}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    camera_cfg = json.loads((root / "src" / "config" / "camera.json").read_text(encoding="utf-8"))
+    camera_cfg = json.loads((root / "src" / "config" / "camera_18.json").read_text(encoding="utf-8"))
     master_serial = camera_cfg["master_serial"]
 
     print("=" * 60)

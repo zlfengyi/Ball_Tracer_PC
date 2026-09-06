@@ -12,7 +12,7 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ARM_ROOT = PROJECT_ROOT / "ArmCalibration"
 ARM_DATA_ROOT = ARM_ROOT / "data"
-DEFAULT_CAMERA_CONFIG_PATH = PROJECT_ROOT / "src" / "config" / "camera.json"
+DEFAULT_CAMERA_CONFIG_PATH = PROJECT_ROOT / "src" / "config" / "camera_18.json"
 
 
 def load_json(path: Path | str) -> Any:

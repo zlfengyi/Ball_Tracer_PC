@@ -164,7 +164,7 @@ def main() -> None:
         cam_cfg = load_camera_config(CAMERA_CONFIG_PATH)
         serials = load_sync_serials(CAMERA_CONFIG_PATH)
         if not serials:
-            print("Error: no cameras found in camera.json")
+            print("Error: no cameras found in camera_18.json")
             sys.exit(1)
 
     reference = args.reference

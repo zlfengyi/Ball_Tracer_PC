@@ -260,7 +260,7 @@ def main() -> None:
     else:
         serials = load_sync_serials()
         if not serials:
-            raise RuntimeError("No camera serials found in camera.json")
+            raise RuntimeError("No camera serials found in camera_18.json")
 
     merged_dir = merge_sessions(
         sessions=sessions,

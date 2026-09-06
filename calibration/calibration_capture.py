@@ -77,7 +77,7 @@ def main():
         print(f"  增益:     {args.gain} dB")
     print()
 
-    print("加载相机配置 (config/camera.json)...")
+    print("加载相机配置 (config/camera_18.json)...")
     overrides = {}
     if args.exposure > 0:
         overrides["exposure_us"] = args.exposure

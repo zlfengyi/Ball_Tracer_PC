@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-快速演示：从 config/camera.json 加载配置，同步取一组图片并保存。
+快速演示：从 config/camera_18.json 加载配置，同步取一组图片并保存。
 
 用法：
   python -m src.demo
@@ -21,7 +21,7 @@ def main():
     save_dir = _root / "captured_frames"
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    print("加载配置 (config/camera.json)...")
+    print("加载配置 (config/camera_18.json)...")
     with SyncCapture.from_config() as cap:
         sync_sns = cap.sync_serials
         print(f"  同步相机: {sync_sns}")

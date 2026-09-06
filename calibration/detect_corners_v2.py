@@ -290,7 +290,7 @@ def main() -> None:
     if args.serials:
         serials = args.serials
     else:
-        camera_json = project_root / "src" / "config" / "camera.json"
+        camera_json = project_root / "src" / "config" / "camera_18.json"
         with open(camera_json, encoding="utf-8") as inp:
             cam_cfg = json.load(inp)
         serials = cam_cfg.get("slave_serials", [])

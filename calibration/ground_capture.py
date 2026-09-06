@@ -2,7 +2,7 @@
 """
 地面标定图片采集：拍摄标定板平放地面的同步图片对。
 
-曝光时间自动设为 camera.json 中的 3 倍，以保证地面图像亮度充足。
+曝光时间自动设为 camera_18.json 中的 3 倍，以保证地面图像亮度充足。
 
 用法：
   python ground_capture.py [--count 30] [--duration 60] [--output calibration_images]
@@ -51,7 +51,7 @@ def main():
     interval = args.duration / args.count
 
     # 读取配置中的曝光时间
-    config_path = project_root / "src" / "config" / "camera.json"
+    config_path = project_root / "src" / "config" / "camera_18.json"
     with open(config_path, encoding="utf-8") as f:
         cfg = json.load(f)
     base_exposure = cfg.get("exposure_us", 1800.0)
@@ -68,7 +68,7 @@ def main():
     print(f"  输出目录: {output_dir}")
     print()
 
-    print("加载相机配置 (config/camera.json)...")
+    print("加载相机配置 (config/camera_18.json)...")
     with SyncCapture.from_config(exposure_us=ground_exposure, gain_db=ground_gain) as cap:
         sync_sns = cap.sync_serials
         print(f"  同步相机: {sync_sns}")
