@@ -259,6 +259,7 @@ class CarLocalizer:
         # 自己那台的键，dict 赋值在 GIL 下是原子的，locate() 的线程池可直接并发写。
         self._roi_state: dict[str, tuple[tuple[int, int, int, int], int]] = {}
         self._roi_since_full: dict[str, int] = {}
+        self._roi_miss: dict[str, int] = {}
 
     # 连续 N 次 raw 空而增强有效 → 切到「增强起手」；之后每 M 次回探一次 raw，
     # 免得光线恢复了还一直吃增强图（增强图角点有 ~0.27° 偏移，能不用就不用）。
@@ -306,10 +307,15 @@ class CarLocalizer:
     # 窗口里检出数少于上次就整幅重检一次 —— tag 被遮挡或新进画面最多多花一次全幅
     # 代价，不会永久漏；窗口全空同理落回全幅，所以最坏情况就是今天的成本。
     _ROI_PAD = 300      # px；按 tag 边长 ~45px 折算约 1m 车体位移余量
-    # 窗口只认「不少于上次」，所以一旦缩到单块 tag 上，重新露出来的那块永远不会
-    # 被找回。没看全所有配置 tag 时按这个周期强制整幅重扫，把再捕获延迟封在
-    # ~1.5s（13Hz 采样）；看全时不重扫，正常场次一分钱不花。
-    _ROI_RESCAN_EVERY = 20
+    # 窗口按「上次检出的所有 tag 的并集」画，而 tag 全都刚性长在车上：窗口里只要
+    # 还有 tag，暂时被挡住的那块回来时也仍在窗口内。所以少检出一块**不**触发重扫，
+    # 只有窗口连续空这么多次才认为真跟丢，去整幅重扫。空窗那几次该相机本帧不贡献
+    # 观测（另外几台还在），比每少一块就全幅重来便宜得多。窗口 300px 折合约 1m
+    # 车体位移，而两次采样才隔 25~50ms，物理上跑不出去，空窗基本只来自遮挡/反光。
+    _ROI_MISS_LIMIT = 3
+    # 安全网：窗口缩到单块 tag 上、另一块回来时恰好落在窗外，靠周期性整幅重扫兜。
+    # 看全所有配置 tag 时不重扫，正常场次不花钱。
+    _ROI_RESCAN_EVERY = 60
 
     def detect(self, image: np.ndarray, serial: str = "") -> list[CarDetection]:
         """检测整张图像中的所有 AprilTag (tag36h11)。
@@ -325,7 +331,7 @@ class CarLocalizer:
         ):
             roi_state = None
         if roi_state is not None:
-            (x0, y0, x1, y1), expect = roi_state
+            (x0, y0, x1, y1), _ = roi_state
             sub = gray[y0:y1, x0:x1]
             # 快路径不碰暗光状态机（它是全图口径的），只跟随它已经判定的暗场结论，
             # 否则暗场里窗口每帧必空、白白多跑一遍。
@@ -333,13 +339,20 @@ class CarLocalizer:
                 sub = self._enhance_for_low_light(sub)
             corners_list, ids, _ = self._detector.detectMarkers(
                 np.ascontiguousarray(sub))
-            if ids is not None and len(ids) >= expect:
+            if ids is not None:
+                self._roi_miss[serial] = 0
                 return self._collect(
                     corners_list, ids, serial, x0, y0, gray.shape, full=False)
+            self._roi_miss[serial] = self._roi_miss.get(serial, 0) + 1
+            if self._roi_miss[serial] < self._ROI_MISS_LIMIT:
+                return []
 
         corners_list, ids = self._detect_full(gray)
+        if serial:
+            self._roi_miss[serial] = 0
         if ids is None:
             self._roi_state.pop(serial, None)
+            self._roi_since_full.pop(serial, None)
             return []
         return self._collect(
             corners_list, ids, serial, 0, 0, gray.shape, full=True)

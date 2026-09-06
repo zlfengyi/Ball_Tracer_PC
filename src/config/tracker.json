@@ -50,7 +50,7 @@
     },
     "car_localizer": {
         "enabled": true,
-        "sample_every_frames": 2,
+        "sample_every_frames": 1,
         "disabled_serials": []
     },
     "video_output": {
