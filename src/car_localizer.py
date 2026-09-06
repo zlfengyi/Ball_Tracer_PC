@@ -229,6 +229,12 @@ class CarLocalizer:
         params.perspectiveRemovePixelPerCell = 8
         # 忽略 cell 边缘 30%，减少边缘串扰
         params.perspectiveRemoveIgnoredMarginPerCell = 0.3
+        # 候选周长封顶：默认 4.0 让网柱/场地结构等巨型轮廓也进解码流程白耗时。
+        # 0901 在 18F 真图（004_current 标定照 + 115811 live 帧）实测：单加 0.6 省 30%
+        # （23.5→16.4ms/帧），检出与角点逐位不变；车 tag 现距边长 41~51px（周长率
+        # ~0.09），到 0.6 还有 6 倍余量。⚠勿加 minMarkerPerimeterRate——远处小 tag
+        # 有被杀风险，实测它也只再省 <1ms。
+        params.maxMarkerPerimeterRate = 0.6
         # yaw 对角点误差很敏感；检测后使用灰度梯度做亚像素角点细化。
         params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
         self._detector = cv2.aruco.ArucoDetector(aruco_dict, params)
@@ -248,6 +254,11 @@ class CarLocalizer:
         self._hold_yaw_t: Optional[float] = None
         self._last_accepted_loc: Optional[CarLoc] = None
         self.single_tag_frames = 0     # 诊断计数：走退化路径发出的帧数
+
+        # 逐相机跟踪窗 {序列号: ((x0, y0, x1, y1), 上次检出块数)}。每个线程只碰
+        # 自己那台的键，dict 赋值在 GIL 下是原子的，locate() 的线程池可直接并发写。
+        self._roi_state: dict[str, tuple[tuple[int, int, int, int], int]] = {}
+        self._roi_since_full: dict[str, int] = {}
 
     # 连续 N 次 raw 空而增强有效 → 切到「增强起手」；之后每 M 次回探一次 raw，
     # 免得光线恢复了还一直吃增强图（增强图角点有 ~0.27° 偏移，能不用就不用）。
@@ -289,9 +300,88 @@ class CarLocalizer:
 
     # ── 检测 ──────────────────────────────────────────────────────────
 
-    def detect(self, image: np.ndarray) -> list[CarDetection]:
-        """检测整张图像中的所有 AprilTag (tag36h11)。"""
+    # 车是慢速刚体：上一帧 tag 在哪，这一帧就在附近。全幅 detectMarkers 实测
+    # 24~36ms/相机（4 台并发的 locate() 要 89ms，把车定位硬封在 ~11Hz），裁到上次
+    # tag bbox 外扩 _ROI_PAD 之后是 6ms（0906 在 18F 真帧实测，检出与全幅逐位一致）。
+    # 窗口里检出数少于上次就整幅重检一次 —— tag 被遮挡或新进画面最多多花一次全幅
+    # 代价，不会永久漏；窗口全空同理落回全幅，所以最坏情况就是今天的成本。
+    _ROI_PAD = 300      # px；按 tag 边长 ~45px 折算约 1m 车体位移余量
+    # 窗口只认「不少于上次」，所以一旦缩到单块 tag 上，重新露出来的那块永远不会
+    # 被找回。没看全所有配置 tag 时按这个周期强制整幅重扫，把再捕获延迟封在
+    # ~1.5s（13Hz 采样）；看全时不重扫，正常场次一分钱不花。
+    _ROI_RESCAN_EVERY = 20
+
+    def detect(self, image: np.ndarray, serial: str = "") -> list[CarDetection]:
+        """检测整张图像中的所有 AprilTag (tag36h11)。
+
+        serial 非空时走跟踪窗快路径。角点一律还原成**全图坐标**再返回，标定内参
+        和三角化都按全图算，下游无需感知窗口的存在。
+        """
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+
+        roi_state = self._roi_state.get(serial) if serial else None
+        if roi_state is not None and roi_state[1] < len(self._tags) and (
+            self._roi_since_full.get(serial, 0) >= self._ROI_RESCAN_EVERY
+        ):
+            roi_state = None
+        if roi_state is not None:
+            (x0, y0, x1, y1), expect = roi_state
+            sub = gray[y0:y1, x0:x1]
+            # 快路径不碰暗光状态机（它是全图口径的），只跟随它已经判定的暗场结论，
+            # 否则暗场里窗口每帧必空、白白多跑一遍。
+            if self._prefer_enhanced:
+                sub = self._enhance_for_low_light(sub)
+            corners_list, ids, _ = self._detector.detectMarkers(
+                np.ascontiguousarray(sub))
+            if ids is not None and len(ids) >= expect:
+                return self._collect(
+                    corners_list, ids, serial, x0, y0, gray.shape, full=False)
+
+        corners_list, ids = self._detect_full(gray)
+        if ids is None:
+            self._roi_state.pop(serial, None)
+            return []
+        return self._collect(
+            corners_list, ids, serial, 0, 0, gray.shape, full=True)
+
+    def _collect(
+        self,
+        corners_list,
+        ids,
+        serial: str,
+        x0: int,
+        y0: int,
+        shape: tuple[int, ...],
+        *,
+        full: bool,
+    ) -> list[CarDetection]:
+        """窗口坐标 → 全图坐标，顺手刷新该相机的跟踪窗。"""
+        results = []
+        for i, tag_id in enumerate(ids.ravel()):
+            corners = corners_list[i].reshape(4, 2) + np.array(
+                [x0, y0], dtype=np.float32)
+            results.append(CarDetection(
+                tag_id=int(tag_id),
+                cx=float(corners[:, 0].mean()),
+                cy=float(corners[:, 1].mean()),
+                corners=corners,
+            ))
+        if serial and results:
+            pts = np.concatenate([d.corners for d in results], axis=0)
+            h, w = shape[0], shape[1]
+            pad = self._ROI_PAD
+            self._roi_state[serial] = ((
+                max(0, int(pts[:, 0].min()) - pad),
+                max(0, int(pts[:, 1].min()) - pad),
+                min(w, int(pts[:, 0].max()) + pad),
+                min(h, int(pts[:, 1].max()) + pad),
+            ), len(results))
+            self._roi_since_full[serial] = (
+                0 if full else self._roi_since_full.get(serial, 0) + 1)
+        return results
+
+    def _detect_full(self, gray: np.ndarray):
+        """全幅检测 + 暗光救援状态机，返回 (corners_list, ids)。"""
 
         # 暗光救援：光线掉下去后 tag 白块只剩 20~30 灰度（黑块 ~2），ArUco 的自适应
         # 阈值取不出边缘，整张图一个 tag 都出不来 —— 2026-08-09 夜实测就是这样：场景
@@ -307,7 +397,7 @@ class CarLocalizer:
                 self._enhance_for_low_light(gray))
             if ids is None:
                 self._prefer_enhanced = False       # 连增强都不行了，回到常规路径重新判断
-                return []
+                return None, None
             self.low_light_recovered += 1
         else:
             corners_list, ids, _ = self._detector.detectMarkers(gray)
@@ -322,24 +412,13 @@ class CarLocalizer:
                     self._enhance_for_low_light(gray))
                 if ids is None:
                     self._raw_fail_streak = 0
-                    return []
+                    return None, None
                 self.low_light_recovered += 1
                 self._raw_fail_streak += 1
                 if self._raw_fail_streak >= self._PREFER_ENHANCED_AFTER:
                     self._prefer_enhanced = True
 
-        results = []
-        for i, tag_id in enumerate(ids.ravel()):
-            corners = corners_list[i].reshape(4, 2)
-            cx = float(corners[:, 0].mean())
-            cy = float(corners[:, 1].mean())
-            results.append(CarDetection(
-                tag_id=int(tag_id),
-                cx=cx,
-                cy=cy,
-                corners=corners,
-            ))
-        return results
+        return corners_list, ids
 
     # ── 多视图刚体位姿估计 ─────────────────────────────────────────────
 
@@ -501,7 +580,8 @@ class CarLocalizer:
         """
         # 并行检测所有相机（复用线程池）
         all_dets = {}
-        futures = {self._pool.submit(self.detect, img): sn for sn, img in images.items()}
+        futures = {self._pool.submit(self.detect, img, sn): sn
+                   for sn, img in images.items()}
         for fut in futures:
             all_dets[futures[fut]] = fut.result()
 

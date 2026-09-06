@@ -328,7 +328,7 @@ def _fake_locate_images(localizer, dets):
     }
     marker_to_sn = dict(enumerate(ALL_CAMS))
     localizer.detect = (  # type: ignore[method-assign]
-        lambda img: per_cam[marker_to_sn[int(img[0, 0])]]
+        lambda img, serial="": per_cam[marker_to_sn[int(img[0, 0])]]
     )
     return images
 
@@ -357,8 +357,8 @@ def test_locate_drops_entire_camera_on_duplicate_tag_id(tmp_path):
     base_detect = localizer.detect
     duplicate = _detection(1, dets[1]["cam3"].corners + 30.0)
 
-    def detect_with_duplicate(image):
-        found = list(base_detect(image))
+    def detect_with_duplicate(image, serial=""):
+        found = list(base_detect(image, serial))
         if int(image[0, 0]) == 3:
             found.append(duplicate)
         return found
