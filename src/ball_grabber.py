@@ -871,6 +871,9 @@ class SyncCapture:
         gain_db: float = -1.0,
         digital_shift: Optional[float] = None,
         pixel_format: str = "",
+        # 全相机统一底部裁剪（OffsetY 固定 0，只砍底部行）。因为偏移是 0，
+        # 裁剪后的像素坐标与全幅逐点相同，标定内参和三角测量无需任何重映射。
+        roi_height: int = 0,
         slave_params: Optional[dict[str, dict]] = None,
     ):
         self._master = master_serial
@@ -927,7 +930,7 @@ class SyncCapture:
                         digital_shift=digital_shift,
                         pixel_format=pixel_format,
                         roi_offset_y=params.get("roi_offset_y", 0),
-                        roi_height=params.get("roi_height", 0),
+                        roi_height=params.get("roi_height", roi_height),
                         roi_width=params.get("roi_width", 0),
                         binning=params.get("binning", 1),
                         _st_dev_list=st_dev_list,
@@ -948,7 +951,7 @@ class SyncCapture:
                         digital_shift=digital_shift,
                         pixel_format=pixel_format,
                         roi_offset_y=params.get("roi_offset_y", 0),
-                        roi_height=params.get("roi_height", 0),
+                        roi_height=params.get("roi_height", roi_height),
                         roi_width=params.get("roi_width", 0),
                         binning=params.get("binning", 1),
                         gev_scpd=gev_scpd,
