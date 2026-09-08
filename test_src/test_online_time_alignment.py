@@ -686,11 +686,13 @@ def test_arrival_separated_tracks_cannot_be_fitted_as_one_throw():
     assert snapshot["pc_minus_rk_s"] is None
 
 
-def test_first_bounce_before_8m_cross_rejects_throw_instead_of_using_second_bounce():
+def test_first_bounce_past_the_floor_still_locks_onto_bounce_one():
     aligner = OnlineThrowTimeAligner()
 
-    # Bounce #1 is at y=8.5 m.  The ball crosses y=8 m only on its way to the
-    # clean second bounce.  Selecting bounce #2 would fabricate a valid throw.
+    # Bounce #1 is at y=8.5 m, past the 8 m floor, so the ball never crosses the
+    # floor while airborne -- the gate line moves to 8.5 + margin = 9.5 m, which
+    # the track (starting at 10 m) does cross.  Bounce #2 sits at y~6.99 m;
+    # selecting it would fabricate a valid throw, so pin the bounce we used.
     results = _feed(
         aligner,
         _two_bounce_events(
@@ -702,11 +704,41 @@ def test_first_bounce_before_8m_cross_rejects_throw_instead_of_using_second_boun
     )
 
     assert len(results) == 1
+    accepted = results[0]
+    assert accepted["accepted"] is True
+    assert accepted["pc_minus_rk"] == pytest.approx(4.0, abs=0.001)
+    features = accepted["features"]
+    assert features["pc_cross_y"] == pytest.approx(9.5, abs=0.001)
+    assert features["rk_cross_y"] == pytest.approx(9.5, abs=0.001)
+    assert features["pc_bounce_y"] == pytest.approx(8.5, abs=0.05)
+    assert features["rk_bounce_y"] == pytest.approx(8.5, abs=0.05)
+    assert aligner.snapshot()["updates"] == 1
+
+
+def test_first_bounce_past_the_floor_without_enough_descent_still_rejects():
+    aligner = OnlineThrowTimeAligner()
+
+    # Same bounce #1 depth (y=8.5 m), but the track only starts at 9.4 m, so the
+    # ball is never seen coming down through the 9.5 m line.  Without that
+    # descent this side cannot claim it watched the same incoming flight, and
+    # falling through to bounce #2 stays forbidden.
+    results = _feed(
+        aligner,
+        _two_bounce_events(
+            rk_start=540.0,
+            pc_minus_rk=4.0,
+            y_start=9.40,
+            y_speed=1.5,
+        ),
+    )
+
+    assert len(results) == 1
     rejection = results[0]
     assert rejection["accepted"] is False
     assert rejection["reason"] == "bounce_before_cross"
     assert rejection["features"]["pc_state"] == "bounce_before_cross"
     assert rejection["features"]["pc_bounce_y"] > 8.0
+    assert rejection["features"]["pc_cross_y"] == pytest.approx(9.5, abs=0.001)
     assert rejection["features"]["pc_crossed_8"] is False
     assert aligner.current_offset() is None
     snapshot = aligner.snapshot()

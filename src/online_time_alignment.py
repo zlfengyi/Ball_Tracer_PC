@@ -5,9 +5,14 @@ The fitted clock contract is always::
     pc_exposure_time = rk_payload_time + pc_minus_rk
 
 Only complete incoming throws are eligible: each side must observe the ball
-cross y=8 m toward the car, descend into a bounce, and then rise in
-stage 1.  A completed PC/RK pair is consumed exactly once.  Failed fits never
-replace the last accepted offset.
+cross an incoming gate line toward the car, descend into a bounce, and then
+rise in stage 1.  The gate sits at y=8 m, but a throw whose first bounce lands
+beyond that line is judged against a line ``_CROSS_BOUNCE_MARGIN_M`` above its
+own bounce instead -- what the gate is really asserting is "this side watched
+the ball come in and go down", which a fixed line cannot express for a short
+feed.  Each side uses its own bounce, so the car's pose-belief error (see
+``xy_shift`` below) cancels out of the comparison.  A completed PC/RK pair is
+consumed exactly once.  Failed fits never replace the last accepted offset.
 
 Spatial agreement is judged translation-invariant: the median XY
 displacement between the two world-frame tracks is the car's pose belief
@@ -26,6 +31,13 @@ from dataclasses import dataclass, field
 
 
 _CROSS_Y_M = 8.0
+# Floor only.  A feed that first bounces past _CROSS_Y_M never crosses it while
+# airborne, so gating on the fixed line rejects the whole session (0907 evening:
+# first bounces at 8.1-11.8 m, every attempt "bounce_before_cross").  Raising the
+# constant instead is not an option -- the 0907 morning session only acquired the
+# ball at y~9.4-10.8, and any line high enough for the deep feeds is above where
+# those tracks start.  The margin is what both cases actually have in common.
+_CROSS_BOUNCE_MARGIN_M = 1.0
 _MAX_POINT_GAP_S = 0.25
 _MAX_TIMESTAMP_ARRIVAL_SKEW_S = 1.0
 _MIN_CLOCK_ROLLBACK_S = 5.0
@@ -624,15 +636,21 @@ class OnlineThrowTimeAligner:
                 candidate.bounce_index[source] = index
 
     @staticmethod
-    def _cross_time(points: list[_Point], end_index: int) -> float | None:
+    def _cross_time(
+        points: list[_Point], end_index: int, cross_y: float = _CROSS_Y_M
+    ) -> float | None:
         for left, right in zip(points[:end_index], points[1:end_index + 1]):
-            if left.y < _CROSS_Y_M or right.y > _CROSS_Y_M:
+            if left.y < cross_y or right.y > cross_y:
                 continue
             if right.y >= left.y or right.t <= left.t:
                 continue
-            fraction = (left.y - _CROSS_Y_M) / (left.y - right.y)
+            fraction = (left.y - cross_y) / (left.y - right.y)
             return left.t + fraction * (right.t - left.t)
         return None
+
+    @staticmethod
+    def _cross_line(bounce_y: float) -> float:
+        return max(_CROSS_Y_M, bounce_y + _CROSS_BOUNCE_MARGIN_M)
 
     def _source_evidence(
         self, candidate: _ThrowCandidate, source: str
@@ -646,6 +664,7 @@ class OnlineThrowTimeAligner:
             "state": "first_bounce_incomplete",
             "crossed_8": generic_cross is not None,
             "cross_t": generic_cross,
+            "cross_y": _CROSS_Y_M,
             "pre_points": 0,
             "post_points": 0,
             "bounce_y": None,
@@ -660,10 +679,12 @@ class OnlineThrowTimeAligner:
 
         bounce_sample = samples[bounce_index]
         bounce = bounce_sample.point
-        cross_t = self._cross_time(points, bounce_index)
+        cross_y = self._cross_line(bounce.y)
+        cross_t = self._cross_time(points, bounce_index, cross_y)
         evidence.update({
             "crossed_8": cross_t is not None,
             "cross_t": cross_t,
+            "cross_y": cross_y,
             "bounce_y": bounce.y,
             "bounce_t": bounce.t,
             "bounce_arrival_pc": bounce_sample.arrival_pc,
@@ -790,6 +811,7 @@ class OnlineThrowTimeAligner:
             features.update({
                 f"{source}_state": row["state"],
                 f"{source}_crossed_8": bool(row["crossed_8"]),
+                f"{source}_cross_y": row["cross_y"],
                 f"{source}_pre_points": int(row["pre_points"]),
                 f"{source}_post_points": int(row["post_points"]),
                 f"{source}_bounce_y": row["bounce_y"],
@@ -1348,6 +1370,7 @@ class OnlineThrowTimeAligner:
                 "contract": "pc_exposure_t = rk_ball_world_t + pc_minus_rk_s",
                 "topic": "/ball_world_topic",
                 "incoming_cross_y_m": _CROSS_Y_M,
+                "incoming_cross_bounce_margin_m": _CROSS_BOUNCE_MARGIN_M,
                 "joint_arrival_gap_ms": _MAX_JOINT_ARRIVAL_GAP_S * 1000.0,
                 "joint_spatial_gap_m": _MAX_JOINT_SPATIAL_GAP_M,
                 "joint_gap_ms": _MAX_JOINT_GAP_S * 1000.0,
