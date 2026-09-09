@@ -9,7 +9,10 @@
     </General>
     <Discovery>
       <ParticipantIndex>auto</ParticipantIndex>
-      <MaxAutoParticipantIndex>8</MaxAutoParticipantIndex>
+      <MaxAutoParticipantIndex>32</MaxAutoParticipantIndex>  <!-- 与 RK 侧一致：RK 上 daemon/can_node/bag/测试节点同时在跑，索引超过 8 的参与者 PC 探不到 -->
+      <!-- 0907：Windows 防火墙(Public 网)拦掉 RK 主动发来的 SPDP，发现只能靠 PC 这边周期广播 → 默认 30s 太慢，
+           RK 上新起的 ros2 bag 录不到 /pc_car_loc。3s 一轮（2 peer × 33 端口的小包）代价可忽略。 -->
+      <SPDPInterval>3 s</SPDPInterval>
       <Peers>
         <!-- 一台车一个 IP：v03 / v04，在场的那台会应答，另一台静默无害 -->
         <Peer Address="192.168.50.143" />
