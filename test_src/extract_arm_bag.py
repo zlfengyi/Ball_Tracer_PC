@@ -14,6 +14,7 @@ compact_arm_kinematics + config/cars/v04.yaml（零位 offset_rad、tool_x、hit
 输出供 test_src/generate_curve3_html.py 的 Arm tab 使用：
   states   — /joint_states 实际关节位置/速度/力矩 + FK TCP
   commands — /tennis/motor_command 目标（首个轨迹点）+ FK TCP
+  link_commands — /tennis/link_command（链侧补偿开时才有：补偿前的链侧命令；commands 此时是电机参考 = 链侧 + δ）
   events   — status / arm_command / hit_pos / predict_hit_pos 文本事件
 
 时间轴（全项目只有两个时间轴）：
@@ -501,6 +502,7 @@ def main() -> int:
 
     states: list[dict] = []
     commands: list[dict] = []
+    link_commands: list[dict] = []
     events: list[dict] = []
     state_diffs: list[tuple[float, float]] = []    # (recv_s, stamp − recv) 全部有效 stamp
     command_diffs: list[tuple[float, float]] = []
@@ -546,7 +548,7 @@ def main() -> int:
                     "tcp": tcp_of(positions),
                 }
             )
-        elif topic == "/tennis/motor_command":
+        elif topic in ("/tennis/motor_command", "/tennis/link_command"):
             msg = deserialize_message(data, msg_type)
             if not msg.points:
                 continue
@@ -556,9 +558,9 @@ def main() -> int:
                 seen_command_names = names
             positions = _ordered(list(point.positions), names, joint_names)
             stamp = _header_stamp_sec(msg)
-            if stamp > 0.0:
+            if stamp > 0.0 and topic == "/tennis/motor_command":
                 command_diffs.append((recv, stamp - recv))
-            commands.append(
+            (commands if topic == "/tennis/motor_command" else link_commands).append(
                 {
                     "stamp": stamp,
                     "recv": recv,
@@ -676,6 +678,7 @@ def main() -> int:
 
     _finish(states, c_sys_js)
     _finish(commands, c_sys_mc)
+    _finish(link_commands, c_sys_mc)
     status_payload_n = 0
     for e in events:
         if e["t_payload"] is not None:
@@ -688,6 +691,7 @@ def main() -> int:
     # dict 键序整理：t 放行首，便于肉眼查文件
     states = [{"t": r["t"], **{k: r[k] for k in ("position", "velocity", "effort", "tcp")}} for r in states]
     commands = [{"t": r["t"], **{k: r[k] for k in ("position", "velocity", "effort", "tcp")}} for r in commands]
+    link_commands = [{"t": r["t"], **{k: r[k] for k in ("position", "velocity", "effort", "tcp")}} for r in link_commands]
     events = [{"t": e["t"], "topic": e["topic"], "text": e["text"]} for e in events]
 
     # ---- ht 锚点残差：新调度触球≡ht，done(=accepted.t+duration) − ht 应 ≈0 ----
@@ -780,12 +784,13 @@ def main() -> int:
         ],
         "states": states,
         "commands": commands,
+        "link_commands": link_commands,
         "events": events,
     }
     args.output.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
     print(
-        "arm json saved: %s (states=%d commands=%d events=%d duration=%.1fs)"
-        % (args.output, len(states), len(commands), len(events), result["duration_sec"])
+        "arm json saved: %s (states=%d commands=%d link_commands=%d events=%d duration=%.1fs)"
+        % (args.output, len(states), len(commands), len(link_commands), len(events), result["duration_sec"])
     )
     print("state joint names: %s" % (seen_state_names,))
     print("command joint names: %s" % (seen_command_names,))

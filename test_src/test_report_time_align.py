@@ -176,12 +176,14 @@ def test_throw_phase_changes_all_pc_sampling_but_not_rk_values():
     assert "const pcSampleTimeForThrow = (th,t) => {" in source
     assert "const rkToPcForThrow" not in source
     assert "const pcToRkForThrow" not in source
-    assert "const targetPredHtBaseline=targetPred?rkToPc(targetPred.ht):null;" in source
-    assert "const targetPredSamplePc=targetPred?pcSampleTimeForThrow(th,targetPred.ht):null;" in source
-    assert "const truthAcc=finalHtPcSample!=null?pcTruthAt(finalHtPcSample):null;" in source
+    assert "const finalHtPcBaseline=finalHt!=null?rkToPc(finalHt):null;" in source
+    assert "const finalHtPcSample=finalHt!=null?pcSampleTimeForThrow(th,finalHt):null;" in source
+    assert "const pre300HtPcSample=pre300Ht!=null?pcSampleTimeForThrow(th,pre300Ht):null;" in source
+    assert "const truthFin=finalHtPcSample!=null?pcTruthAt(finalHtPcSample):null;" in source
+    assert "const truthPre=pre300HtPcSample!=null?pcTruthAt(pre300HtPcSample):null;" in source
     assert "const visPcT=finalHtPcSample;" in source
     assert "const visRkT=finalHt!=null&&visPcT!=null?finalHt+(visSrc.t-visPcT):null;" in source
-    assert "const hitAnchorPc=accHt!=null?pcSampleTimeForThrow(th,accHt)" in source
+    assert "const hitAnchorPc=finalHtPcSample!=null?finalHtPcSample" in source
     assert "const accHtPcBaseline=rkToPc(accHt);" in source
     assert "const accHtPcSample=th?pcSampleTimeForThrow(th,accHt):null;" in source
     assert "const result=accHtPcSample!=null?strikeAfter(accHtPcSample).verdict:'—';" in source
@@ -253,6 +255,37 @@ def test_estimate_flight_phase_fails_closed_when_short_or_ambiguous(
     obs, car, rk_data = _synth(0.0, noise_amplitude=0.0)
     result = _run_estimate(obs, car, rk_data, tmp_path, expr=expr)
     assert result["usable"] is False
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_flight_phase_quality_uses_clean_narrow_margin_tier(tmp_path):
+    obs, car, rk_data = _synth(0.0, noise_amplitude=0.0)
+    result = _run_estimate(
+        obs,
+        car,
+        rk_data,
+        tmp_path,
+        expr=(
+            "["
+            "flightPhaseQualityUsable({err:.01807,p90:.0523,trimmedRmse:.0243,n:42,span:2.223},1,1.467,.011,false),"
+            "flightPhaseQualityUsable({err:.01020,p90:.0400,trimmedRmse:.0200,n:30,span:1.5},1,1.459,.012000000000000004,false),"
+            "flightPhaseQualityUsable({err:.02442,p90:.0719,trimmedRmse:.0341,n:45,span:2.558},.918,1.380,.010,false),"
+            "flightPhaseQualityUsable({err:.01807,p90:.0523,trimmedRmse:.0243,n:42,span:2.223},1,1.467,.013,false),"
+            "flightPhaseQualityUsable({err:.02100,p90:.0523,trimmedRmse:.0243,n:42,span:2.223},1,1.467,.011,false),"
+            "flightPhaseQualityUsable({err:.02400,p90:.0900,trimmedRmse:.0390,n:20,span:.8},.8,1.500,.019,false),"
+            "flightPhaseQualityUsable({err:.01807,p90:.1100,trimmedRmse:.0243,n:42,span:2.223},1,1.467,.011,false)"
+            "]"
+        ),
+    )
+    assert result == [
+        True,   # clean/narrow 1.467: recover the calibrated boundary case
+        True,   # binary float representation of exactly 12 ms remains inclusive
+        False,  # weaker 1.380 fit remains fail-closed
+        False,  # clean but wider than 12 ms does not use the relaxed tier
+        False,  # best residual above 2 cm does not use the relaxed tier
+        True,   # the original strict 1.50 tier is unchanged
+        False,  # no uniqueness tier may bypass the existing p90 hard gate
+    ]
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")

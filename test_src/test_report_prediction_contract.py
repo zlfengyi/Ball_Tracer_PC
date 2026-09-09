@@ -642,6 +642,7 @@ def _arm_hit_harness(events: str, tail: str) -> str:
     return (
         "const isNum=v=>typeof v==='number'&&Number.isFinite(v);\n"
         "const RK={t0:0};\n"
+        "const armAligned=true;\n"
         "let HIT_TIME_ADVANCE_SEC=0.010;\n"
         "const SWING_HT_UPDATE_LEAD_SEC=0.100;\n"
         "const SWING_HT_UPDATE_MIN_REMAINING_SEC=0.060;\n"
@@ -933,43 +934,8 @@ def test_arm_data_failure_is_shown_as_a_banner_not_a_page_of_dashes(tmp_path):
     assert "载荷解析失败 9/722 条" in truncated and "#e94560" in truncated
 
 
-def _plane_shift_harness(x_scale, tx: float, dy: float) -> str:
-    """触球平面前移量的 node 夹具：喂本场自标定 x 比例 + 该拍目标 x + 实测 dy。"""
-    return (
-        "const isNum=v=>typeof v==='number'&&Number.isFinite(v);\n"
-        "const cmFmt=(v,d=1)=>isNum(v)?(Number(v)*100).toFixed(d):'—';\n"
-        "const cmSigned=(v,d=1)=>isNum(v)?(v>=0?'+':'')+(Number(v)*100).toFixed(d):'—';\n"
-        "const tableSigned=v=>isNum(v)?(v>=0?'+':'')+Number(v).toFixed(1):'—';\n"
-        f"const armConstCal={{xScale:{'null' if x_scale is None else repr(x_scale)}}};\n"
-        f"const accepted={{tx:{tx}}};\n"
-        f"const gapFin={{dy:{dy}, vRel:-12.0}};\n"
-        "const finalHt=1.0;\n"
-        + _core("hit-plane-shift-core-begin", "hit-plane-shift-core-end") + "\n"
-        "console.log(JSON.stringify({deg:hitYawExtraRad*180/Math.PI,"
-        "shift:hitPlaneShift,note:hitPlaneNote}));\n"
-    )
 
 
-@pytest.mark.skipif(NODE is None, reason="node not on PATH")
-def test_hit_plane_shift_is_derived_from_the_self_calibrated_x_scale(tmp_path):
-    """臂端整体多转 δ 把触球平面搬离车 y 面 → 「球面y−车y」列的零点跟着搬。
-
-    列的口径不动（用户 0812 拍板），但零点必须在悬停里写出来：0811 113734 场 dy=+4cm
-    按老零点读是"球没够到、ht 偏早 3ms"，扣掉平面前移 9.1cm 后是"已穿过 5cm、ht 偏晚 4ms"，
-    符号相反。δ 由 x 比例反解（同一处臂端变换 x/=cosδ），臂端下场改 δ 报告自动跟上。
-    """
-    scale = 1 / math.cos(math.radians(5.0))
-    r = _run_node(tmp_path, _plane_shift_harness(scale, 1.0439, 0.040))
-    assert r["deg"] == pytest.approx(5.0, abs=0.02)
-    assert r["shift"] == pytest.approx(1.0439 * math.sin(math.radians(5.0)), abs=1e-6)
-    assert "零点是 +9.1cm，不是 0" in r["note"]
-    assert "扣掉后球面到拍面 -5.1cm" in r["note"]       # +4.0 − 9.1（cm，1位小数）
-    assert "等效时序 +4.2ms" in r["note"]                # 正=该 ht 比真实触球晚
-
-    # δ=0（臂端没这个变换 / 没标定出来）时整段不出现，与改前逐字相同
-    for x_scale in (None, 1.0):
-        off = _run_node(tmp_path, _plane_shift_harness(x_scale, 1.0439, 0.040))
-        assert (off["deg"], off["shift"], off["note"]) == (0, 0, "")
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
@@ -1092,299 +1058,209 @@ def test_ball_car_gap_measured_at_given_time_and_rejects_pollution(tmp_path):
     assert result["miss"] is None       # 窗内无球观测不产出
 
 
-def test_main_pc_truth_and_aim_use_last_target_prediction_ht():
+def test_main_pc_truth_columns_anchor_pre300ht_and_finalht():
+    """0904 起北极星表只剩两个预测锚：Pre300HT 与 FinalHT，PC 真值各在其 ht(+本抛 zPhase) 上取样。"""
     source = SRC.read_text(encoding="utf-8")
-    assert "const targetPredHtBaseline=targetPred?rkToPc(targetPred.ht):null;" in source
-    assert "const targetPredSamplePc=targetPred?pcSampleTimeForThrow(th,targetPred.ht):null;" in source
-    assert "const targetTruth=targetPredSamplePc!=null?pcTruthAt(targetPredSamplePc):null;" in source
-    assert "const truth=pcTruthAt(htPc);" not in source
-    # 0805 起：全量RK重估的第三个 ht 不再单列，击球误差改成两列空间量——
-    # dy 是时序误差的空间形态，dx/dz 是末次 target 对应预测击球点与真值的落点差（两侧同轴同基准）
-    # raw预测/盲区列统一锚「最后进入update_ht的raw HT」；mode=2时它不是执行接触时刻。
-    # TCP 严格取 raw HT 的 /joint_states FK，不另找过面。
-    assert "const gapFin=finalHt!=null?ballCarGapForThrow(th,finalHt):null;" in source
-    assert "球面y−车y<br>@臂最后更新HT<br>(cm, RK全量真值)</th>" in source
-    assert "击球点@末次target预测<br>− RK全量真值@臂最后更新HT<br>dx/dz(cm, 世界轴)</th>" in source
-    # 0809 起两列改 cm：算式一律留米，换算只在 cmSigned/cmFmt 显示层做
-    assert "? (targetPred.worldX-targetPred.carX)-gapFin.dx : null;" in source
-    assert "const aimDz=(gapFin&&targetPred&&isNum(targetPred.relZ))?targetPred.relZ-gapFin.dz:null;" in source
-    assert "th.ref300Xw-th.ref300CarX" not in source
-    assert "isNum(th.ref300Z))?th.ref300Z-gapFin.dz" not in source
-    assert "+cmSigned(aimDx)+'/'+cmSigned(aimDz)+'</span>'" in source
-    assert "+cmSigned(gapFin.dy)+'</span>'" in source
-    assert "htAllS1ForThrow" not in source
-    assert "hE300" not in source
-    assert "<th>HT真实(触球)<br>(s,PC轴)</th>" not in source
-    assert "HT err@300<br>" not in source
-    assert "'<td>'+htPc.toFixed(3)+'</td>'" not in source
-    assert "const truth=accHtPcSample!=null?pcTruthAt(accHtPcSample):null;" in source
-    assert source.count("<td>'+pcTruthCell(targetTruth,true,targetPredSamplePc,true)+'</td>") == 2
-    assert "<td>'+pcTruthCell(truth,false,accHtPcSample)+'</td>" in source
-    # 主表第二列 PC 真值：同一套拟合，评估时刻换成raw臂最后更新HT。
-    assert "const truthAcc=finalHtPcSample!=null?pcTruthAt(finalHtPcSample):null;" in source
-    # 有/无末次 target 对应预测两条渲染路径都要出这一列（该列只依赖 accepted）
-    assert source.count("pcTruthCell(truthAcc,true,finalHtPcSample)") == 2
+    assert "const finalHt=fin?fin.ht-RK.t0:null;" in source
+    assert "const finalHtPcSample=finalHt!=null?pcSampleTimeForThrow(th,finalHt):null;" in source
+    assert "const pre300Ht=pre?pre.ht-RK.t0:null;" in source
+    assert "const pre300HtPcSample=pre300Ht!=null?pcSampleTimeForThrow(th,pre300Ht):null;" in source
+    assert "const truthFin=finalHtPcSample!=null?pcTruthAt(finalHtPcSample):null;" in source
+    assert "const truthPre=pre300HtPcSample!=null?pcTruthAt(pre300HtPcSample):null;" in source
+    assert "pcTruthCell(truthPre,true,pre300HtPcSample)" in source
+    assert "pcTruthCell(truthFin,true,finalHtPcSample)" in source
+    assert "PC真值@Pre300HT+zPhase<br>x/y/z(cm)<br>(y为球接触面)</th>" in source
+    assert "PC真值@FinalHT+zPhase<br>x/y/z(cm)<br>(y为球接触面)</th>" in source
+    # 旧锚（末次 target 对应预测 HT / 臂最后更新HT / accepted HT）与随之撤下的列不得残留在主表
+    for gone in ("targetPredHtBaseline", "targetPredSamplePc", "targetTruth", "truthAcc",
+                 "PC真值@对应预测HT", "PC真值@臂最后更新HT", "球面y−车y<br>@臂最后更新HT",
+                 "击球点@末次target预测", "const gapFin=", "hitPlaneShift", "htAllS1ForThrow", "hE300",
+                 "<th>HT真实(触球)<br>(s,PC轴)</th>", "HT err@300<br>", "'<td>'+htPc.toFixed(3)+'</td>'"):
+        assert gone not in source, gone
     # 空值必须带原因：取值时刻要传进单元格，否则 "—" 分不清缺小车位姿、缺球观测还是拟合没过门
-    assert "const pcTruthCell = (f,withY=false,tPc=null,contactY=false) => {" in source
+    assert "const pcTruthCell = (f,withY=false,tPc=null) => {" in source
     assert "const R_BALL=0.033;" in source
-    assert "const yValue=contactY?f.y-R_BALL:f.y;" in source
+    assert "const yValue=f.y-R_BALL;" in source
     assert "y=(球心world_y−R球3.3cm)−车体中心world_y" in source
-    assert "仅“PC真值@对应预测HT”列的 y 显示球接触面" in source
+    assert "y 均显示球接触面" in source
     assert "if(!f) return pcTruthMissCell(tPc);" in source
     assert "PC 小车定位在该时刻缺失" in source
     assert "PC 球观测不足" in source
-    # 0803 起已删列：开始触球t/PC球×车相交t/HT−开始触球/HT−PC相交/RK−PC dx/dz/
-    # PC真值@开始触球，相关实现与辅助函数不应残留
-    assert "touchT" not in source
-    assert "pcMeetTrueAt" not in source
-    assert "TOUCH_DWELL_LEAD_S" not in source
-    assert "开始触球" not in source
-    assert "球×车相交" not in source
+    # Arm Accepted 分表仍评估 accepted 消息自身的预测质量，锚它自己的 ht
+    assert "const truth=accHtPcSample!=null?pcTruthAt(accHtPcSample):null;" in source
+    assert "<td>'+pcTruthCell(truth,false,accHtPcSample)+'</td>" in source
+    # 0803 起已删列（开始触球/球×车相交/旧 preHt）不应残留；Pre300HT 是 0904 新口径，变量名不含旧 preHt
+    for gone in ("touchT", "pcMeetTrueAt", "TOUCH_DWELL_LEAD_S", "开始触球", "球×车相交", "preHt", "hitTableHtml"):
+        assert gone not in source, gone
     assert "y:fy[0]-c.y" in source
     assert "x:fx[0]-c.x" in source
     coord_note = "PC真值采用世界坐标轴，不随车体 yaw 旋转。x = 拟合球心 world_x − 同时刻插值车体中心 world_x"
     assert source.index('id="p5"') < source.index(coord_note) < source.index('id="rk300Tbl"')
-    assert "preHt" not in source
-    assert "hitTableHtml" not in source
 
 
-def test_rk300_table_merges_tcp_xyz_and_last_accepted_error():
+def test_rk300_table_anchors_everything_on_finalht():
+    """0904 用户定：北极星表全表唯一时间锚 = FinalHT（[[final-ht-core]]），列集固定 16 列。"""
     source = SRC.read_text(encoding="utf-8")
     exporter = TABLE_EXPORTER.read_text(encoding="utf-8")
-    assert "const accepted=lastAcceptedForThrow(th);" in source
-    assert "const accHt=accepted&&isNum(accepted.wht)?accepted.wht-RK.t0:null;" in source
-    # TCP 只锚 raw 最后更新HT；mode=2 Coast 也不另找过面。
-    assert "const tcp=finalHt!=null?tcpAt(finalHt):null;" in source
+    table = source.split("const rk300TableHtml = () => {")[1].split("const armAcceptedTableHtml = () => {")[0]
+    assert "const fin=finalTargetForThrow(th);" in table
+    assert "const pre=pre300ForThrow(th,fin);" in table
+    assert "const accepted=fin?fin.accepted:lastAcceptedForThrow(th);" in table
+    assert "const RL_TARGET_FREEZE_LEAD_S=0.030;" in source
+    assert "const tRef=fin.ht-REF_LEAD_TARGET;" in source
+    # TCP 只锚 FinalHT；不另找过面
+    assert "const tcp=finalHt!=null?tcpAt(finalHt):null;" in table
     assert "tcpAt(accHt)" not in source
     assert "armExecutionContactAt" not in source
     assert "armTcpFiveSampleAt" not in source
-    assert "const tcpYawDeg=carYawAcc;" in source
-    assert "const tcpWorld=armPointWorld(tcp,tcpYawDeg,armConstCal.zOff);" in source
+    assert "const tcpYawDeg=carYawAcc;" in table
+    assert "const tcpWorld=armPointWorld(tcp,tcpYawDeg,armConstCal.zOff);" in table
     assert "p[2]-zArmMinusWorld" in source
     assert "armZOff" not in source
-    # accepted 侧保持上游 /predict_hit_pos rel_x/rel_z 原值，不做 face_yaw/yaw/偏置变换。
-    assert "const tcpAccepted=accepted&&isNum(accepted.wx)&&isNum(accepted.wz)" in source
-    assert "? [accepted.wx,accepted.wz] : null;" in source
-    assert "const tcpAcceptedTarget" not in source
-    assert "const tcpAcceptedDx=tcpWorld&&tcpAccepted" in source
-    assert "? (tcpWorld[0]-tcpAccepted[0])*100 : null;" in source
-    assert "const tcpAcceptedDz=tcpWorld&&tcpAccepted" in source
-    assert "? (tcpWorld[2]-tcpAccepted[1])*100 : null;" in source
-    assert "last accepted 直接取上游 /predict_hit_pos rel_x/z=" in source
-    assert "z_world=z_FK−zOffset=" in source
-    assert "zOffset=臂模型z−世界z" in source
-    assert "tcp−last accepted dx/dz=" in source
-    assert "tableXyzCm(tcpWorld[0],tcpWorld[1],tcpWorld[2])+', '" in source
-    assert "mode=2 Coast 也不换时刻" in source
-    assert "各减同一个本场自标定提前量" in source
-    assert "各减10ms" not in source
-    assert source.count("<td>'+tcpCell+'</td>") == 2
+    # 臂目标：RL=FinalHT 消息自身 rel_x/rel_z，规则=最后 accepted 的（late 只改 ht）；目标侧不做任何变换
+    assert "const aimIsFinal=!!(fin&&(fin.source==='rl_status'||fin.source==='rl_recon'));" in table
+    assert "const aim=aimIsFinal?[fin.relX,fin.relZ]" in table
+    assert ":(accepted&&isNum(accepted.wx)&&isNum(accepted.wz)?[accepted.wx,accepted.wz]:null);" in table
+    assert "const tcpAimDx=tcpWorld&&aim?(tcpWorld[0]-aim[0])*100:null;" in table
+    assert "const tcpAimDz=tcpWorld&&aim?(tcpWorld[2]-aim[1])*100:null;" in table
+    assert "直接取上游 /predict_hit_pos rel_x/z=(" in table
+    assert "z_world=z_FK−zOffset=" in table
+    assert "zOffset=臂模型z−世界z" in table
+    assert "tcp−目标 dx/dz=" in table
+    assert "tableXyzCm(tcpWorld[0],tcpWorld[1],tcpWorld[2])+', '" in table
+    assert table.count("<td>'+tcpCell+'</td>") == 1
     assert "accepted.wxw-accepted.wcarx" not in source
-    assert "mode=2 Coast" in source
-    assert "armPredictionMatchesAccepted(p,e.t+RK.t0,rec.tx,rec.tz,dur)" in source
+    assert "armPredictionMatchesAccepted(p,e.t+rkT0,rec.tx,rec.tz,dur)" in source
     headers = [
-            "最后改target t / 对应ct<br>(s,global PC轴)</th>",
-            "<th>对应预测 HT<br>(s,global PC轴)</th>",
-        "<th>对应预测击球 rel_x/z(cm)</th>",
-        "末次target目标−实际车@HT<br>dx/dy(cm)<br>(RK世界系)</th>",
-        "末次target对应预测车@HT<br>−实际车@HT dx/dy(cm)<br>(RK世界系)</th>",
-        # 表头带悬停：本场回配成功率 + 自标定出来的臂端三个量（x 比例/z 偏移/提前量）
-        "机械臂最后accepted目标<br>x/z(cm)</th>",
-        "PC真值@对应预测HT+zPhase<br>x/y/z(cm)<br>(y为球接触面)</th>",
-        "PC真值@臂最后更新HT+zPhase<br>x/y/z(cm)</th>",
-        "TCP@臂最后更新HT x/y/z(cm,世界轴)<br>相对机械臂中心地面点z=0<br>tcp−last accepted（dx，dz）</th>",
-        "视觉拍心−车心@臂最后更新HT+zPhase前/后<br>x/z(cm,世界轴)<br>视觉−同曝光TCP（dx，dz）</th>",
-        "最后更新−挥拍起<br>(ms)</th>",
-        "盲区 ht−ct<br>@臂最后更新HT<br>(ms)</th>",
-        "Δht 重定相<br>(ms)</th>",
-        "球面y−车y<br>@臂最后更新HT<br>(cm, RK全量真值)</th>",
-        "击球点@末次target预测<br>− RK全量真值@臂最后更新HT<br>dx/dz(cm, 世界轴)</th>",
-        "车yaw@臂最后更新HT<br>(°)</th>",
-        "目标挥拍速度/pitch<br>(m/s, °)</th>",
-        "目标规划出球<br>yaw/pitch/speed<br>(°,°,m/s;世界系)</th>",
-        "拍面yaw,pitch / 世界拍心speed<br>@臂最后更新HT<br>(°,°,m/s;世界系)</th>",
-        "拍面yaw,pitch / 世界拍心speed<br>@臂最后更新HT−12ms<br>(°,°,m/s;世界系)</th>",
+        "末次target目标−实际车@FinalHT<br>dx/dy(cm)<br>(RK世界系)</th>",
+        "末次target对应预测车<br>−实际车@FinalHT dx/dy(cm)<br>(RK世界系)</th>",
+        "Pre300HT 预测击球点<br>rel_x/z(cm) @ht</th>",
+        "FinalHT 预测击球点<br>rel_x/z(cm) @ht</th>",
+        "Pre300HT−FinalHT<br>dx/dz(cm) Δht(ms)</th>",
+        "PC真值@Pre300HT+zPhase<br>x/y/z(cm)<br>(y为球接触面)</th>",
+        "PC真值@FinalHT+zPhase<br>x/y/z(cm)<br>(y为球接触面)</th>",
+        "TCP@FinalHT x/y/z(cm,世界轴)<br>相对机械臂中心地面点z=0<br>tcp−臂目标（dx，dz）</th>",
+        "视觉拍心−车心@FinalHT+zPhase附近<br>x/y/z(cm,世界轴)<br>人工轨迹或最近前/后＋ht前逐帧；视觉−同曝光TCP（dx，dy，dz）</th>",
+        "车yaw@FinalHT<br>(°)</th>",
+        "目标挥拍速度/yaw/pitch<br>(m/s, °, °)</th>",
+        "拍面yaw,pitch / 世界拍心speed<br>@FinalHT<br>(°,°,m/s;世界系)</th>",
+        "拍面yaw,pitch / 世界拍心speed<br>@FinalHT−12ms<br>(°,°,m/s;世界系)</th>",
         "PC回球<br>yaw/俯仰(°) / speed / Δt(ms)</th>",
         "实测 e_n,eff<br>(拍面法向)</th>",
-        "PC视频判型 / S0 cxy, cor_z / 实测反弹 cxy, cor_z / RK旧拍头vz</th>",
     ]
-    assert [source.index(header) for header in headers] == sorted(
-        source.index(header) for header in headers
-    )
-    assert "TCP@执行过面−accepted" not in source
-    # 两列拍面角锚在「臂最后更新 HT」（含挥拍中 ht 重定相消费的那条），不是最后一条 accepted
-    assert "? (accepted.finalMismatch ? null : (isNum(accepted.finalHt)?accepted.finalHt-RK.t0:accHt))" in source
+    assert [table.index(h) for h in headers] == sorted(table.index(h) for h in headers)
+    assert len(re.findall(r"<th[ >]", table)) == len(headers) + 1   # 加 # 列，恰 16 列（<thead> 不算）
+    for gone in ("机械臂最后accepted目标<br>x/z(cm)</th>", "PC真值@对应预测HT+zPhase", "最后更新−挥拍起<br>(ms)</th>",
+                 "盲区 ht−ct<br>@臂最后更新HT", "Δht 重定相<br>(ms)</th>", "目标规划出球<br>", "<th>消息</th>",
+                 "<th>备注</th>", "PC视频判型 / S0 cxy, cor_z / 实测反弹 cxy, cor_z / RK旧拍头vz</th>",
+                 "TCP@执行过面−accepted", "臂最后更新HT", "accHt"):
+        assert gone not in table, gone
+    # 规则模式的 FinalHT 仍来自 _armHit 的重定相重建（最后一条 late ht saved 的同源 ht/ct）
+    assert "const ct=isNum(accepted.finalCt)?accepted.finalCt:accepted.wct;" in source
+    assert "source=viaLate?'late_saved':'accepted';" in source
     assert "continuousSweep || e.t<=cur.done+0.05" in source
     assert "const continuousSweep=/\\bsweep_w=/.test(e.text);" in source
     assert "mode:continuousSweep?statusNum(e.text,'mode'):null" in source
-    assert "faceAnglesWorldAt(finalHt)" in source
-    assert "faceAnglesWorldPreAt(finalHt)" in source
+    assert "h.finalHt=null; h.finalCt=null; h.finalMismatch=true;" in source
+    # 拍面/拍速/车 yaw 全部锚 FinalHT
+    assert "faceAnglesWorldAt(finalHt)" in table
+    assert "faceAnglesWorldPreAt(finalHt)" in table
     assert "faceAnglesWorldAt(accHt)" not in source
     assert "faceAnglesWorldPreAt(accHt)" not in source
     assert "const botYaw=botYawDegAt(tEval);" in source
     assert "pcCarYawAt" not in source
     assert "faceYaw.carYaw" not in source
-    assert "PC AprilTag raw HT" not in source
-    assert "PC raw HT左右最近帧按HT距离作圆弧插值" not in source
-    assert "挥拍前0.45~0.15s窗圆均值" not in source
-    assert "PC AprilTag 挥拍前[−450,−150]ms 圆均值" not in source
-    # 两列各自同时给 yaw 与 pitch（同一份窗内拟合），单元格文本为 yaw/pitch
-    assert "tableSigned(faceYaw.deg)+'/'+tableSigned(faceYaw.pitch)" in source
-    assert "tableSigned(faceYawPre.deg)+'/'+tableSigned(faceYawPre.pitch)" in source
-    # 两列灰字是世界拍速：六轴臂速度向量、车心平移与 yaw 刚体项在同一 RK 物理时刻合成。
-    # 不沿用 yaw/pitch 的窗内外推；J1 伺服/目标比较仍严格使用 J1 同口径，不能拿世界总速相减。
-    assert "const swingSpeed=racketSpeedAt(finalHt);" in source
+    assert "tableSigned(faceYaw.deg)+'/'+tableSigned(faceYaw.pitch)" in table
+    assert "tableSigned(faceYawPre.deg)+'/'+tableSigned(faceYawPre.pitch)" in table
+    assert "const swingSpeed=racketSpeedAt(finalHt);" in table
     assert "const s=interpRow(armSpeedRows,t,RACKET_SPEED_MAX_GAP_S);" in source
-    assert "const fit=fitFaceAnglesTo(accHtRk,tEval);" in source  # yaw/pitch 仍是窗内拟合外推
-    assert "swingSpeed.speedWorld.toFixed(2)+'m/s'" in source
-    assert "swingSpeed.speedArm" in source
-    assert "swingSpeed.speedCar" in source
-    assert "swingSpeed.speedTurn" in source
-    assert "swingSpeed.vJ1-swingSpeed.cmdJ1" in source
-    assert "swingSpeed.vJ1-tgtSpeed" in source
-    # 触球锚只许由指令速度平台首帧定位；实测速度叠着 σ~0.5m/s 伺服振荡，
-    # 窗内 argmax 不是触球探测器（0808 首版的"峰值即触球"伪迹，不许回潮）
-    assert "swingSpeed.contactDt" in source and "swingSpeed.measContactJ1" in source
-    assert "swingSpeed.oscJ1" in source
+    assert "const fit=fitFaceAnglesTo(accHtRk,tEval);" in source
+    assert "swingSpeed.speedWorld.toFixed(2)+'m/s'" in table
+    for k in ("swingSpeed.speedArm", "swingSpeed.speedCar", "swingSpeed.speedTurn",
+              "swingSpeed.vJ1-swingSpeed.cmdJ1", "swingSpeed.vJ1-tgtSpeed",
+              "swingSpeed.contactDt", "swingSpeed.measContactJ1", "swingSpeed.oscJ1"):
+        assert k in table, k
     assert "peakDt" not in source
-    # 目标挥拍速度/pitch 列：只吃 accepted 状态自带的计划量，两条渲染路径都要出
-    assert "const tgtSpeed=accepted&&isNum(accepted.tgtSpeed)?accepted.tgtSpeed:null;" in source
-    assert "const tgtPitch=accepted&&isNum(accepted.tgtPitch)?accepted.tgtPitch:null;" in source
+    # 目标三量：RL 用 FinalHT 目标（rl_swing done 状态），规则用最后 accepted 计划量；yaw=−δ（世界系）
+    assert "const doneNum=k=>done?statusNum(done.text,k):null;" in table
+    assert "const tgtSpeed=isNum(doneNum('speed_req'))?doneNum('speed_req')" in table
+    assert ":(accepted&&isNum(accepted.tgtSpeed)?accepted.tgtSpeed:null);" in table
+    assert "const tgtYawWorldDeg=tgtYawExtraDeg!=null?-tgtYawExtraDeg" in table
+    assert "yawExtra:Number(p.hit_yaw_extra), carYaw:Number(p.car_yaw)" in source
     assert "tgtSpeed:statusNum(e.text,'speed')" in source
     assert "tgtSpeedReq:statusNum(e.text,'speed_req')" in source
-    assert source.count("<td>'+tgtSpeedCell+'</td>") == 2
-    # 规划球出射三量只能吃最后 accepted 的显式记录；三字段原子齐全才显示，禁止拿
-    # yaw_extra/拍面 pitch/挥拍 speed 反推代填。
-    assert "tgtOutYaw:statusNum(e.text,'out_yaw')" in source
-    assert "tgtOutPitch:statusNum(e.text,'out_pitch')" in source
-    assert "tgtOutSpeed:statusNum(e.text,'out_speed')" in source
-    assert "tgtOutReplay:statusNum(e.text,'out_replay')===1" in source
-    assert "const tgtOutComplete=tgtOutYaw!=null&&tgtOutPitch!=null&&tgtOutSpeed!=null;" in source
-    assert "离线重放候选（075317 原日志未记录出球三元组）" in source
-    assert "禁止用 yaw_extra、拍面 pitch 或挥拍 speed 代填" in source
-    assert source.count("<td>'+tgtOutCell+'</td>") == 2
-    # 盲区列的 ct/ht 必须同源，且与主表末次 target 对应预测不是一回事
-    assert "const finalCt=accepted&&isNum(accepted.finalCt)?accepted.finalCt-RK.t0:null;" in source
-    # 回配失配（重定相生效但拿不到同源 ht/ct）必须出 ⚠— 而不是退回 accepted 冒充：
-    # 0809 场 #6/#13 曾把 ~174ms 的真盲区显示成 327/306ms，且无任何提示
-    assert "const blindBad=!!(accepted&&accepted.finalMismatch);" in source
-    assert (
-        "const blind=(finalHt!=null&&finalCt!=null&&!blindBad)?(finalHt-finalCt)*1000:null;"
-        in source
-    )
-    assert "h.finalHt=null; h.finalCt=null; h.finalMismatch=true;" in source
-    assert "⚠—" in source
-    # 0803 已删列：视觉球拍@accepted HT（相对小车），其专用取值/单元格实现不应残留
-    assert "视觉球拍" not in source
-    assert "visualRacketAt" not in source
-    assert "visualRacketCell" not in source
-    # 车yaw@臂最后更新HT 列：/bot_state yaw 按它自己的 imu_t 物理轴严格夹取。
-    assert "const carYawAcc=finalHt!=null?botYawDegAt(finalHt):null;" in source
-    assert "const carYawRate=finalHt!=null?imuYawRateDegAt(finalHt):null;" in source
-    assert source.count("<td>'+carYawCell+'</td>") == 2
-    # 世界拍速三条车体合同：vx/vy/yaw 走 bot_state imu_t；角速度走已回拨反馈延时的 IMU t。
+    assert table.count("<td>'+tgtCell+'</td>") == 1
+    # 车yaw@FinalHT 列：/bot_state yaw 按它自己的 imu_t 物理轴严格夹取
+    assert "const carYawAcc=finalHt!=null?botYawDegAt(finalHt):null;" in table
+    assert "const carYawRate=finalHt!=null?imuYawRateDegAt(finalHt):null;" in table
+    assert table.count("<td>'+carYawCell+'</td>") == 1
+    # 世界拍速三条车体合同：vx/vy/yaw 走 bot_state imu_t；角速度走已回拨反馈延时的 IMU t
     assert "ys(RK.imu,'yaw_speed')" in source
     assert "const T=ys(RK.bot,'imu_t')||[], VX=ys(RK.bot,'vx'), VY=ys(RK.bot,'vy')" in source
     assert "const vCar=botVelocityAt(t), yawDeg=botYawDegAt(t), yawRate=imuYawRateAt(t);" in source
     assert "CA.bot_center.params.arm_forward_offset_m" in source
-    assert "racketWorldVelocity(vArm,tcp,vCar,yawDeg,yawRate,armForwardOffsetM)" in source
+    # yaw 刚体项的杠杆必须是拍心点 p_head 本身（速度算的是哪个点，杠杆就得是哪个点）
+    assert "racketWorldVelocity(vArm,head,vCar,yawDeg,yawRate,armForwardOffsetM)" in source
+    assert "const head=[0,1,2].map(k=>lerp(s.a.p_head[k],s.b.p_head[k],s.f));" in source
     assert "不回退 arm-only" in source
-    # HT−12ms 列（0808 由 −10ms 挪到 −12ms：指令平台首帧定位的臂内触球锚中位 −11ms）：
-    # fy/fp 同窗拟合在该刻取值、拍速同刻插值；车 yaw 用 /bot_state 瞬时值（IMU 连续更新）
     assert "const FACE_YAW_PRE_S=0.012;" in source
-    assert "racketSpeedRawAt(finalHt-FACE_YAW_PRE_S)" in source
-    assert "swingSpeedPre.speedWorld.toFixed(2)+'m/s'" in source
+    assert "racketSpeedRawAt(finalHt-FACE_YAW_PRE_S)" in table
+    assert "swingSpeedPre.speedWorld.toFixed(2)+'m/s'" in table
     assert "fitFaceAnglesTo(accHtRk,tEval)" in source
     assert "botYawDegAt(tEval)" in source
     assert "ys(RK.bot,'yaw')" in source
     assert "const T=ys(RK.bot,'imu_t')||[], Y=ys(RK.bot,'yaw')" in source
-    assert "<th>/tennis/status 字符串</th>" not in source
-    assert "<th>/predict_hit_pos 字符串</th>" not in source
-    # 旧车心/偏置 TCP 列与 accepted HT 锚点命名不应残留（lead 分表的 PC真值@accepted HT 除外，
-    # 那边评估的是 accepted 消息自身预测质量，锚它自己的 ht 语义正确）
-    assert "TCP−车心@臂最后更新HT" not in source
-    assert "z−臂系z偏移" not in source
-    assert "臂基≡车心" not in source
-    assert "TCP@accepted HT" not in source
-    assert "PC真值@accepted HT x/y/z" not in source
-    assert "tableXyzCm(tcpWorld[0],tcpWorld[1],tcpWorld[2])" in source
-    # phase/target/deadline 仍在发布事件轴；只有物理 pose 在 imu_t=HT 上插值。
+    for gone in ("<th>/tennis/status 字符串</th>", "<th>/predict_hit_pos 字符串</th>", "TCP−车心@臂最后更新HT",
+                 "z−臂系z偏移", "臂基≡车心", "TCP@accepted HT", "PC真值@accepted HT x/y/z", "视觉球拍",
+                 "visualRacketAt", "visualRacketCell"):
+        assert gone not in source, gone
+    # 车侧两列：末次 raw target / 末次target对应预测车，都减 FinalHT 时刻的实际车（imu_t 有界插值）
     assert "const t=ts(RK.bot), phase=ys(RK.bot,'phase');" in source
     assert "deadline:isNum(remaining[i])?t[i]+remaining[i]:null" in source
-    assert "const actualAtTargetHt=targetChange&&isNum(targetChange.deadline)" in source
-    assert "? botPoseAtImuTime(targetChange.deadline) : null;" in source
-    assert "(runEnd.tx-actualAtTargetHt.x)*100" in source
-    assert "(runEnd.ty-actualAtTargetHt.y)*100" in source
-    assert source.count("<td>'+targetActualAtHtError+'</td>") == 2
-    assert "const actualAtPredHt=targetPred?botPoseAtImuTime(targetPred.ht):null;" in source
-    assert "(targetPred.carX-actualAtPredHt.x)*100" in source
-    assert "(targetPred.carY-actualAtPredHt.y)*100" in source
+    assert "const actualAtFinal=finalHt!=null?botPoseAtImuTime(finalHt):null;" in table
+    assert "(runEnd.tx-actualAtFinal.x)*100" in table
+    assert "(runEnd.ty-actualAtFinal.y)*100" in table
+    assert "(targetPred.carX-actualAtFinal.x)*100" in table
+    assert "(targetPred.carY-actualAtFinal.y)*100" in table
+    assert table.count("<td>'+targetActualCell+'</td>") == 1
+    assert table.count("<td>'+predActualCell+'</td>") == 1
+    assert "actualAtTargetHt" not in source
     assert "(th.ref300CarX-runEnd.x)*100" not in source
-    assert "(th.ref300CarY-runEnd.y)*100" not in source
-    assert source.count("<td>'+predActualAtHtError+'</td>") == 2
-    assert "const targetPredHt=targetPredHtBaseline!=null?targetPredHtBaseline.toFixed(3):'—';" in source
-    assert "const targetPredHit=targetPred?tableXzCm(targetPred.relX,targetPred.relZ):'—';" in source
-    assert source.count("<td>'+targetPredHt+'</td>") == 2
-    assert source.count("<td>'+targetPredHit+'</td>") == 2
-    assert source.count("<td>'+racketCorCell+'</td>") == 2
-    assert source.count("<td>'+enCell+'</td>") == 2
-    assert "const enHitRk=ret&&finalHt!=null&&finalHtPcSample!=null" in source
-    assert "finalHt+(ret.tHit-finalHtPcSample)" in source
-    assert "faceAnglesWorldAt(finalHt,enHitRk)" in source
-    assert "racketSpeedRawAt(enHitRk)" in source
-    assert "racketNormalRestitution(" in source
-    assert "[ret.incoming.vx,ret.incoming.vy,ret.incoming.vz]" in source
-    assert "[ret.vx,ret.vy,ret.vz],enRacket.world,enNormal" in source
-    assert "不是材料常数，也不是落地 cor_z/cxy 或世界y等效e" in source
-    assert "const racketCorCell=racketCorCellHtml(th,racketAssignments);" in source
-    assert "同抛最后一条Stage0 /predict_hit_pos" in source
-    assert "不取配置值，也不拿S1遥测冒充" in source
-    assert "(row.status==='accepted'||row.status==='rejected')" in source
-    assert "acceptedState=rowStatus==='accepted'&&contactAnchorStatus==='accepted'" in source
-    assert "const validAccepted=acceptedState&&acceptedEvidence;" in source
-    assert "measurement.accepted===true" in source
-    assert "bundle&&bundle.accepted===true" in source
-    assert "invalid_accepted_evidence" in source
-    assert "validContactRejected=rowStatus==='rejected'&&contactAnchorStatus==='rejected'" in source
-    assert "validVisionNotEvaluated=rowStatus==='rejected'&&contactAnchorStatus==='accepted'" in source
-    assert "validVisionRejected=rowStatus==='rejected'&&contactAnchorStatus==='accepted'" in source
-    assert "acceptedVz=validAccepted&&isNum(match.row.vz_world_mps)" in source
-    assert "measurement.bundle_diagnostics" in source
-    assert "bundle.supported_frames" in source
-    assert "bundle.fit_span_s" in source
-    assert "bundle.max_reprojection_error_px" in source
-    assert "bundle.leave_one_frame_bbox_center_vz_mps" in source
-    assert "拒绝记录的 vz_world_mps 无论是否存在都不读取、不显示" in source
-    assert "racket_impact/v3 状态组合无效" in source
-    assert "row.contact_t_rk" not in source
-    assert "refined_contact_t_rk" not in source
-    assert "contact_anchor_t_rk" in source
-    assert "仅按 contact_anchor_t_rk=" in source
-    assert "RK ball_world 固定高度外推锚点" in source
-    assert "不是视频直接观测到的impact" in source
-    assert "racketMotionForVz" in source
-    assert "球拍头bbox中心bundle vz代理" in source
-    assert "不是校准拍面速度" in source
-    assert "不是直接观测球自转" in source
-    assert "未用于本场S0" in source
-    assert "旧session没有 D.racket_impact；旧运动质心流程已判定不可信，绝不再用于判型" in source
-    assert "RK当时S0采用的旧拍头vz " in source
-    assert "D.racket_swing" not in source
-    assert "racketSwingAssignments" not in source
+    # 两个预测点格 + 差值格
+    assert "const preCell=predPointCell(pre,'Pre300HT','');" in table
+    assert "const finCell=predPointCell(fin,'FinalHT',fin?' ['+srcLabel[fin.source]+']':'');" in table
+    assert "tableSigned((pre.relX-fin.relX)*100)+'/'+tableSigned((pre.relZ-fin.relZ)*100)" in table
+    assert "Δht'+tableSigned((pre.ht-fin.ht)*1000)+'ms" in table
+    # 视频判型 / 反弹 COR 列已从主表撤下（实现保留给 racket-cor 单测）；e_n 列保留并锚 FinalHT
+    assert "<td>'+racketCorCell+'</td>" not in source
+    assert table.count("<td>'+enCell+'</td>") == 1
+    assert "const enHitRk=ret&&finalHt!=null&&finalHtPcSample!=null" in table
+    assert "finalHt+(ret.tHit-finalHtPcSample)" in table
+    assert "faceAnglesWorldAt(finalHt,enHitRk)" in table
+    assert "racketSpeedRawAt(enHitRk)" in table
+    assert "racketNormalRestitution(" in table
+    assert "[ret.incoming.vx,ret.incoming.vy,ret.incoming.vz]" in table
+    assert "[ret.vx,ret.vy,ret.vz],enRacket.world,enNormal" in table
+    assert "不是材料常数，也不是落地 cor_z/cxy 或世界y等效e" in table
+    # 合同导出带挥拍模式与 FinalHT 来源，schema 不变（racket_ht_black_marker 只认 v4）
+    contract = source.split("const publishArmHitContract = rows => {")[1]         .split("const rk300TableHtml = () => {")[0]
+    assert "schema:'arm_final_ht/v4'," in contract
+    assert "swingMode:ARM_SWING_MODE.mode," in contract
+    assert "finalHtSource:fin?fin.source:null," in table
+    assert "finalHtRkAbs:fin?fin.ht:null," in table
+    # 0 抛的场次也发合同（rows=[]）：下游靠"有没有合同"区分报告太旧/页面挂了 与 本场没有抛
+    assert "if(!reportThrows.length){ publishArmHitContract([]); return ''; }" in table
+    assert "publishArmHitContract(armContractRows);" in table
+    # racket-cor 实现合同不变（列撤下但函数留给单测与将来复用）
     cell = re.search(r"const racketCorCellHtml = .*?\n};", source, re.S)
     assert cell
     assert "<br>" not in cell.group(0)
     assert "impactText+' / S0 cxy '+corXyText+', cor_z '+corText" in cell.group(0)
     assert "' / 实测反弹 cxy '+measuredCxyText+', cor_z '+measuredCorText" in cell.group(0)
     assert "' / RK旧拍头vz '+usedValue" in cell.group(0)
-    assert " / S0 cor_xy(水平) " not in cell.group(0)
-    assert " / 实测反弹≈ cor_xy(水平) " not in cell.group(0)
     assert "cor_xy=vxy_out/vxy_in=" in source
     assert "cor_z=−vz_out/vz_in=" in source
-    assert '<th style="white-space:nowrap"' in source
-    assert "'<br><span style=\"color:#a0a0c0\">ct '" not in source
-    assert "' <span style=\"color:#a0a0c0\">(ct '" in source
-    assert '"rk300Tbl": "北极星表（末次 Target 对应预测 / PC 真值 / 臂执行）"' in exporter
+    assert '"rk300Tbl": "北极星表（Pre300HT / FinalHT 预测 / PC 真值 / 臂执行）"' in exporter
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
@@ -1433,11 +1309,14 @@ def test_racket_world_speed_is_vector_sum_with_car_center_offset(tmp_path):
 
 @pytest.mark.parametrize("car,fp0", [("v03", 15.42), ("v04", 15.42)])
 def test_add_face_angles_wiring_and_fk_properties(car, fp0):
-    """拍面yaw,pitch,speed 三量的 Python 侧：正确附加 fy/fp/v_tcp_arm、跳过残缺关节；
+    """拍面yaw,pitch,拍心/拍速的 Python 侧：正确附加 fy/fp、跳过残缺关节；
     FK 性质：零位 fy=fp=0（拍面朝正前且不上仰）、J1 为垂直轴（Δfy=−Δq1 精确、fp 分毫不动
-    ——这正是 pitch 列不需要减车 yaw 的依据）；三维速度的解析 Jacobian 与数值差分一致，
-    且只有 J1 转时退化成 |q̇1|·r（r=hypot(tcp_x,tcp_y)），即 status speed= 的口径。
-    两台车逐条都要成立：拍面角在两车下恒等（旋转链一致），位置/拍速则不同。"""
+    ——这正是 pitch 列不需要减车 yaw 的依据）。
+    拍速口径按车分（arm.head_model 自报）：v0.3 无柔度标定 → 解析 Jacobian，与数值差分一致、
+    只有 J1 转时退化成 |q̇1|·r（status speed= 的口径）；v0.4 走冻结柔度模型 F，**必须同时有
+    effort** 才出 p_head/v_tcp_arm，故这里这批没 effort 的帧在 v04 下一律不出速度（F 的细节
+    见 test_add_face_angles_v04_head_is_frozen_compliance_central_difference）。
+    拍面角在两车下恒等（旋转链一致），位置/拍速则不同。"""
     pytest.importorskip("numpy")
     import math
     import sys
@@ -1482,12 +1361,22 @@ def test_add_face_angles_wiring_and_fk_properties(car, fp0):
     # 三维速度只在有 6 个数值 velocity 的帧上出现；不再只存无法与车速向量合成的模长。
     assert all("v_tcp_arm" not in s[i] for i in (0, 5, 9))
     assert all("vt" not in row for row in s)
+    if car == "v04":
+        # 冻结柔度模型三个输入缺一不可：这批帧没有 effort ⇒ 整批无 p_head、无拍速
+        assert arm["head_model"]["kind"] == "frozen_compliance"
+        assert arm["head_model"]["velocity"] == "central_difference"
+        assert all("v_tcp_arm" not in row and "p_head" not in row for row in s)
+        assert "冻结柔度模型" in arm["fk_source"]
+        return
+    assert arm["head_model"]["kind"] == "rigid_fk_jacobian"     # v0.3 没有柔度标定
+    assert "拍速=解析 Jacobian" in arm["fk_source"]
     # 解析 Jacobian 三分量 ≡ 数值差分（沿 q̇ 方向前推一小步的位移速率）
     step = 1e-6
     tcp0 = fk(q)["tcp"]
     tcp1 = fk([a + step * b for a, b in zip(q, qd)])["tcp"]
     numeric_vec = [(float(tcp1[i]) - float(tcp0[i])) / step for i in range(3)]
     assert s[6]["v_tcp_arm"] == pytest.approx(numeric_vec, abs=1e-4)
+    assert s[6]["p_head"] == pytest.approx([float(v) for v in tcp0], abs=1e-4)  # 刚性 TCP 原样
     # 只有 J1 转时退化成 |q̇1|·r（触球瞬间的构造，也是 status speed= 的口径）
     lever = math.hypot(tcp0[0], tcp0[1])
     assert math.dist(s[7]["v_tcp_arm"], [0.0, 0.0, 0.0]) == pytest.approx(
@@ -1496,17 +1385,153 @@ def test_add_face_angles_wiring_and_fk_properties(car, fp0):
     assert s[8]["v_tcp_arm"] == [0.0, 0.0, 0.0]                # 静止帧拍速为 0
 
 
-def test_rk300_table_shows_reject_reasons_only_without_accepted():
+def test_add_face_angles_v04_head_is_frozen_compliance_central_difference():
+    """v0.4 的拍心/拍速合同：p_head = 冻结柔度模型 F(q, q̇, τ)，拍速 = 它的 ±10ms 中心差分。
+
+    钉四条：① 零载荷零速时 F 退化成「刚性 TCP + R·tool_offset + [dx,dy,0]」的纯几何偏置；
+    ② 有力矩时 q_eff 真的按 c·τ 偏（J1 正负载荷不同系数），p_head 随之偏离刚性 TCP；
+    ③ v_tcp_arm 就是相邻 ±10ms 两帧 p_head 的割线，不是 J(q)·q̇——同一批帧上两者数值不同；
+    ④ 差分端点被 >30ms 的断档隔开时不出速度（空闲段 20Hz 会走到这条）。"""
+    pytest.importorskip("numpy")
+    import json
+    import sys
+
+    import numpy as np
+
+    sys.path.insert(0, str(SRC.parent))
+    try:
+        from generate_curve3_html import _add_face_angles, _frozen_head_model
+        import extract_arm_bag as eab
+    finally:
+        sys.path.pop(0)
+    eab.use_car("v04")
+    model = _frozen_head_model("v04")
+    spec = json.loads(Path(model["path"]).read_text(encoding="utf-8"))
+    link6 = eab.JOINTS[-1]["child"]
+
+    def ref_point(q, qd, tau):
+        c = spec["compliance_rad_per_Nm"]
+        qe = list(map(float, q))
+        qe[0] -= (c["j1_positive_effort"] * max(tau[0], 0.0)
+                  + c["j1_negative_effort"] * min(tau[0], 0.0)
+                  + spec["j1_velocity_seconds"] * qd[0])
+        for j in (2, 3, 4):
+            qe[j] -= c[f"j{j + 1}"] * tau[j]
+        r = eab.fk(qe)
+        rot = np.asarray(r["link_transforms"][link6][:3, :3], dtype=float)
+        return (np.asarray(r["tcp"], dtype=float)
+                + rot @ np.asarray(spec["tool_offset_m"], dtype=float)
+                + np.asarray([*spec["base_xy_offset_m"], 0.0], dtype=float))
+
+    q0 = [0.1, -0.2, 0.3, 0.15, -0.4, 0.25]
+    qd = [4.0, -0.4, 0.7, 0.2, -0.9, 0.5]
+    tau = [37.0, -6.0, 3.0, -8.0, 2.5, 0.4]
+    dt = 0.010
+    # 100Hz 一段（12 帧）+ 一段 60ms 断档后的孤立帧
+    ts = [1.000 + k * dt for k in range(12)] + [1.170, 1.180]
+    states = []
+    for i, t in enumerate(ts):
+        q = [a + b * (t - ts[0]) for a, b in zip(q0, qd)]
+        states.append({"t": round(t, 6), "position": q,
+                       "velocity": list(qd), "effort": list(tau)})
+    # 静止零载荷帧（放在最后一段之后，自带 ±10ms 邻居）
+    rest_t = [1.400, 1.410, 1.420]
+    for t in rest_t:
+        states.append({"t": t, "position": list(q0), "velocity": [0.0] * 6,
+                       "effort": [0.0] * 6})
+    arm = {"car": "v04", "states": states}
+    _add_face_angles(arm, car="v04")
+    s = arm["states"]
+
+    # ① 零载荷零速 ⇒ 纯几何偏置
+    rest = s[len(ts) + 1]
+    rigid = np.asarray(eab.fk(q0)["tcp"], dtype=float)
+    assert rest["p_head"] == pytest.approx(ref_point(q0, [0.0] * 6, [0.0] * 6), abs=1e-4)
+    assert float(np.linalg.norm(np.asarray(rest["p_head"]) - rigid)) > 0.005   # 偏置非零
+    assert rest["v_tcp_arm"] == [0.0, 0.0, 0.0]                # 静止帧拍速为 0
+
+    # ② 有力矩时 q_eff 真的偏，p_head 离开刚性 TCP
+    mid = s[5]
+    assert mid["p_head"] == pytest.approx(ref_point(mid["position"], qd, tau), abs=1e-4)
+    assert float(np.linalg.norm(
+        np.asarray(mid["p_head"])
+        - np.asarray(eab.fk(mid["position"])["tcp"], dtype=float))) > 0.02
+
+    # ③ 拍速 ≡ 相邻 ±10ms 两帧 p_head 的割线，且明显不等于 J(q)·q̇
+    # p_head 落盘只留 0.1mm（4 位），拿它反算割线自带 ±0.0001/0.02 = ±5mm/s 的量化噪声
+    secant = [(b - a) / (2 * dt) for a, b in zip(s[4]["p_head"], s[6]["p_head"])]
+    assert mid["v_tcp_arm"] == pytest.approx(secant, abs=6e-3)
+    res = eab.fk(mid["position"])
+    jac = np.zeros(3)
+    for rate, joint in zip(qd, eab.JOINTS):
+        frame = res["joint_frames"][joint["name"]]
+        jac += rate * np.cross(frame[:3, :3] @ joint["axis"],
+                               res["tcp"] - frame[:3, 3])
+    assert float(np.linalg.norm(np.asarray(mid["v_tcp_arm"]) - jac)) > 0.05
+
+    # ④ 端点被 >30ms 断档隔开 ⇒ 有 p_head 但没有拍速（首尾帧同理）
+    assert "p_head" in s[len(ts) - 1] and "v_tcp_arm" not in s[len(ts) - 1]
+    assert "p_head" in s[0] and "v_tcp_arm" not in s[0]
+    assert arm["head_model"]["sha256"] == model["sha256"]
+    assert arm["head_model"]["half_window_ms"] == pytest.approx(10.0)
+
+
+def test_v04_head_point_matches_rl_arm_frozen_endpoint():
+    """报告端的 p_head 必须与 rl_arm/env/frozen_endpoint.py 逐值相同。
+
+    两边现在共用同一个资产文件，但公式是各自写的一份（报告端不 import rl_arm，避免把
+    torch 拖进报告链）。这条测试就是那份「同一口径」的锁：训练环境评分用哪个点、
+    报告页面上的拍速/e_n 就得是同一个点，否则线上线下的甜点定义会悄悄分叉。"""
+    pytest.importorskip("numpy")
+    pytest.importorskip("torch")          # frozen_endpoint 模块级 import torch
+    import sys
+
+    import numpy as np
+
+    rl_arm = Path(os.environ.get("TENNIS_MAN_ROOT", "D:/tennis-man")) / "rl_arm"
+    if not (rl_arm / "env" / "frozen_endpoint.py").is_file():
+        pytest.skip(f"rl_arm checkout 不在 {rl_arm}")
+    sys.path.insert(0, str(SRC.parent))
+    sys.path.insert(0, str(rl_arm))
+    try:
+        from generate_curve3_html import _frozen_head_model, _head_effective_q
+        import extract_arm_bag as eab
+        from env.frozen_endpoint import FrozenEndpoint
+    finally:
+        sys.path.pop(0)
+        sys.path.pop(0)
+    eab.use_car("v04")
+    head = _frozen_head_model("v04")
+    link6 = eab.JOINTS[-1]["child"]
+
+    class _FkAdapter:                      # FrozenEndpoint 的 numpy 分支只用这两样
+        fk = staticmethod(eab.fk)
+        JOINTS = eab.JOINTS
+
+    rng = np.random.default_rng(20260907)
+    q = rng.uniform(-1.0, 1.0, size=(16, 6))
+    v = rng.uniform(-6.0, 6.0, size=(16, 6))
+    tau = rng.uniform(-60.0, 60.0, size=(16, 6))
+    ref = FrozenEndpoint(_FkAdapter()).point(q, v, tau)
+    mine = []
+    for qi, vi, ti in zip(q, v, tau):
+        r = eab.fk(_head_effective_q(head, qi, vi, ti))
+        mine.append(np.asarray(r["tcp"], dtype=float)
+                    + np.asarray(r["link_transforms"][link6][:3, :3], dtype=float)
+                    @ np.asarray(head["tool_offset"], dtype=float)
+                    + np.asarray(head["base_offset"], dtype=float))
+    assert np.abs(np.asarray(mine) - ref).max() == 0.0
+
+
+def test_rk300_table_puts_reject_reasons_in_finalht_cell_when_no_accepted():
+    """备注列已撤：本抛没有 FinalHT 时，臂端拒收原因进 FinalHT 格的悬停。"""
     source = SRC.read_text(encoding="utf-8")
-    assert "const rejectNote=accepted?'—':rejectNoteForThrow(th);" in source
-    assert "<th>备注</th>" in source
+    table = source.split("const rk300TableHtml = () => {")[1].split("const armAcceptedTableHtml = () => {")[0]
     assert "^reject hit: (.+)$" in source
-    assert source.count('<td class="armTblNote"><div>\'+rejectNote+\'</div></td>') == 2
-    assert source.count(
-        '<td class="armTblNote"><div>\'+rejectNote+\'</div></td><td>\'+racketCorCell+\'</td></tr>'
-    ) == 2
-    assert '<th>备注</th>\'+\n    \'<th style="white-space:nowrap"' in source
-    assert "-webkit-line-clamp:2" in source
+    assert "rejectNoteForThrow(th).replace(/<br>/g,'；')" in table
+    assert "本抛无 FinalHT（无 accepted / 无 RL 目标，底盘也无可回配的末次 target）；臂端拒收原因：" in table
+    assert "<th>备注</th>" not in table
+    assert "armTblNote" not in table
 
 
 def test_rk_plot_uses_predict_hit_car_position_and_removes_old_traces():
@@ -1558,3 +1583,308 @@ def test_visual_racket_bracket_keeps_nearest_raw_before_and_after(tmp_path):
     assert result["both"]["after"]["t"] == pytest.approx(0.010)
     assert result["beforeOnly"]["before"]["t"] == pytest.approx(-0.006)
     assert result["beforeOnly"]["after"] is None
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_reviewed_visual_racket_rows_opt_in_keeps_all_phases_sorted(tmp_path):
+    core = _core("racket-bracket-core-begin", "racket-bracket-core-end")
+    harness = (
+        f"{core}\n"
+        "const rows=["
+        "{t:0.020,reportRow:16,manualReview:true,contactPhase:'post_contact'},"
+        "{t:-0.030,reportRow:16,manualReview:true,contactPhase:'pre_contact'},"
+        "{t:0.001,reportRow:16,manualReview:true,contactPhase:'contact_integrated'},"
+        "{t:0.000,reportRow:15,manualReview:true,contactPhase:'contact_integrated'},"
+        "{t:-0.010,reportRow:16,manualReview:false,contactPhase:'pre_contact'}];\n"
+        "console.log(JSON.stringify({reviewed:reviewedVisualRacketRows(rows,16),"
+        "single:reviewedVisualRacketRows(rows,15)}));\n"
+    )
+    result = _run_node(tmp_path, harness)
+
+    assert [row["t"] for row in result["reviewed"]] == pytest.approx([-0.030, 0.001, 0.020])
+    assert [row["contactPhase"] for row in result["reviewed"]] == [
+        "pre_contact",
+        "contact_integrated",
+        "post_contact",
+    ]
+    assert result["single"] == []
+
+    source = SRC.read_text(encoding="utf-8")
+    assert "contact_integrated:'触球窗'" in source
+    assert "expectedDistanceMm:r.expected_distance_mm" in source
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_visual_racket_rows_before_ht_keep_own_throw_and_full_window(tmp_path):
+    core = _core("racket-bracket-core-begin", "racket-bracket-core-end")
+    harness = (
+        f"{core}\n"
+        "const rows=["
+        "{t:-0.470,reportRow:7},"
+        "{t:-0.430,reportRow:7},"
+        "{t:-0.100,reportRow:7},"
+        "{t:-0.030,reportRow:8},"
+        "{t:-0.020,reportRow:null},"
+        "{t:0.010,reportRow:7}];\n"
+        "console.log(JSON.stringify({own:visualRacketRowsBeforeHt(rows,7,0),"
+        "legacy:visualRacketRowsBeforeHt(rows,null,0)}));\n"
+    )
+    result = _run_node(tmp_path, harness)
+
+    # 本抛：只留自己 report_row 的帧（旧 sidecar 无 report_row 的行放行），窗内升序。
+    assert [row["t"] for row in result["own"]] == pytest.approx([-0.430, -0.100, -0.020])
+    # 旧 sidecar 整体无 report_row 时退回纯时间窗。
+    assert [row["t"] for row in result["legacy"]] == pytest.approx(
+        [-0.430, -0.100, -0.030, -0.020]
+    )
+
+    source = SRC.read_text(encoding="utf-8")
+    # 35ms 内缺帧时，前/后条目回退到测量窗内最近帧（dt 如实显示），不做宽窗拟合。
+    assert "const RACKET_RAW_FAR_MAX_SEC=0.46;" in source
+    assert "visRawEntry(visPair.before||visPairFar.before,'前')" in source
+    assert "visRawEntry(visPair.after||visPairFar.after,'后')" in source
+    assert "visualRacketRowsBeforeHt(pcRacketRows,idx+1,visPcT)" in source
+
+
+def _s1_pred(t, ht, rel_x=1.0, rel_z=1.2, n_fit=8, stage=1, rel_y=0.2):
+    """构造一条 /predict_hit_pos（payload ct=t）。"""
+    payload = {
+        "x": rel_x, "y": 0.0, "z": rel_z, "stage": stage, "ct": t, "ht": ht, "duration": ht - t,
+        "n_bounce_fit": n_fit, "rel_x": rel_x, "rel_y": rel_y, "rel_z": rel_z, "car_pred_x": 0.0,
+        "car_pred_y": 0.0, "car_yaw": 0.0, "rel_src": "predictor", "hit_yaw_extra": 0.1,
+    }
+    return {"t": t, "topic": "/predict_hit_pos", "text": json.dumps(payload)}
+
+
+def _final_ht_harness(events: list, override: str, accepted_js: str = "null") -> str:
+    """FinalHT / Pre300HT 选取段（[[final-ht-core]]）的 node 夹具：事件流 + 模式覆盖 + lastAccepted 桩。"""
+    status_num = ("const statusNum=(text,key)=>{const m=new RegExp('(?:^|\\\\s)'+key+"
+                  "'=(-?[0-9]+(?:\\\\.[0-9]+)?)').exec(text||'');return m?Number(m[1]):null;};\n")
+    return (
+        "const isNum=v=>typeof v==='number'&&Number.isFinite(v);\n"
+        "const cmFmt=(v,d=1)=>isNum(v)?(Number(v)*100).toFixed(d):'—';\n"
+        "const RK={t0:0};\n"
+        # 无臂回退依赖（[[bot-run-end-core]] / [[last-target-pred-core]]）：本夹具只测臂侧取法，桩掉即可
+        "const ts=s=>s.t; const ys=(s,k)=>s.y[k]; const rkPredStage=[], rkPredNFit=[];\n"
+        "const botRunEndForThrow=()=>null; const lastTargetPredictionForThrow=()=>null;\n"
+        "const REF_LEAD_TARGET=0.3;\n"
+        "const ARM_PRED_ARRIVE_MAX_SEC=0.25;\n"
+        "const armAligned=true;\n"
+        f"const ARM_SWING_MODE_OVERRIDE='{override}';\n"
+        f"const ARM={{events:{json.dumps(events)}}};\n"
+        + status_num +
+        "const armPreds=ARM.events.filter(e=>e.topic==='/predict_hit_pos').map(e=>{const p=JSON.parse(e.text);"
+        "return {t:e.t,rel_x:p.rel_x,rel_y:p.rel_y,rel_z:p.rel_z,ht:p.ht,ct:p.ct,stage:p.stage,"
+        "nFit:p.n_bounce_fit,relSrc:p.rel_src};});\n"
+        "const armHitStatuses=ARM.events.filter(e=>e.topic==='/tennis/status'&&"
+        "/^(accepted hit |late ht saved|reject hit:|error hit_pos)/.test(e.text)).map((e,si)=>({si,t:e.t,text:e.text}));\n"
+        "const armPredAlign={delta:0};\n"
+        "const reportThrows=[{firstT:0,lastT:1e9,ht:0}];\n"
+        "const matchThrowByAcceptedCt=ct=>reportThrows[0];\n"
+        f"const lastAcceptedForThrow=th=>({accepted_js});\n"
+        + _core("final-ht-core-begin", "final-ht-core-end") + "\n"
+        "const fin=finalTargetForThrow(reportThrows[0]);\n"
+        "const pre=pre300ForThrow(reportThrows[0],fin);\n"
+        "console.log(JSON.stringify({mode:ARM_SWING_MODE.mode,"
+        "fin:fin&&{ct:fin.ct,ht:fin.ht,relX:fin.relX,relZ:fin.relZ,source:fin.source,issues:fin.issues,"
+        "nFrozen:fin.nFrozen,arrival:fin.arrival},pre:pre&&{ct:pre.ct,ht:pre.ht,devMs:pre.devMs}}));\n"
+    )
+
+
+def _rl_throw_events(ht=10.60, n=20, reply_delay=0.055, rl_done=None):
+    """RL 场次一抛：每 30ms 一条 S1 预测（ct=10.00+0.03k，ht 恒定），臂回复晚 reply_delay。
+    前 5 条回 accepted（首条=接管），其后 late ht saved；rl_done 给了就追加 rl_swing done 状态。"""
+    events = []
+    for k in range(n):
+        ct = round(10.00 + 0.03 * k, 3)
+        events.append(_s1_pred(ct, ht, rel_x=1.0 + 0.001 * k, rel_z=1.2 + 0.002 * k, n_fit=4 + k))
+        reply = round(ct + reply_delay, 3)
+        if k < 5:
+            text = (f"accepted hit x={1.0 + 0.001 * k:.4f} z={1.2 + 0.002 * k - 0.164:.4f} "
+                    f"duration={ht - reply:.4f} hit_time=0.2500")
+        else:
+            text = f"late ht saved: contact in {ht - reply:.3f}s sweep_w=3.5 mode=0"
+        events.append(_status_event(reply, text))
+    if rl_done is not None:
+        events.append(_status_event(ht + 0.05, rl_done))
+    events.sort(key=lambda e: e["t"])
+    return events
+
+
+_RL_ACCEPTED_STUB = ("{cmd:10.055,lastAcceptT:10.175,wct:10.12,wht:10.60,finalCt:10.12,finalHt:10.60,"
+                     "finalMismatch:false,reswing:null,lates:[],lastUpdateT:10.175,wx:1.004,wz:1.208}")
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_final_ht_rl_reconstruction_respects_30ms_freeze(tmp_path):
+    """旧 RL bag（无 rl_swing done）：到达代理=生产回复时刻，接管后 到达≥当前目标ht−30ms 的不接受。
+
+    ht=10.60：k=19（ct 10.57，回复 10.625）与 k=18（ct 10.54，回复 10.595）落在冻结窗，
+    k=17（ct 10.51，回复 10.565）是冻结前最后接受 → FinalHT；Pre300HT 取 ct 最接近 10.30 的 k=10。
+    """
+    out = _run_node(tmp_path, _final_ht_harness(_rl_throw_events(), "rl", _RL_ACCEPTED_STUB))
+    assert out["mode"] == "rl"
+    assert out["fin"]["source"] == "rl_recon"
+    assert out["fin"]["ct"] == pytest.approx(10.51)
+    assert out["fin"]["relX"] == pytest.approx(1.017)
+    assert out["fin"]["nFrozen"] == 2
+    assert out["fin"]["arrival"] == pytest.approx(10.565)
+    assert out["fin"]["issues"] == []
+    assert out["pre"]["ct"] == pytest.approx(10.30)
+    assert out["pre"]["devMs"] == pytest.approx(0.0, abs=1e-6)
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_final_ht_rl_status_is_matched_by_ct_and_auto_detected(tmp_path):
+    """新 bag：臂发 rl_swing done mode=active ct=…，auto 判定为 RL 且按 ct 精确回配（不靠到达代理）。"""
+    done = ("rl_swing done mode=active ct=10.480000 ht=10.600000 t_arr=10.535000 x_geo=1.0160 z=1.0680 "
+            "face_yaw=-0.1000 pitch=28.00 speed_req=4.50 stage=1 n_points=20 n_targets=17 n_frozen=3 "
+            "t_end=10.630000")
+    out = _run_node(tmp_path, _final_ht_harness(_rl_throw_events(rl_done=done), "auto", _RL_ACCEPTED_STUB))
+    assert out["mode"] == "rl"
+    assert out["fin"]["source"] == "rl_status"
+    assert out["fin"]["ct"] == pytest.approx(10.48)
+    assert out["fin"]["nFrozen"] == 3
+    assert out["fin"]["arrival"] == pytest.approx(10.535)
+    # 同一 bag 若强制按规则读：FinalHT 退回 lastAccepted 桩的 finalCt（10.12）
+    out2 = _run_node(tmp_path, _final_ht_harness(_rl_throw_events(rl_done=done), "rules", _RL_ACCEPTED_STUB))
+    assert out2["mode"] == "rules"
+    assert out2["fin"]["source"] == "accepted"
+    assert out2["fin"]["ct"] == pytest.approx(10.12)
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_final_ht_rules_uses_last_late_saved_message_and_flags_contamination(tmp_path):
+    """规则规划器：FinalHT = 最后一条 late ht saved 回配的消息（finalCt）；校验只标不换。"""
+    stub = ("{cmd:10.055,lastAcceptT:10.175,wct:10.12,wht:10.60,finalCt:10.45,finalHt:10.60,"
+            "finalMismatch:false,reswing:{ok:true},lates:[1,2,3],lastUpdateT:10.505,wx:1.004,wz:1.208}")
+    out = _run_node(tmp_path, _final_ht_harness(_rl_throw_events(), "auto", stub))
+    assert out["mode"] == "rules"
+    assert out["fin"]["source"] == "late_saved"
+    assert out["fin"]["ct"] == pytest.approx(10.45)
+    assert out["fin"]["issues"] == []
+    assert out["pre"]["ct"] == pytest.approx(10.30)
+    # 末端脏数据：finalCt 指向一条 rel_y<0 且 stage 回退到 0 的消息 → 三条告警，值照旧不换
+    events = _rl_throw_events()
+    events.append(_s1_pred(10.58, 10.60, rel_x=1.3, rel_z=1.2, n_fit=0, stage=0, rel_y=-0.1))
+    events.append(_status_event(10.635, "reject hit: stage 0"))
+    events.sort(key=lambda e: e["t"])
+    stub_dirty = stub.replace("finalCt:10.45", "finalCt:10.58")
+    dirty = _run_node(tmp_path, _final_ht_harness(events, "rules", stub_dirty))
+    assert dirty["fin"]["ct"] == pytest.approx(10.58)
+    joined = "；".join(dirty["fin"]["issues"])
+    assert "stage 回退" in joined and "rel_y<0" in joined and "跳变" in joined
+
+
+def _chassis_fallback_harness(arm_aligned: bool, override: str, events=None, accepted_js: str = "null",
+                              with_target_change: bool = True) -> str:
+    """无臂 FinalHT 回退（用户 2026-09-06 定）：真实 bot-run-end / last-target-pred / final-ht 三段 + RK bot/pred 桩。
+
+    RK.t0=100 检查回退锚换到了 RK 绝对轴；bot 桩与 test_last_target_change_matches_prediction_by_deadline_not_ct
+    同一组：RUN 内最后一次 target 变化 t=1.15、deadline=1.80，对应 pred idx=1（ct 1.10 / ht 1.80）。
+    """
+    events = events or []
+    status_num = ("const statusNum=(text,key)=>{const m=new RegExp('(?:^|\\s)'+key+"
+                  "'=(-?[0-9]+(?:\\.[0-9]+)?)').exec(text||'');return m?Number(m[1]):null;};\n")
+    target_x = "[1,1,1,4,4,4,null]" if with_target_change else "[null,null,null,null,null,null,null]"
+    arm_js = f"{{events:{json.dumps(events)}}}" if arm_aligned else "null"
+    return (
+        "const isNum=v=>typeof v==='number'&&Number.isFinite(v);\n"
+        "const cmFmt=(v,d=1)=>isNum(v)?(Number(v)*100).toFixed(d):'—';\n"
+        f"{BOT_POSE_JS_DEPS}"
+        "const ts=s=>s.t; const ys=(s,k)=>s.y[k];\n"
+        "const REF_LEAD_TARGET=0.3;\n"
+        "const ARM_PRED_ARRIVE_MAX_SEC=0.25;\n"
+        f"const armAligned={'true' if arm_aligned else 'false'};\n"
+        f"const ARM_SWING_MODE_OVERRIDE='{override}';\n"
+        f"const ARM={arm_js};\n"
+        + status_num +
+        "const armPreds=ARM?ARM.events.filter(e=>e.topic==='/predict_hit_pos').map(e=>{const p=JSON.parse(e.text);"
+        "return {t:e.t,rel_x:p.rel_x,rel_y:p.rel_y,rel_z:p.rel_z,ht:p.ht,ct:p.ct,stage:p.stage,"
+        "nFit:p.n_bounce_fit,relSrc:p.rel_src};}):[];\n"
+        "const armHitStatuses=ARM?ARM.events.filter(e=>e.topic==='/tennis/status'&&"
+        "/^(accepted hit |late ht saved|reject hit:|error hit_pos)/.test(e.text)).map((e,si)=>({si,t:e.t,text:e.text})):[];\n"
+        "const armPredAlign={delta:0};\n"
+        "const th={ht:1.25,firstT:1.00,lastT:1.14,firstIdx:0,lastIdx:2}; const reportThrows=[th];\n"
+        "const matchThrowByAcceptedCt=ct=>reportThrows[0];\n"
+        f"const lastAcceptedForThrow=th=>({accepted_js});\n"
+        "const rkPredStage=[1,1,1], rkPredNFit=[4,5,6];\n"
+        "const RK={t0:100,"
+        "bot:{t:[1.00,1.05,1.10,1.15,1.20,1.25,1.26],y:{"
+        "phase:['RUN','RUN','RUN','RUN','RUN','RUN','BRAKE_IN_SWING'],"
+        "x:[0,0,0,0,0,2.25,2.25],y:[0,0,0,0,0,3.35,3.35],"
+        f"target_x:{target_x},target_y:[2,3,3,3,3,3,null],"
+        "remaining:[1.00,.95,.90,.65,.69,.64,null]}},"
+        "pred:{t:[1.00,1.10,1.14],y:{"
+        "ht_rel:[2.00,1.80,1.89],x:[.50,.60,999],rel_x:[.70,.78,999],rel_y:[.9,.8,.7],rel_z:[1.10,1.20,999],"
+        "car_pred_x:[2.00,2.20,999],car_pred_y:[3.00,3.30,999]}}};\n"
+        + _core("bot-run-end-core-begin", "bot-run-end-core-end") + "\n"
+        + _core("last-target-pred-core-begin", "last-target-pred-core-end") + "\n"
+        + _core("final-ht-core-begin", "final-ht-core-end") + "\n"
+        "const fin=finalTargetForThrow(th);\n"
+        "const pre=pre300ForThrow(th,fin);\n"
+        "console.log(JSON.stringify({mode:ARM_SWING_MODE.mode,modeSource:ARM_SWING_MODE.source,"
+        "fin:fin&&{ct:fin.ct,ht:fin.ht,relX:fin.relX,relZ:fin.relZ,stage:fin.stage,nFit:fin.nFit,source:fin.source,"
+        "issues:fin.issues,fallback:fin.fallback,accepted:fin.accepted,note:fin.note},"
+        "pre:pre&&{ct:pre.ct,ht:pre.ht,relX:pre.relX,devMs:pre.devMs}}));\n"
+    )
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_final_ht_falls_back_to_chassis_last_target_when_arm_absent(tmp_path):
+    """臂栈没跑（bag 无 /joint_states，0905_173206）：FinalHT=底盘末次 target 对应预测 [车]，Pre300HT 同抛 RK 流。"""
+    out = _run_node(tmp_path, _chassis_fallback_harness(arm_aligned=False, override="auto"))
+    assert out["mode"] == "rules"
+    assert "无 /joint_states" in out["modeSource"]
+    fin = out["fin"]
+    assert fin["source"] == "chassis_target" and fin["fallback"] is True and fin["accepted"] is None
+    assert fin["ct"] == pytest.approx(101.10) and fin["ht"] == pytest.approx(101.80)   # RK 绝对轴
+    assert fin["relX"] == pytest.approx(0.78) and fin["relZ"] == pytest.approx(1.20)
+    assert fin["stage"] == 1 and fin["nFit"] == 5
+    assert fin["issues"] == []
+    assert "末次 target" in fin["note"]
+    # Pre300HT：早于 FinalHT 的 ct 里最接近 101.80−0.30=101.50 的只有 idx0（ct 101.00）
+    assert out["pre"]["ct"] == pytest.approx(101.00) and out["pre"]["relX"] == pytest.approx(0.70)
+    assert out["pre"]["devMs"] == pytest.approx(-500.0)
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_final_ht_chassis_fallback_only_when_arm_gives_none(tmp_path):
+    """臂在但本抛没受理（RL 无 done、无 accepted）→ 落到 [车]；臂受理了 → 仍是臂的 FinalHT，不被回退抢走。"""
+    preds = [_s1_pred(round(10.00 + 0.03 * k, 3), 10.60, rel_x=1.0, rel_z=1.2, n_fit=4 + k) for k in range(5)]
+    none = _run_node(tmp_path, _chassis_fallback_harness(arm_aligned=True, override="rl", events=preds))
+    assert none["mode"] == "rl"
+    assert none["fin"]["source"] == "chassis_target" and none["fin"]["fallback"] is True
+    assert none["fin"]["ct"] == pytest.approx(101.10)
+
+    real = _run_node(tmp_path, _chassis_fallback_harness(
+        arm_aligned=True, override="rules", events=_rl_throw_events(), accepted_js=_RL_ACCEPTED_STUB))
+    assert real["fin"]["source"] == "accepted" and real["fin"]["fallback"] is False
+    assert real["fin"]["ct"] == pytest.approx(10.12)
+
+    # 臂状态有但回配不上（rl_swing done 的 ct 不在预测流里）→ 回退到 [车]，并把臂侧告警带过去
+    done = ("rl_swing done mode=active ct=10.999000 ht=10.600000 t_arr=10.535000 x_geo=1.0 z=1.0 "
+            "face_yaw=0 pitch=28.00 speed_req=4.50 stage=1 n_points=20 n_targets=17 n_frozen=3 t_end=10.63")
+    dangling = _run_node(tmp_path, _chassis_fallback_harness(
+        arm_aligned=True, override="rl", events=_rl_throw_events(rl_done=done), accepted_js=_RL_ACCEPTED_STUB))
+    assert dangling["fin"]["source"] == "chassis_target"
+    assert any("rl_swing done" in s for s in dangling["fin"]["issues"])
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_final_ht_chassis_fallback_needs_a_target_change(tmp_path):
+    """车没下发过目标（RUN 内无 target 变化）→ 回退也没有锚，整行照旧为空，不拿别的时刻冒充。"""
+    out = _run_node(tmp_path, _chassis_fallback_harness(arm_aligned=False, override="auto", with_target_change=False))
+    assert out["fin"] is None and out["pre"] is None
+
+
+def test_chassis_fallback_is_labelled_in_table_and_summary():
+    source = SRC.read_text(encoding="utf-8")
+    table = source.split("const rk300TableHtml = () => {")[1].split("const armAcceptedTableHtml = () => {")[0]
+    assert "chassis_target:'车'" in table
+    assert "finalHtFallback:!!(fin&&fin.fallback)," in table
+    assert "回退为底盘末次 target 对应预测 [车]" in table
+    assert "臂无 FinalHT 时回退=底盘末次 target 对应预测 [车]" in table
+    # 回退不冒充臂目标：tcp−臂目标 / 目标拍速仍只认 RL/规则的源
+    assert "const aimIsFinal=!!(fin&&(fin.source==='rl_status'||fin.source==='rl_recon'));" in table
+    assert "if(!ARM) return {mode:'rules', source:'bag 无 /joint_states，臂栈未运行'};" in source
