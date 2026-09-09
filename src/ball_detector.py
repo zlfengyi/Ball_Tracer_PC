@@ -160,6 +160,8 @@ class BallDetector:
         self._onnx_input_hw: tuple[int, int] | None = None
         self._fixed_engine_batch = _infer_fixed_engine_batch(self._model_path)
         self._engine_imgsz = _infer_engine_imgsz(self._model_path)
+        self._pinned_input = None      # 复用的 pinned H2D 缓冲，见 _engine_batch_detections
+        self._engine_fast_path = None  # None=未判定 / True=可用 / False=已回退
 
         if self._model_path.suffix == ".onnx":
             self._init_onnx_runtime()
@@ -216,6 +218,74 @@ class BallDetector:
         if self._engine_imgsz is not None:
             kwargs["imgsz"] = self._engine_imgsz
         return self._model.predict(source, **kwargs)
+
+    def _engine_batch_detections(
+        self, images: list[np.ndarray], conf: float
+    ) -> Optional[list[list[BallDetection]]]:
+        """Direct engine path, bypassing ultralytics' generic pre/post-processing.
+
+        This engine carries its own end2end NMS head: the raw output is
+        (B, 300, 6) = [x1, y1, x2, y2, conf, cls] already in input-pixel space,
+        so ultralytics' postprocess only rebuilds Results objects around numbers
+        the engine already produced. Skipping it — plus filling a pinned buffer
+        and doing BGR->RGB / HWC->CHW on the GPU instead of a strided CPU copy —
+        is what buys the per-frame budget at 60 Hz (0906 measured yolo_avg 12.8 ms
+        at 60 Hz and 14.8 ms at 70 Hz, against a 16.7 / 14.3 ms whole-frame budget).
+
+        Returns None whenever the setup is not the shape this path assumes, so
+        the caller falls back to the ultralytics path.
+        """
+        predictor = getattr(self._model, "predictor", None)
+        size = self._engine_imgsz
+        if predictor is None or size is None:
+            return None
+        if not all(
+            image.ndim == 3 and image.shape == (size, size, 3) for image in images
+        ):
+            return None
+
+        import torch
+
+        buffer = self._pinned_input
+        if buffer is None or buffer.shape[0] != len(images):
+            buffer = torch.empty(
+                (len(images), size, size, 3), dtype=torch.uint8, pin_memory=True
+            )
+            self._pinned_input = buffer
+        staging = buffer.numpy()
+        for index, image in enumerate(images):
+            staging[index] = image
+
+        device_batch = buffer.to(predictor.device, non_blocking=True)
+        # BGR HWC uint8 -> RGB CHW float, all on the GPU
+        tensor = device_batch.permute(0, 3, 1, 2).flip(1).contiguous()
+        tensor = tensor.half() if predictor.model.fp16 else tensor.float()
+        tensor = tensor.div_(255.0)
+
+        raw = predictor.inference(tensor)
+        if isinstance(raw, (list, tuple)):
+            if not raw:
+                return None
+            raw = raw[0]
+        if raw.ndim != 3 or raw.shape[0] != len(images) or raw.shape[2] != 6:
+            return None      # not the end2end head — let ultralytics handle it
+
+        keep = raw[:, :, 4] >= conf
+        results: list[list[BallDetection]] = [[] for _ in images]
+        if bool(keep.any()):
+            rows = raw[keep].cpu().numpy()          # only survivors cross PCIe
+            owners = keep.nonzero(as_tuple=False)[:, 0].cpu().numpy()
+            for owner, row in zip(owners, rows):
+                x1, y1, x2, y2, confidence = (float(v) for v in row[:5])
+                results[int(owner)].append(BallDetection(
+                    x=(x1 + x2) / 2.0,
+                    y=(y1 + y2) / 2.0,
+                    confidence=confidence,
+                    x1=x1, y1=y1, x2=x2, y2=y2,
+                ))
+        for detections in results:
+            detections.sort(key=lambda det: det.confidence, reverse=True)
+        return results
 
     def _predict_fixed_batch(self, images: list[np.ndarray], conf: float) -> list:
         if not images:
@@ -473,10 +543,23 @@ class BallDetector:
         if self._onnx_session is not None:
             return [self.detect(image, conf=conf) for image in images]
 
-        results = self._predict_fixed_batch(
-            images,
-            conf if conf is not None else self._conf,
-        )
+        threshold = conf if conf is not None else self._conf
+        # engine 自带 end2end NMS 时走直连快路径；第一次调用 predictor 还没建，
+        # 会返回 None 落回下面的 ultralytics 路径（那一次顺便把 predictor 建出来）。
+        if self._engine_fast_path is not False:
+            fast = self._engine_batch_detections(images, threshold)
+            if fast is not None:
+                self._engine_fast_path = True
+                return [
+                    self.postprocess_detections(
+                        detections,
+                        duplicate_iou_threshold=self._duplicate_iou_threshold,
+                        max_box_aspect_ratio=self._max_box_aspect_ratio,
+                    )
+                    for detections in fast
+                ]
+
+        results = self._predict_fixed_batch(images, threshold)
         return [
             self.postprocess_detections(
                 self._parse_boxes(result),

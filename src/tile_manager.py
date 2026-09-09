@@ -83,14 +83,23 @@ class TileManager:
         track_timeout: float = 0.3,
         search_hold_frames: int = 4,
     ):
-        self._tile_size = tile_size
+        # 切片必须是正方形：它会被缩成 resize_to×resize_to 送 YOLO，非方形切片等于给球
+        # 做各向异性缩放，球压成椭圆后直接撞 detection_postprocess 的形状门
+        # （max_box_aspect_ratio 1.6）。压 ROI 冲帧率时最容易踩这个：0906 把 roi_height
+        # 降到 928、tile_size 还留着 1280，切片就成了 1280×928（1.38 倍畸变），而且全程
+        # 无任何报错。这里按最短边夹一次，配置写大了也不会静默出畸变切片。
+        smallest_side = min(
+            (min(w, h) for w, h in camera_sizes.values()),
+            default=int(tile_size),
+        )
+        self._tile_size = max(1, min(int(tile_size), int(smallest_side)))
         self._resize_to = max(int(resize_to), 1)
         self._track_timeout = track_timeout
         self._search_hold_frames = search_hold_frames
         self._states: dict[str, _CameraState] = {}
 
         for sn, (w, h) in camera_sizes.items():
-            tiles = self._compute_search_tiles(w, h, tile_size)
+            tiles = self._compute_search_tiles(w, h, self._tile_size)
             self._states[sn] = _CameraState(search_tiles=tiles)
 
     @staticmethod
