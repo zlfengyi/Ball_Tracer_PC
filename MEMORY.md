@@ -39,6 +39,34 @@
 
 ## 近期变更
 
+- `2026-09-07`
+  - **报告端「拍心/拍速」换口径（用户定案：冻结柔度模型 + 直接替换旧列）**。原来拍心 = 刚性 `FK(q)` 的 TCP、
+    拍速 = 解析 Jacobian `J(q)·q̇`；0907 黑标三场证明臂是弹性链（受载拍心落后 FK 157mm、卸载回收 66mm、
+    卸载段视觉比 FK 快 +2.5m/s），所以现在：
+    `p_head = FK(q_eff) + R_link6(q_eff)·tool_offset + [dx,dy,0]`，`q1_eff = q1 − c1±·τ1 + 0.00503·q̇1`、`q3/4/5_eff = q − c_j·τ_j`；
+    拍速 = `p_head` 的 **±10ms 中心差分**（与 `tennis-man/rl_arm/env/swing_env.py` 评分同式），yaw 刚体项杠杆也改用 `p_head`。
+    模型单源 = `tennis-man/rl_arm/assets/v04/visual_endpoint_20260907.json`（sha256 `973fbcd7…`，路径由 `TENNIS_MAN_ROOT` 解析，
+    缺文件直接 SystemExit）；`arm.head_model` 在页面自报口径/指纹/窗口。**v0.3 无柔度标定，仍走刚性 TCP + Jacobian。**
+    实现 `generate_curve3_html.py` 的 `_frozen_head_model` / `_head_effective_q` / `_add_face_angles` + JS `headModelNote`；
+    单测 `test_report_prediction_contract.py::test_add_face_angles_v04_head_is_frozen_compliance_central_difference`
+    与 `::test_v04_head_point_matches_rl_arm_frozen_endpoint`（与 rl_arm 官方实现逐值 0 差）。
+    `tracker_20260907_185746` 已重生成：8 挥拍速降 15~35%、e_n 中位 0.404→0.611，**0907 之前的报告 e_n 不可与本列直接比**。
+    ⚠ 差分半窗 5→20ms 会差 0.4~1.4m/s（主项是 `c·τ` 的导数，即弹性释放本身，不是数值噪声）——跨场比必须同窗；
+    `fit_return_law.py` 仍是旧口径且 `RETURN_RESTITUTION=0.30` 就是在旧口径下标的，换口径要连那条律一起重标（未动）。
+  - 诊断经验：一场里「后半段 RK 数据整段消失」先别怀疑视觉。`tracker_20260907_185746` 是 PC↔RK 的 WiFi 单向断
+    （PC→RK 先死、RK→PC 晚 9.6s = Cyclone 参与者租约超时），RK 本机健康又跑了 90s——**RK 上 `run_arm_cpp_ready.sh`
+    自己录了一份 `~/tennis-man/arm_controller/data/session_<N>/`，和 PC 侧 bag 一对照就分得清「RK 挂了」还是「链路断了」**。
+  - `ros2/cyclonedds_18.xml` 的 `Peers` 只有两台 RK、没有 `127.0.0.1`，多播又是关的 ⇒ **PC 本机两个参与者互相发现不了，
+    自家 bag 从来没录到过 `/pc_car_loc`/`/pc_world_ball_loc`/`/pc_rk_time_offset`**（RK 侧 bag 里有，收发本身没问题）。补 peer 即可。
+
+- `2026-09-06`
+  - 报告北极星表加「无臂回退锚」：臂没受理本抛或臂栈没跑（bag 无 `/joint_states`）时，FinalHT 回退为底盘末次 target 对应的那条
+    `/predict_hit_pos`（RUN 内最后一次 target_x/y 变化按 bot.t+remaining↔ht 回配），源 `chassis_target`、格内标 `[车]`；
+    只锚车移动 / PC 真值 / 车 yaw 列，TCP/拍面/目标拍速仍为空、不冒充臂目标。无臂时模式栏显示「无臂数据」。
+    实现在 `generate_curve3_html.py` `[[final-ht-core]]`（`rkPredsForThrow`/`chassisTargetForThrow`），
+    单测 `test_report_prediction_contract.py::test_final_ht_*chassis*`；`tracker_20260905_173206` 已重生成（7/7 [车]）。
+  - 诊断经验：北极星表整表 `—` 先查 `<run>_rosbag/metadata.yaml` 有没有臂话题；173206 场臂话题一个都没有=臂栈没起，
+    与 RL 版本无关（对表时板子 CST = PC run id + 15h）。
 - `2026-03-23`
   - 删除旧的 `CLAUDE.md`，项目上下文以 `DEV.md` 和本文件为准。
   - `BallLocalizer` / `CarLocalizer` 默认标定切到 `four_camera_calib.json`。

@@ -72,3 +72,4 @@ tmp_report_server_*.txt
 tmp/
 arm_controller_data/
 manual_triangulation/*
+.pytest_tmp_*/
