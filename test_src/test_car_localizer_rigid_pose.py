@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -732,3 +733,108 @@ def test_detect_probes_raw_again_so_recovered_light_stops_using_enhanced(tmp_pat
     assert [d.tag_id for d in localizer.detect(bright)] == [0]
     assert localizer._prefer_enhanced is False, "光线恢复后应停用增强图"
     assert len(seen) == 1, "回探命中就不该再跑增强图"
+
+
+@pytest.fixture
+def car_detection_clock(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(
+        "src.car_localizer.time", SimpleNamespace(perf_counter=lambda: now[0]))
+    return now
+
+
+@pytest.mark.parametrize("tracked", [False, True])
+def test_lost_camera_full_scan_is_limited_by_time(
+    tmp_path, car_detection_clock, tracked,
+):
+    localizer = _localizer(tmp_path)
+    results = [(_STUB_CORNERS, np.array([[0]]))] if tracked else []
+    seen = _stub_detect_markers(localizer, results + [(None, None)])
+    image = np.full((1200, 1600), 120, np.uint8)
+    localizer.detect(image, "cam0")
+    initial_full_calls = sum(x.shape == image.shape for x in seen)
+
+    # 任意多次短暂漏检都不能提前触发全图检测；首次全图失败也必须限频。
+    for t in np.linspace(100.01, 100.99, 80):
+        car_detection_clock[0] = float(t)
+        assert localizer.detect(image, "cam0") == []
+    assert sum(x.shape == image.shape for x in seen) == initial_full_calls
+
+    for t, scans in [(101.0, 1), (101.5, 1), (102.0, 2)]:
+        car_detection_clock[0] = t
+        assert localizer.detect(image, "cam0") == []
+        assert sum(x.shape == image.shape for x in seen) == initial_full_calls + 2 * scans
+        if tracked and t == 101.5:
+            assert seen[-1].shape != image.shape, "全图失败后仍应继续识别旧窗口"
+
+    # 一个相机的重找冷却不能抑制另一台相机的首次检测。
+    before = len(seen)
+    localizer.detect(image, "cam1")
+    assert len(seen) == before + 2
+
+
+def test_one_visible_tag_stays_in_roi_without_periodic_full_scan(
+    tmp_path, car_detection_clock,
+):
+    localizer = _localizer(tmp_path)
+    full_corners = np.array([[[700., 400.], [780., 400.], [780., 480.], [700., 480.]]])
+    roi_corners = full_corners - [400., 100.]
+    seen = _stub_detect_markers(localizer, [
+        ([full_corners], np.array([[0]])), ([roi_corners], np.array([[0]])),
+    ])
+    image = np.full((1200, 1600), 120, np.uint8)
+    for i in range(80):
+        car_detection_clock[0] = 100.0 + i * 0.1
+        dets = localizer.detect(image, "cam0")
+        assert len(dets) == 1
+        np.testing.assert_allclose(dets[0].corners, full_corners.reshape(4, 2))
+    assert sum(x.shape == image.shape for x in seen) == 1
+
+
+def test_full_scan_reacquires_tag_after_it_leaves_tracking_window(
+    tmp_path, car_detection_clock, monkeypatch,
+):
+    localizer = _localizer(tmp_path)
+    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
+    marker = cv2.aruco.generateImageMarker(dictionary, 0, 80)
+    first = np.full((1200, 1600), 255, np.uint8)
+    first[400:480, 700:780] = marker
+    moved = np.full_like(first, 255)
+    moved[800:880, 1200:1280] = marker
+    full_scans = []
+    detect_full = localizer._detect_full
+
+    def record_full(gray):
+        full_scans.append(car_detection_clock[0])
+        return detect_full(gray)
+
+    monkeypatch.setattr(localizer, "_detect_full", record_full)
+    assert [d.tag_id for d in localizer.detect(first, "cam0")] == [0]
+    car_detection_clock[0] = 100.9
+    assert localizer.detect(moved, "cam0") == []
+    assert full_scans == [100.0]
+    car_detection_clock[0] = 101.0
+    dets = localizer.detect(moved, "cam0")
+    assert [d.tag_id for d in dets] == [0]
+    assert dets[0].cx == pytest.approx(1239.5, abs=1.0)
+    assert dets[0].cy == pytest.approx(839.5, abs=1.0)
+    car_detection_clock[0] = 101.1
+    assert [d.tag_id for d in localizer.detect(moved, "cam0")] == [0]
+    assert full_scans == [100.0, 101.0]
+
+
+def test_unconfigured_tag_does_not_prevent_lost_car_search(
+    tmp_path, car_detection_clock,
+):
+    localizer = _localizer(tmp_path)
+    seen = _stub_detect_markers(localizer, [
+        (_STUB_CORNERS, np.array([[0]])),
+        (_STUB_CORNERS, np.array([[42]])),
+    ])
+    image = np.full((1200, 1600), 120, np.uint8)
+    localizer.detect(image, "cam0")
+    car_detection_clock[0] = 100.5
+    assert localizer.detect(image, "cam0") == []
+    car_detection_clock[0] = 101.0
+    localizer.detect(image, "cam0")
+    assert sum(x.shape == image.shape for x in seen) == 2
