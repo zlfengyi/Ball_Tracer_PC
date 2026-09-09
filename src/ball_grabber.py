@@ -40,6 +40,7 @@
 from __future__ import annotations
 
 import ctypes
+import math
 import os
 import threading
 import time
@@ -357,6 +358,8 @@ def open_camera(
     gev_scpd: int = -1,
     reverse_x: Optional[bool] = None,
     reverse_y: Optional[bool] = None,
+    # 广播触发的频率（不是 AcquisitionFrameRate）。给了就在开场校验传感器给得起。
+    trigger_fps: float = 0.0,
     _st_dev_list=None,
 ) -> Any:
     """
@@ -606,6 +609,30 @@ def open_camera(
             except Exception:
                 pass
 
+        # ROI 定下来之后读回传感器真正能给的帧率上限。压 ROI 冲帧率时这是唯一真值：
+        # 触发再准，ResultingFrameRate 低于触发频率就一定按比例丢帧。
+        if frame_rate > 0:
+            resulting = MVCC_FLOATVALUE()
+            if int(cam.MV_CC_GetFloatValue("ResultingFrameRate", resulting)) == 0:
+                ceiling = float(resulting.fCurValue)
+                note = "" if ceiling >= frame_rate - 0.5 else "  ← 低于 AcquisitionFrameRate"
+                print(
+                    f"[camera {serial}] ROI 高 {roi_height or 'full'} 行，"
+                    f"AcquisitionFrameRate={frame_rate:g} → "
+                    f"ResultingFrameRate={ceiling:.2f} fps{note}"
+                )
+                # 触发频率高于传感器上限是**负收益**，不是「拿到上限那么多」：0906 实测
+                # ROI1304（上限 44.0）下按 60Hz 触发，相机只吐 30.6fps/台，比按 40Hz 触发
+                # 拿到的 39.9 还差。落在读出窗口里的触发被整个吞掉，且不进任何计数器。
+                # 这种「配得越高跑得越慢」的坑必须在开场就拦，不能等跑完看帧率。
+                if trigger_fps > 0 and ceiling > 0 and trigger_fps > ceiling + 0.5:
+                    raise RuntimeError(
+                        f"相机 {serial} 在 ROI 高 {roi_height or 'full'} 行下最高只能给 "
+                        f"{ceiling:.2f} fps，而触发频率配的是 {trigger_fps:g} fps。"
+                        f"超上限触发只会更慢：把 camera 配置的 fps 降到 ≤{ceiling:.1f}，"
+                        f"或把 roi_height 压到 ≤{int(117.5e6 / (trigger_fps * 2048))} 行。"
+                    )
+
         # 相机侧 180° 反转必须在 StartGrabbing 之前设置。
         _check(cam.MV_CC_SetBoolValue("ReverseX", bool(reverse_x)), f"ReverseX={reverse_x}")
         _check(cam.MV_CC_SetBoolValue("ReverseY", bool(reverse_y)), f"ReverseY={reverse_y}")
@@ -667,6 +694,14 @@ class ImageGrabber(threading.Thread):
         self._tick_frequency_hz = int(tick_frequency_hz) if int(tick_frequency_hz) > 0 else read_tick_frequency(cam, serial)
         self._time_offset: float = 0.0       # PC perf_counter - dev_time（秒）
         self._calib_thread: Optional[threading.Thread] = None
+        # 丢帧归因计数：没有这几个数就分不清帧丢在网线上、SDK 里还是 Python 里。
+        # frames_missing 用相机自己的 nFrameNum 缺口算（相机侧/传输侧丢），
+        # frames_overwritten 是主机侧来不及消费被覆盖掉的（见 _drain_keep_latest）。
+        self.frames_received = 0
+        self.frames_missing = 0
+        self.lost_packets = 0
+        self.frames_overwritten = 0
+        self._last_frame_num: Optional[int] = None
 
     def run(self) -> None:
         # 初始校准（取帧前同步执行）
@@ -711,6 +746,15 @@ class ImageGrabber(threading.Thread):
                     exposure_start_pc=exposure_start_pc,
                 )
                 with self._lock:
+                    self.frames_received += 1
+                    self.lost_packets += frame.lost_packet
+                    if self._last_frame_num is not None:
+                        gap = frame.frame_num - self._last_frame_num - 1
+                        if 0 < gap < 1000:      # 1000+ = 相机重启/计数回绕，不算丢
+                            self.frames_missing += gap
+                    self._last_frame_num = frame.frame_num
+                    if len(self._queue) == self._queue.maxlen:
+                        self.frames_overwritten += 1
                     self._queue.append(frame)
             finally:
                 try:
@@ -756,19 +800,70 @@ class ImageGrabber(threading.Thread):
         self._stop_event.set()
 
     def _drain_keep_latest(self) -> Optional[Frame]:
-        """清空队列，仅返回最新帧。"""
+        """清空队列，仅返回最新帧（被丢掉的那些计入 frames_overwritten）。"""
         with self._lock:
             if not self._queue:
                 return None
+            self.frames_overwritten += len(self._queue) - 1
             latest = self._queue[-1]
             self._queue.clear()
             return latest
+
+    def stats(self) -> dict:
+        with self._lock:
+            return {
+                "received": self.frames_received,
+                "missing": self.frames_missing,
+                "lost_packets": self.lost_packets,
+                "overwritten": self.frames_overwritten,
+            }
 
 
 # ───────────────── 同步采集 ─────────────────
 
 
+#: Sleep stops this far short of the deadline and the rest is spun out. Windows
+#: wakes a sleeper late by a millisecond or more even with the 1 ms timer, and a
+#: late trigger costs a whole frame (see ActionTriggerLoop).
+_TRIGGER_SPIN_GUARD_S = 0.0015
+
+
+class _HighResolutionTimers:
+    """Ask Windows for a 1 ms scheduler tick for as long as triggering runs."""
+
+    def __init__(self) -> None:
+        self._winmm = getattr(getattr(ctypes, "windll", None), "winmm", None)
+
+    def __enter__(self) -> "_HighResolutionTimers":
+        if self._winmm is not None:
+            try:
+                self._winmm.timeBeginPeriod(1)
+            except Exception:
+                self._winmm = None
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self._winmm is not None:
+            try:
+                self._winmm.timeEndPeriod(1)
+            except Exception:
+                pass
+
+
 class ActionTriggerLoop(threading.Thread):
+    """Broadcast GigE action commands on a fixed grid t0 + n*period.
+
+    The cadence is a grid, never a running offset. The previous version advanced
+    with ``next_t = now + period`` whenever a wake-up was late by more than
+    ``period - minimum_period``, which permanently pushed the schedule out: at
+    fps=40 / acquisition=48 that tolerance is only 3.9 ms, so ordinary Windows
+    sleep jitter turned a 25.0 ms request into a 30.9 ms mean (0905 213942:
+    inter-exposure gaps spread 21-31 ms with 2187 double gaps, 32.3 Hz delivered
+    out of ~39.6 Hz issued). Fixing slots keeps every gap an exact multiple of
+    the period, so no trigger can arrive faster than the sensor accepts and a
+    late wake-up costs one slot instead of shifting all later ones.
+    """
+
     def __init__(
         self,
         *,
@@ -787,43 +882,79 @@ class ActionTriggerLoop(threading.Thread):
         self._minimum_period = (
             1.0 / max(float(acquisition_frame_rate), 0.001) + 0.00025
         )
+        if self._period < self._minimum_period:
+            raise ValueError(
+                f"trigger period {self._period * 1000:.2f} ms (fps={fps:g}) is shorter "
+                f"than the camera's minimum {self._minimum_period * 1000:.2f} ms "
+                f"(acquisition_frame_rate={acquisition_frame_rate:g}); the sensor would "
+                "silently reject triggers. Raise acquisition_frame_rate to at least "
+                f"{1.3 * float(fps):.0f} in the camera config."
+            )
         self._device_key = int(device_key)
         self._group_key = int(group_key)
         self._group_mask = int(group_mask)
         self._broadcast_address = str(broadcast_address)
         self._timeout_ms = int(timeout_ms)
+        # Diagnostics: without these a lost frame is indistinguishable from a
+        # trigger that was never issued.
+        self.issued = 0
+        self.skipped_slots = 0
+        self.max_late_s = 0.0
 
-    def _next_trigger_time(self, previous_deadline: float, now: float) -> float:
-        scheduled_t = previous_deadline + self._period
-        if scheduled_t >= now + self._minimum_period:
-            return scheduled_t
-        return now + self._period
+    def _next_slot(self, fired_slot: int, elapsed: float) -> int:
+        """Grid slot for the next trigger, given how far we are past t0 now.
+
+        Always the next slot, unless we are already so late that it would land
+        closer than the sensor's minimum period — then skip whole slots.
+        """
+        slot = fired_slot + 1
+        earliest = elapsed + self._minimum_period
+        if slot * self._period < earliest:
+            slot = int(math.ceil(earliest / self._period))
+        return slot
+
+    def _issue(self) -> None:
+        info = MV_ACTION_CMD_INFO()
+        results = MV_ACTION_CMD_RESULT_LIST()
+        info.nDeviceKey = self._device_key
+        info.nGroupKey = self._group_key
+        info.nGroupMask = self._group_mask
+        info.bActionTimeEnable = 0
+        info.nActionTime = 0
+        info.pBroadcastAddress = self._broadcast_address.encode("ascii")
+        info.nTimeOut = self._timeout_ms
+        info.bSpecialNetEnable = 0
+        info.nSpecialNetIP = 0
+        MvCamera.MV_GIGE_IssueActionCommand(info, results)
 
     def run(self) -> None:
-        next_t = time.perf_counter()
-        while not self._stop_event.is_set():
-            now = time.perf_counter()
-            if now < next_t:
-                time.sleep(min(0.002, next_t - now))
-                continue
+        with _HighResolutionTimers():
+            t0 = time.perf_counter()
+            slot = 1
+            while not self._stop_event.is_set():
+                deadline = t0 + slot * self._period
+                while True:
+                    remaining = deadline - time.perf_counter()
+                    if remaining <= 0.0:
+                        break
+                    if self._stop_event.is_set():
+                        return
+                    if remaining > _TRIGGER_SPIN_GUARD_S:
+                        time.sleep(min(remaining - _TRIGGER_SPIN_GUARD_S, 0.002))
+                self._issue()
+                self.issued += 1
+                elapsed = time.perf_counter() - t0
+                self.max_late_s = max(self.max_late_s, elapsed - slot * self._period)
+                next_slot = self._next_slot(slot, elapsed)
+                self.skipped_slots += next_slot - slot - 1
+                slot = next_slot
 
-            info = MV_ACTION_CMD_INFO()
-            results = MV_ACTION_CMD_RESULT_LIST()
-            info.nDeviceKey = self._device_key
-            info.nGroupKey = self._group_key
-            info.nGroupMask = self._group_mask
-            info.bActionTimeEnable = 0
-            info.nActionTime = 0
-            info.pBroadcastAddress = self._broadcast_address.encode("ascii")
-            info.nTimeOut = self._timeout_ms
-            info.bSpecialNetEnable = 0
-            info.nSpecialNetIP = 0
-            MvCamera.MV_GIGE_IssueActionCommand(info, results)
-
-            # Preserve the requested cadence after ordinary wake-up jitter, but
-            # abandon catch-up when the next interval would exceed the camera's
-            # acquisition-rate limit and create a rejected trigger.
-            next_t = self._next_trigger_time(next_t, now)
+    def stats(self) -> dict:
+        return {
+            "issued": self.issued,
+            "skipped_slots": self.skipped_slots,
+            "max_late_ms": round(self.max_late_s * 1000.0, 3),
+        }
 
 
 class SyncCapture:
@@ -891,6 +1022,10 @@ class SyncCapture:
         self._grabbers: dict[str, ImageGrabber] = {}
         self._action_trigger: Optional[ActionTriggerLoop] = None
         self._stop = threading.Event()
+        self._exposure_spread_discards = 0
+        self._arrival_spread_discards = 0
+        self._assembly_timeouts = 0
+        self._final_stats: Optional[dict] = None
 
         MvCamera.MV_CC_Initialize()
 
@@ -941,6 +1076,7 @@ class SyncCapture:
                         action_group_key=action_group_key,
                         action_group_mask=action_group_mask,
                         frame_rate=acquisition_frame_rate,
+                        trigger_fps=self._fps,
                         full_frame=True,
                         exposure_us=exposure_us,
                         gain_db=gain_db,
@@ -1007,18 +1143,45 @@ class SyncCapture:
                     exp_starts = [f.exposure_start_pc for f in latest.values()]
                     exp_spread = max(exp_starts) - min(exp_starts)
                     if exp_spread > 0.010:  # >10ms 说明不是同一触发周期
+                        self._exposure_spread_discards += 1
                         oldest_sn = min(latest, key=lambda sn: latest[sn].exposure_start_pc)
                         del latest[oldest_sn]
                         time.sleep(0.001)
                         continue
                     return latest
                 # 帧不同步，丢弃最老的重新收集
+                self._arrival_spread_discards += 1
                 oldest_sn = min(latest, key=lambda sn: latest[sn].arrival_perf)
                 del latest[oldest_sn]
 
             time.sleep(0.001)
 
+        self._assembly_timeouts += 1
         return None
+
+    def stats(self) -> dict:
+        """整条取帧链的丢帧归因，供 run_tracker 写进 summary。
+
+        `missing` 是相机自己的 nFrameNum 缺口（触发被拒 / 传输丢帧），
+        `overwritten` 是主机来不及消费被覆盖的，两者相加才是「触发发了但没进主循环」
+        的总数——0905 靠 exposure 间隔反推出的那 18% 以后可以直接读出来。
+        """
+        if self._final_stats is not None:
+            return self._final_stats
+        per_cam = {sn: g.stats() for sn, g in self._grabbers.items()}
+        out = {
+            "per_camera": per_cam,
+            "received": sum(v["received"] for v in per_cam.values()),
+            "missing": sum(v["missing"] for v in per_cam.values()),
+            "lost_packets": sum(v["lost_packets"] for v in per_cam.values()),
+            "overwritten": sum(v["overwritten"] for v in per_cam.values()),
+            "exposure_spread_discards": self._exposure_spread_discards,
+            "arrival_spread_discards": self._arrival_spread_discards,
+            "assembly_timeouts": self._assembly_timeouts,
+        }
+        if self._action_trigger is not None:
+            out["trigger"] = self._action_trigger.stats()
+        return out
 
     @classmethod
     def from_config(cls, config_path: str = "", **overrides):
@@ -1080,6 +1243,9 @@ class SyncCapture:
 
     def close(self) -> None:
         """停止所有 grabber 并关闭所有相机。"""
+        # 先把丢帧计数快照下来：run_tracker 的最终统计跑在 with 块之外，
+        # close() 之后 _grabbers/_action_trigger 都没了，不快照就只剩 0。
+        self._final_stats = self.stats()
         self._stop.set()
         if self._action_trigger is not None:
             self._action_trigger.join(timeout=1.0)

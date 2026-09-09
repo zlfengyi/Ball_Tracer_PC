@@ -238,6 +238,7 @@ class FullFrameJob:
     exposure_pc: float
     elapsed_s: float | None
     car_loc_sampled: bool
+    video_sampled: bool = True
 
 
 @dataclass
@@ -1014,7 +1015,8 @@ def _generate_post_run_artifacts(
 
     # ── V04 四相机固定黑标拍心（供报告「视觉拍心−车心」列）──
     # final HT 直接取报告页面已执行的 arm contract，避免 Python 另写一套 accepted/late-sweep
-    # 匹配逻辑。第一次报告导出 contract，测量只扫 HT±4 帧，第二次报告合入视觉侧车。
+    # 匹配逻辑。第一次报告导出 contract，测量扫 HT−450ms~+120ms（覆盖 ht 前整个引拍/挥拍
+    # 段，带 3 相机与邻帧轨迹锚补捞），第二次报告合入视觉侧车。
     racket_json_path: Path | None = None
     racket_candidate = json_path.with_name(f"{json_path.stem}_racket.json")
     if measure_racket:
@@ -1248,7 +1250,19 @@ def _candidate_video_backends(
     backend: str,
     *,
     prefer_mp4: bool,
+    prefer_hw_accel: bool = False,
 ) -> list[tuple[str, int | None]]:
+    """Backends to try, in order.
+
+    `prefer_hw_accel` does NOT reorder anything, deliberately. Only the FFMPEG
+    branch can carry VIDEOWRITER_PROP_HW_ACCELERATION, so putting FFMPEG first
+    when the config asks for hardware encoding looks right — and measured worse
+    on this box (0906, 2048x952 @ 60 Hz): this OpenCV's FFMPEG cannot open avc1,
+    falls back to mp4v, and costs **45.5 ms/frame** against MSMF avc1's 10.8 ms,
+    which collapsed the whole tracker from 55 fps to 15 fps. MSMF stays first;
+    ask for FFMPEG explicitly (`video_output.backend: "ffmpeg"`) only on a build
+    whose FFMPEG really has an H.264 encoder.
+    """
     normalized = str(backend or "auto").strip().lower()
     cap_ffmpeg = getattr(cv2, "CAP_FFMPEG", None)
     cap_msmf = getattr(cv2, "CAP_MSMF", None)
@@ -1533,6 +1547,7 @@ class VideoWriterThread:
         for backend_name, api_preference in _candidate_video_backends(
             self._backend,
             prefer_mp4=prefer_mp4,
+            prefer_hw_accel=self._prefer_hw_accel,
         ):
             for codec_name in _candidate_video_codecs(self._codec):
                 fourcc = cv2.VideoWriter_fourcc(*codec_name)
@@ -2143,6 +2158,14 @@ def main() -> int:
         video_output_cfg.get("backend", "auto")
     ).strip().lower()
     video_output_hw_accel = bool(video_output_cfg.get("hw_accel", True))
+    # 只把每 N 帧写进拼接视频。0906 实测：60Hz 下 CPU 编 4096x476 要 25~79ms/帧（三种编码器
+    # 全废），把整条流水线从 55fps 拖到 12~18fps，而且 tile/yolo 一起变慢 3~4 倍——CPU 被编码
+    # 器抢光。抽帧是这台机器上唯一不换硬件就能同时留住高帧率和录像的办法：60Hz + every 2 =
+    # 30Hz 视频，编码负载与 0905（32fps 全录）相同，黑标测量的窗口密度也一样。
+    # 帧号映射天生兼容：video_frame_idx 是按实际写入顺序 enumerate 出来的，没写的帧不带这个键。
+    video_write_every_frames = max(
+        int(video_output_cfg.get("write_every_frames", 1)), 1
+    )
     video_path = output_dir / f"{run_id}{_video_container_suffix(video_output_codec)}"
     post_run_cfg = tracker_cfg.get("post_run", {})
     post_run_enabled = bool(post_run_cfg.get("enabled", True)) and save_logs
@@ -2417,8 +2440,13 @@ def main() -> int:
         img_sample = frame_to_numpy(first_frames[cam_serials[0]])
         frame_h, frame_w = img_sample.shape[:2]
         n_cams = len(cam_serials)
+        # 拼接尺寸要按真实网格算：写线程用的是 (half_w*cols, half_h*rows)。原来写死成
+        # 「一行 n_cams 列」，四相机 2x2 下会报出 4096x464 这种根本不存在的分辨率，
+        # 正好误导「视频编码有多贵」的判断。
+        _grid_cols, _grid_rows = _grid_dimensions(n_cams, cols=2)
         print(f"  单帧分辨率: {frame_w}x{frame_h}, "
-              f"视频输出分辨率: {frame_w // 2 * n_cams}x{frame_h // 2}")
+              f"视频输出分辨率: {frame_w // 2 * _grid_cols}x{frame_h // 2 * _grid_rows} "
+              f"({_grid_cols}x{_grid_rows} 网格)")
 
         # 初始化分片管理器
         tile_mgr = TileManager(
@@ -2475,7 +2503,8 @@ def main() -> int:
         if not args.no_video:
             writer_thread = VideoWriterThread(
                 str(video_path), frame_w, frame_h,
-                n_cams=n_cams, fps=capture_fps,
+                # 抽帧时 mp4 头里的 fps 要是「实际写入」的速率，否则回放速度不对
+                n_cams=n_cams, fps=capture_fps / video_write_every_frames,
                 codec=video_output_codec,
                 backend=video_output_backend,
                 prefer_hw_accel=video_output_hw_accel,
@@ -2601,7 +2630,7 @@ def main() -> int:
                                     status="dropped",
                                 ))
 
-                        if writer_thread is not None:
+                        if writer_thread is not None and job.video_sampled:
                             writer_thread.submit(WriteJob(
                                 images=images,
                                 serials=cam_serials,
@@ -2737,10 +2766,16 @@ def main() -> int:
                 _t_decode_sum += _t1 - _t0
 
                 # 全图线与 GPU 推理并行，不进入 YOLO 关键路径。
+                # video_sampled=False 的帧不进视频，全图也就没人要——连解码一起省掉。
+                video_sampled = (
+                    writer_thread is not None
+                    and (frame_idx % video_write_every_frames) == 0
+                )
                 if _full_job_queue is not None and (
-                    writer_thread is not None or car_loc_sampled
+                    video_sampled or car_loc_sampled
                 ):
                     full_job = FullFrameJob(
+                        video_sampled=video_sampled,
                         frames=frames,
                         frame_idx=frame_idx,
                         exposure_pc=exposure_pc,
@@ -3060,6 +3095,8 @@ def main() -> int:
                 "requested_codec": video_output_codec,
                 "requested_backend": video_output_backend,
                 "requested_hw_accel": video_output_hw_accel,
+                # 每 N 帧写一帧；报告端读它才知道视频帧率不等于采集帧率
+                "write_every_frames": video_write_every_frames,
                 "codec": (
                     writer_thread.actual_codec
                     if writer_thread is not None
@@ -3110,6 +3147,10 @@ def main() -> int:
             "end_to_end_duration_s": round(total_elapsed, 3),
             "timeouts": timeout_count,
             "capture_queue_dropped": _capture_drop_count,
+            # 取帧链丢帧归因：trigger.issued 是实际发出的触发数，capture.missing 是
+            # 相机 nFrameNum 缺口（触发被拒/传输丢），overwritten 是主机来不及消费。
+            # actual_fps 低于 cfg fps 时先看这三个数落在哪一段。
+            "capture": cap.stats(),
             "observations_3d": len(log_observations),
             "predictions": len(log_predictions),
             "car_locs": len(log_car_locs),
@@ -3214,6 +3255,25 @@ def main() -> int:
         f"qmax={_full_queue_max_size}"
     )
     print(f"  采集异步线: dropped={_capture_drop_count}")
+    _cap_stats = cap.stats()
+    _trig = _cap_stats.get("trigger")
+    if _trig is not None:
+        print(
+            "  触发环:     "
+            f"issued={_trig['issued']}  skipped_slots={_trig['skipped_slots']}  "
+            f"max_late={_trig['max_late_ms']:.1f}ms"
+        )
+    # 丢帧归因：issued 是发出的触发数，missing 是相机 nFrameNum 缺口（触发被拒/线上丢），
+    # overwritten 是主机来不及消费。实际帧率低于 cfg 时先看这一行落在哪一段。
+    print(
+        "  取帧丢失:   "
+        f"received={_cap_stats['received']}  missing={_cap_stats['missing']}  "
+        f"lost_packets={_cap_stats['lost_packets']}  "
+        f"overwritten={_cap_stats['overwritten']}  "
+        f"exp_spread={_cap_stats['exposure_spread_discards']}  "
+        f"arr_spread={_cap_stats['arrival_spread_discards']}  "
+        f"timeouts={_cap_stats['assembly_timeouts']}"
+    )
     print(
         "  YOLO批量:   "
         f"engine_batch={engine_batch}  "

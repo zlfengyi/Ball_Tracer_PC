@@ -50,13 +50,14 @@
     },
     "car_localizer": {
         "enabled": true,
-        "sample_every_frames": 1,
+        "sample_every_frames": 2,
         "disabled_serials": []
     },
     "video_output": {
         "codec": "avc1",
         "backend": "auto",
-        "hw_accel": true
+        "hw_accel": true,
+        "write_every_frames": 1
     },
     "post_run": {
         "enabled": true,
