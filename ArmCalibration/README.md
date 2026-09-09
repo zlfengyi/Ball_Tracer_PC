@@ -2,6 +2,28 @@
 
 机械臂校准子项目。第 15 步已经完成，当前正式流程固定为 `15.2 -> 15.3 -> 15.4/15.5 -> 15.6`，不再使用早期的棋盘/旧 POE 原型。
 
+## V04 球拍甜点 40 点映射
+
+入口只有一个：
+
+```powershell
+# 默认只生成并校验 40 点，不连接 ROS、不打开相机、不动机械臂
+.\ArmCalibration\run_v04_sweet_spot_map.ps1
+
+# 现场执行；仍须通过源码、ROS 图、车型、停稳、限位和视觉质量联锁
+.\ArmCalibration\run_v04_sweet_spot_map.ps1 -Execute
+```
+
+流程固定为：读取 `D:\arm_controller-unify` 的 V04 YAML 与解析 IK，生成均匀 `8 x 5` 高位网格；每条面板命令都显式携带六轴目标，但只有 J2-J4 改变，J1/J5/J6 始终命令为零。IK 点只使用实测限位的 65%，整条 web_panel 三次轨迹逐点验证在 70% 内，并检查速度及保守球拍/地面包络。每点用真实 `/joint_states` 的 header 推进、目标误差、位置窗口和速度共同确认停稳，再用 18F 四台 action-trigger 相机同步连拍。黑点必须通过四目完整畸变重投影、逐相机剔除和 burst 三维散布门；首点还必须人工确认四张图里的红圈确为甜点，随后锁定球拍局部偏移。最终输出 `joints_to_sweet_spot.csv`，其中是曝光时实测的 J1-J6 和对应甜点三维值。
+
+现场执行不会无条件发 `zero`：机械臂必须先由操作者置于并停稳在六轴零位。采集期间使用 web_panel calibration session 独占锁；任一异常会用新的六轴全零面板轨迹原子替换旧轨迹，真实停稳后才释放锁。若自动回零失败，会把 `session.json` 标为 `unsafe` 并以非零状态退出，不会报告 Complete。
+
+当前仍有两个硬阻塞，二者都会在 ROS、相机或运动动作之前停止：
+
+1. `v04.yaml` 明确注明关节限位从 V03 继承、尚未在 V04 实测。必须先量出并更新真实 V04 限位；解析 IK 可达不是机械安全证明。
+2. RK 的 web_panel 必须部署 `control_contract=v04_sweet_spot_v1` 及 `/api/calibration/acquire|release` 独占锁合同；锁内 motor command 必须校验并使用 PC 随命令提交的 `validated_start_deg/validated_start_velocity_deg_s`，保证执行的正是已验证三次曲线。未部署时不允许退化执行。
+3. C++ 主控必须部署 panel-frame 优先并 adopt 成新 hold 的仲裁修复；运行时 `/tennis/config` 的干净 git 版本必须与本机 V04 控制源码一致。
+
 ## 当前结论
 
 - 第 15 步完成时间：`2026-03-22`
