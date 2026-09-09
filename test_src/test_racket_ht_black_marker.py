@@ -3,9 +3,15 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 
-from racket_ht_black_marker import _measurement_context
+from racket_ht_black_marker import (
+    CameraModel,
+    NothingToMeasure,
+    _grid_panels,
+    _measurement_context,
+)
 
 
 SERIALS = ["cam0", "cam1", "cam2", "cam3"]
@@ -133,6 +139,29 @@ def test_measurement_context_rejects_old_visual_contract(tmp_path: Path):
         _measurement_context(*paths)
 
 
+def test_measurement_context_skips_a_session_without_throws(tmp_path: Path):
+    """0 抛的场次（RK 没发过 /predict_hit_pos）只是没东西可测，不是报告不可信。
+
+    报告页对空场次也发 contract（rows=[]），所以这里能和"合同缺失=报告代码太旧"分开：
+    前者跳过让后处理继续，后者必须报错。对齐质量此时不参与判定。
+    """
+    paths = _write_inputs(tmp_path, align_err=0.5)
+    payload = json.loads(paths[-1].read_text(encoding="utf-8"))
+    payload["arm_contract"]["rows"] = []
+    paths[-1].write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(NothingToMeasure):
+        _measurement_context(*paths)
+
+
+def test_measurement_context_still_rejects_a_missing_contract(tmp_path: Path):
+    paths = _write_inputs(tmp_path)
+    payload = json.loads(paths[-1].read_text(encoding="utf-8"))
+    payload["arm_contract"] = None
+    paths[-1].write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="arm_final_ht/v4"):
+        _measurement_context(*paths)
+
+
 @pytest.mark.parametrize(
     ("align_err", "tab_errors"),
     [(0.081, None), (0.01, ["sw(5): failed"])],
@@ -143,3 +172,49 @@ def test_measurement_context_rejects_untrusted_report(
     paths = _write_inputs(tmp_path, align_err=align_err, tab_errors=tab_errors)
     with pytest.raises(ValueError):
         _measurement_context(*paths)
+
+
+def _camera(image_size: tuple[int, int]) -> CameraModel:
+    return CameraModel(
+        serial="cam",
+        K=np.eye(3),
+        D=np.zeros(5),
+        R=np.eye(3),
+        t=np.zeros(3),
+        rvec=np.zeros(3),
+        P=np.zeros((3, 4)),
+        image_size=image_size,
+    )
+
+
+@pytest.mark.parametrize("frame_size", [(2048, 1536), (2048, 1304)])
+def test_grid_panels_restore_the_captured_frame_not_the_calibrated_height(frame_size):
+    """A bottom-cropped sensor ROI must not be stretched back to the calib height.
+
+    camera_18.json roi_height shortened the capture to 1304 rows while the
+    calibration still records 1536; restoring panels to the calibrated size
+    scaled every row by 1.178 and shifted projected anchors ~0.18*v px.
+    """
+    width, height = frame_size
+    grid = np.zeros((height, width, 3), dtype=np.uint8)
+    # one bright pixel per quadrant, at a known place inside each panel
+    for index in range(4):
+        x = (index % 2) * (width // 2) + 100
+        y = (index // 2) * (height // 2) + 200
+        grid[y, x] = (0, 0, 255)
+    cameras = {serial: _camera((2048, 1536)) for serial in SERIALS}
+    panels = _grid_panels(grid, SERIALS, cameras)
+    for serial in SERIALS:
+        panel = panels[serial]
+        assert panel.shape[:2] == (height, width)
+        ys, xs = np.nonzero(panel[:, :, 2])
+        # half-scale panel restored by exactly 2x: (100, 200) -> (200, 400)
+        assert int(round(xs.mean())) == pytest.approx(200, abs=2)
+        assert int(round(ys.mean())) == pytest.approx(400, abs=2)
+
+
+def test_grid_panels_reject_a_video_that_is_not_a_roi_of_the_calibrated_frame():
+    grid = np.zeros((1304, 1600, 3), dtype=np.uint8)
+    cameras = {serial: _camera((2048, 1536)) for serial in SERIALS}
+    with pytest.raises(ValueError, match="bottom-cropped ROI"):
+        _grid_panels(grid, SERIALS, cameras)

@@ -16,7 +16,10 @@ import numpy as np
 from scipy.optimize import least_squares
 
 
-FRAME_RADIUS = 4
+# Scan the whole pre-HT approach (park + swing start at ~ht-270ms) plus the
+# contact neighbourhood, so every throw carries its racket trajectory before ht.
+PRE_WINDOW_S = 0.45
+POST_WINDOW_S = 0.12
 MARKER_ROI_RADIUS_PX = 250
 MARKER_CANDIDATES_PER_CAMERA = 12
 MARKER_ASSOCIATION_PX = 20.0
@@ -26,8 +29,24 @@ MARKER_MAX_HELDOUT_PX = 6.0
 # Automatic post-run measurement has no human overlay review. 110 mm retains the
 # validated marker in recent sessions while rejecting the known racket-rim alias.
 MARKER_MAX_EXPECTED_DISTANCE_MM = 110.0
+# Three-camera and trajectory-anchored recoveries carry weaker geometry, so they
+# only accept fits much closer to their anchor (validated on 20260901_115811:
+# the worst 3-cam outliers all sat at expected distance 100-106 mm).
+MARKER_MAX_EXPECTED_RECOVERY_MM = 80.0
+# Neighbour visual fits usable as a trajectory anchor: interpolate across at
+# most one missing frame per side; extrapolate at most two frames beyond.
+TRAJ_NEIGHBOR_MAX_SIDE_S = 0.095
+TRAJ_EXTRAP_MAX_S = 0.062
 ARM_STATE_MAX_GAP_S = 0.1
 CAR_LOC_MAX_GAP_S = 0.5
+
+
+class NothingToMeasure(Exception):
+    """报告里一条抛都没有（本场 RK 没发过 /predict_hit_pos）：没有 HT 可测。
+
+    与"合同缺失/对齐不可信"是两回事——那些说明报告本身不能用，必须报错；这里报告是好的，
+    只是这一场没东西可量，后处理应当继续往下走。
+    """
 
 
 @dataclass(frozen=True)
@@ -327,12 +346,13 @@ def _marker_candidates(
     return deduped
 
 
-def _solve_marker_4cam(
+def _solve_marker(
     candidates: dict[str, list[MarkerCandidate]],
     cameras: dict[str, CameraModel],
     expected_xyz_mm: np.ndarray,
+    serials: list[str],
+    max_expected_mm: float,
 ) -> MarkerFit | None:
-    serials = list(cameras)
     if any(not candidates.get(serial) for serial in serials):
         return None
     proposed: dict[tuple[int, ...], float] = {}
@@ -348,7 +368,7 @@ def _solve_marker_4cam(
                         continue
                     if (
                         float(np.linalg.norm(seed - expected_xyz_mm))
-                        > 1.5 * MARKER_MAX_EXPECTED_DISTANCE_MM
+                        > 1.5 * max_expected_mm
                     ):
                         continue
                     choice: list[int] = []
@@ -381,7 +401,7 @@ def _solve_marker_4cam(
         if fit.max_px > MARKER_MAX_REPROJ_PX:
             continue
         expected_distance = float(np.linalg.norm(fit.xyz_mm - expected_xyz_mm))
-        if expected_distance > MARKER_MAX_EXPECTED_DISTANCE_MM:
+        if expected_distance > max_expected_mm:
             continue
         loo_delta: dict[str, float] = {}
         heldout: dict[str, float] = {}
@@ -447,10 +467,32 @@ def _interpolate(
     return result
 
 
+def _interpolate_yaw(rows: list[dict], target: float, max_gap_s: float) -> float | None:
+    """Wrap-aware yaw interpolation over the yaw-valid car rows only.
+
+    Single-tag degraded frames publish yaw=null; requiring yaw on the same rows
+    as position knocked out ~29% of otherwise measurable frames (0901_115811),
+    so yaw interpolates independently across those holes.
+    """
+    times = np.asarray([float(row["elapsed_s"]) for row in rows], dtype=np.float64)
+    right = int(np.searchsorted(times, target))
+    if right <= 0 or right >= len(rows):
+        return None
+    before, after = rows[right - 1], rows[right]
+    span = float(after["elapsed_s"]) - float(before["elapsed_s"])
+    if not (0.0 < span <= max_gap_s):
+        return None
+    fraction = (target - float(before["elapsed_s"])) / span
+    a, b = float(before["yaw"]), float(after["yaw"])
+    delta = math.atan2(math.sin(b - a), math.cos(b - a))
+    return a + fraction * delta
+
+
 def _expected_world_mm(
     pc_elapsed: float,
     arm_states: list[dict],
-    car_locs: list[dict],
+    car_pos_rows: list[dict],
+    car_yaw_rows: list[dict],
     rk_t0: float,
     rk_to_pc_bias: float,
     arm_z_offset_m: float,
@@ -460,12 +502,13 @@ def _expected_world_mm(
         arm_states, rk_absolute, "t", ("tcp",), ARM_STATE_MAX_GAP_S
     )
     car = _interpolate(
-        car_locs, pc_elapsed, "elapsed_s", ("x", "y", "z", "yaw"), CAR_LOC_MAX_GAP_S
+        car_pos_rows, pc_elapsed, "elapsed_s", ("x", "y", "z"), CAR_LOC_MAX_GAP_S
     )
-    if state is None or car is None:
+    yaw = _interpolate_yaw(car_yaw_rows, pc_elapsed, CAR_LOC_MAX_GAP_S)
+    if state is None or car is None or yaw is None:
         return None
     local = np.asarray(state["tcp"], dtype=np.float64)
-    cosine, sine = math.cos(car["yaw"]), math.sin(car["yaw"])
+    cosine, sine = math.cos(yaw), math.sin(yaw)
     relative_world = np.asarray(
         [
             cosine * local[0] - sine * local[1],
@@ -480,19 +523,120 @@ def _expected_world_mm(
     )
 
 
+def _traj_predict(
+    fits: list[tuple[float, np.ndarray]], t: float
+) -> np.ndarray | None:
+    """Predict the marker position from neighbouring accepted visual fits.
+
+    Interpolates across at most ~3 frames total, or linearly extrapolates at
+    most two frames beyond the nearest same-side pair. The prediction is only a
+    search anchor; geometric gates still decide acceptance.
+    """
+    before = [f for f in fits if f[0] < t]
+    after = [f for f in fits if f[0] > t]
+    if (
+        before
+        and after
+        and t - before[-1][0] <= TRAJ_NEIGHBOR_MAX_SIDE_S
+        and after[0][0] - t <= TRAJ_NEIGHBOR_MAX_SIDE_S
+    ):
+        a, b = before[-1], after[0]
+        fraction = (t - a[0]) / (b[0] - a[0])
+        return a[1] + fraction * (b[1] - a[1])
+    if (
+        len(before) >= 2
+        and t - before[-1][0] <= TRAJ_EXTRAP_MAX_S
+        and before[-1][0] - before[-2][0] <= TRAJ_NEIGHBOR_MAX_SIDE_S
+    ):
+        a, b = before[-2], before[-1]
+        velocity = (b[1] - a[1]) / (b[0] - a[0])
+        return b[1] + velocity * (t - b[0])
+    if (
+        len(after) >= 2
+        and after[0][0] - t <= TRAJ_EXTRAP_MAX_S
+        and after[1][0] - after[0][0] <= TRAJ_NEIGHBOR_MAX_SIDE_S
+    ):
+        a, b = after[0], after[1]
+        velocity = (b[1] - a[1]) / (b[0] - a[0])
+        return a[1] - velocity * (a[0] - t)
+    return None
+
+
+def _attempt_solve(
+    candidates: dict[str, list[MarkerCandidate]],
+    cameras: dict[str, CameraModel],
+    serials: list[str],
+    fk_expected: np.ndarray | None,
+    traj_expected: np.ndarray | None,
+) -> tuple[MarkerFit, int, str, str | None] | None:
+    """Acceptance ladder: 4-cam/FK, 4-cam/traj, then 3-cam per anchor."""
+    if fk_expected is not None:
+        fit = _solve_marker(
+            candidates, cameras, fk_expected, serials, MARKER_MAX_EXPECTED_DISTANCE_MM
+        )
+        if fit is not None:
+            return fit, 4, "fk", None
+    if traj_expected is not None:
+        fit = _solve_marker(
+            candidates, cameras, traj_expected, serials, MARKER_MAX_EXPECTED_RECOVERY_MM
+        )
+        if fit is not None:
+            return fit, 4, "traj", None
+    for anchor_name, expected in (("fk", fk_expected), ("traj", traj_expected)):
+        if expected is None:
+            continue
+        best: tuple[tuple[float, float], str, MarkerFit] | None = None
+        for dropped in serials:
+            subset = [serial for serial in serials if serial != dropped]
+            fit = _solve_marker(
+                candidates, cameras, expected, subset, MARKER_MAX_EXPECTED_RECOVERY_MM
+            )
+            if fit is None:
+                continue
+            rank = (fit.expected_distance_mm, fit.point.rms_px)
+            if best is None or rank < best[0]:
+                best = (rank, dropped, fit)
+        if best is not None:
+            return best[2], 3, anchor_name, best[1]
+    return None
+
+
 def _grid_panels(
     image: np.ndarray, serials: list[str], cameras: dict[str, CameraModel]
 ) -> dict[str, np.ndarray]:
+    """Undo the 2x2 mosaic: each panel is one captured frame at half scale.
+
+    The writer tiles ``frame_w//2 x frame_h//2`` copies, so a panel restores by
+    exactly 2x — the same rule as ``annotate_video.scale_panel_to_full``. Do NOT
+    restore to the calibration's ``image_size``: with a bottom-cropped sensor ROI
+    (``camera_18.json roi_height``, OffsetY pinned to 0) the capture is shorter
+    than the calibrated full frame, and stretching it back to the calibrated
+    height scales every row by height_calib/height_capture. 2026-09-05 that ratio
+    was 1536/1304 = 1.178, which put every projected anchor ~0.18*v px above its
+    real feature (75-120 px) and left the marker untriangulable: sessions from
+    20260905_201401 on measured 1-10% of frames, against 87-93% before the ROI.
+    The intrinsics stay valid on the shorter frame because only bottom rows are
+    dropped, so pixel coordinates are unchanged.
+    """
     if image.shape[0] % 2 or image.shape[1] % 2:
         raise ValueError(f"unexpected grid video shape {image.shape[:2]}")
     half_height, half_width = image.shape[0] // 2, image.shape[1] // 2
+    frame_height, frame_width = half_height * 2, half_width * 2
+    for serial in serials:
+        calib_width, calib_height = cameras[serial].image_size
+        if calib_width != frame_width or not 0 < frame_height <= calib_height:
+            raise ValueError(
+                f"grid panels restore to {frame_width}x{frame_height}, which is not "
+                f"the calibrated {serial} frame {calib_width}x{calib_height} nor a "
+                "bottom-cropped ROI of it"
+            )
     panels: dict[str, np.ndarray] = {}
     for index, serial in enumerate(serials):
         x = (index % 2) * half_width
         y = (index // 2) * half_height
         panel = image[y : y + half_height, x : x + half_width]
         panels[serial] = cv2.resize(
-            panel, cameras[serial].image_size, interpolation=cv2.INTER_LINEAR
+            panel, (frame_width, frame_height), interpolation=cv2.INTER_LINEAR
         )
     return panels
 
@@ -533,6 +677,12 @@ def _measurement_context(
 
     if tables.get("script_error") or tables.get("tab_errors"):
         raise ValueError("report page snapshot did not complete cleanly")
+    contract = tables.get("arm_contract") or {}
+    if contract.get("schema") != "arm_final_ht/v4":
+        raise ValueError("report tables lack arm_final_ht/v4 contract")
+    if not contract.get("rows"):
+        # 报告一行都没有 = 本场没有抛；对齐质量此时无从谈起，也无关紧要。
+        raise NothingToMeasure("report has no throws")
     align = tables.get("align") or {}
     auto = align.get("auto") or {}
     required_points = 30 if auto.get("windowSource") == "scan" else 15
@@ -557,9 +707,6 @@ def _measurement_context(
     if not _finite(time_map.get("bias")):
         raise ValueError("report time map has no finite bias")
     baseline_bias = float(time_map["bias"])
-    contract = tables.get("arm_contract") or {}
-    if contract.get("schema") != "arm_final_ht/v4":
-        raise ValueError("report tables lack arm_final_ht/v4 contract")
     phase_policy = contract.get("zPhasePolicy") or {}
     if (
         phase_policy.get("appliesTo") != "all_pc_sampling"
@@ -650,121 +797,219 @@ def measure(
         [row for row in tracker.get("car_locs", []) if _finite(row.get("elapsed_s"))],
         key=lambda row: float(row["elapsed_s"]),
     )
-    if not frames or not arm_states or not car_locs:
+    car_pos_rows = [
+        row
+        for row in car_locs
+        if all(_finite(row.get(key)) for key in ("x", "y", "z"))
+    ]
+    car_yaw_rows = [row for row in car_locs if _finite(row.get("yaw"))]
+    if not frames or not arm_states or not car_pos_rows or not car_yaw_rows:
         raise ValueError("session lacks video frames, arm states, or car locations")
 
+    rk_t0 = float(rk["t0"])
     windows: list[tuple[dict, list[dict]]] = []
     for target in targets:
-        ht_absolute_pc = tracker_t0 + target["final_ht_pc_elapsed_s"]
-        center = min(
-            range(len(frames)),
-            key=lambda index: abs(
-                float(frames[index]["exposure_pc"])
+        items = [
+            frame
+            for frame in frames
+            if -PRE_WINDOW_S
+            <= (
+                float(frame["exposure_pc"])
                 + exposure_center_offset_s
-                - ht_absolute_pc
-            ),
-        )
-        windows.append(
-            (
-                target,
-                frames[
-                    max(0, center - FRAME_RADIUS) :
-                    min(len(frames), center + FRAME_RADIUS + 1)
-                ],
+                - tracker_t0
+                - target["final_ht_pc_elapsed_s"]
             )
-        )
+            <= POST_WINDOW_S
+        ]
+        if items:
+            windows.append((target, items))
 
     print(
         f"[racket] scan {len(targets)} report rows / "
-        f"{sum(len(items) for _, items in windows)} HT-neighbour frames",
+        f"{sum(len(items) for _, items in windows)} frames "
+        f"(ht{-PRE_WINDOW_S:+.2f}s..{POST_WINDOW_S:+.2f}s)",
         flush=True,
     )
+
+    # jobs[row][video_index] = per-frame state carried across the passes
+    jobs: list[dict] = []
+    for target, target_frames in windows:
+        for frame in target_frames:
+            center_abs_pc = float(frame["exposure_pc"]) + exposure_center_offset_s
+            center_elapsed = center_abs_pc - tracker_t0
+            jobs.append(
+                {
+                    "target": target,
+                    "frame": frame,
+                    "video_index": int(frame["video_frame_idx"]),
+                    "center_abs_pc": center_abs_pc,
+                    "center_elapsed": center_elapsed,
+                    "fk_expected": _expected_world_mm(
+                        center_elapsed,
+                        arm_states,
+                        car_pos_rows,
+                        car_yaw_rows,
+                        rk_t0,
+                        target["rk_to_pc_bias_s"],
+                        z_offset,
+                    ),
+                    "candidates": None,
+                    "accepted": None,
+                }
+            )
+
+    video_position: list[int | None] = [None]
+    decoded_count = [0]
+
+    def read_frames(capture: cv2.VideoCapture, wanted: list[dict]) -> None:
+        position = video_position[0]
+        for job in sorted(wanted, key=lambda item: item["video_index"]):
+            decoded_count[0] += 1
+            if decoded_count[0] % 60 == 0:
+                print(f"[racket] decoded {decoded_count[0]} frames", flush=True)
+            video_index = job["video_index"]
+            if position is None or video_index < position or video_index - position > 60:
+                if not capture.set(cv2.CAP_PROP_POS_FRAMES, video_index):
+                    raise RuntimeError(f"could not seek to video frame {video_index}")
+                actual_position = capture.get(cv2.CAP_PROP_POS_FRAMES)
+                if abs(actual_position - video_index) > 0.5:
+                    raise RuntimeError(
+                        f"video seek landed at {actual_position}, expected {video_index}"
+                    )
+                position = video_index
+            while position < video_index:
+                if not capture.grab():
+                    raise RuntimeError(f"could not decode through video frame {position}")
+                position += 1
+            ok, image = capture.read()
+            if not ok:
+                raise RuntimeError(f"could not read video frame {video_index}")
+            position = video_index + 1
+            panels = _grid_panels(image, serials, cameras)
+            anchor = (
+                job["fk_expected"]
+                if job["fk_expected"] is not None
+                else job.get("traj_expected")
+            )
+            anchors = {
+                serial: _project_raw(cameras[serial], anchor) for serial in serials
+            }
+            job["candidates"] = {
+                serial: _marker_candidates(panels[serial], tuple(anchors[serial]))
+                for serial in serials
+            }
+        video_position[0] = position
+
+    def accept(job: dict, solved: tuple[MarkerFit, int, str, str | None]) -> None:
+        fit, n_cam, anchor_name, dropped = solved
+        dt_ms = 1000.0 * (
+            job["center_elapsed"] - job["target"]["final_ht_pc_elapsed_s"]
+        )
+        observation = {
+            "x": float(fit.point.xyz_mm[0] / 1000.0),
+            "y": float(fit.point.xyz_mm[1] / 1000.0),
+            "z": float(fit.point.xyz_mm[2] / 1000.0),
+            "t": job["center_abs_pc"],
+            "elapsed_s": job["center_elapsed"],
+            "frame_idx": int(job["frame"]["idx"]),
+            "video_frame_idx": job["video_index"],
+            "report_row": job["target"]["report_row"],
+            "final_ht_pc_elapsed_s": job["target"]["final_ht_pc_elapsed_s"],
+            "dt_ht_ms": dt_ms,
+            "ht_side": "before" if dt_ms < 0.0 else "after",
+            "n_cam": n_cam,
+            "anchor": anchor_name,
+            "reproj_err": fit.point.rms_px,
+            "reproj_max_px": fit.point.max_px,
+            "loo_max_mm": max(fit.loo_delta_mm.values()),
+            "heldout_max_px": max(fit.loo_heldout_px.values()),
+            "expected_distance_mm": fit.expected_distance_mm,
+            "black_marker": True,
+        }
+        if dropped is not None:
+            observation["dropped_serial"] = dropped
+        job["accepted"] = observation
+
+    def row_fits(report_row: int) -> list[tuple[float, np.ndarray]]:
+        fits = [
+            (
+                job["center_elapsed"],
+                np.asarray(
+                    [
+                        job["accepted"]["x"],
+                        job["accepted"]["y"],
+                        job["accepted"]["z"],
+                    ],
+                    dtype=np.float64,
+                )
+                * 1000.0,
+            )
+            for job in jobs
+            if job["accepted"] is not None
+            and job["target"]["report_row"] == report_row
+        ]
+        return sorted(fits, key=lambda item: item[0])
 
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         raise RuntimeError(f"could not open video {video_path}")
-    observations: list[dict] = []
-    attempted = 0
     try:
-        for target, target_frames in windows:
-            first_video_index = int(target_frames[0]["video_frame_idx"])
-            if not capture.set(cv2.CAP_PROP_POS_FRAMES, first_video_index):
-                raise RuntimeError(f"could not seek to video frame {first_video_index}")
-            actual_position = capture.get(cv2.CAP_PROP_POS_FRAMES)
-            if abs(actual_position - first_video_index) > 0.5:
-                raise RuntimeError(
-                    f"video seek landed at {actual_position}, expected {first_video_index}"
-                )
-            video_position = first_video_index
-            row_observations_before = len(observations)
-            for frame in target_frames:
-                video_index = int(frame["video_frame_idx"])
-                while video_position < video_index:
-                    if not capture.grab():
-                        raise RuntimeError(
-                            f"could not decode through video frame {video_position}"
-                        )
-                    video_position += 1
-                ok, image = capture.read()
-                if not ok:
-                    raise RuntimeError(f"could not read video frame {video_index}")
-                video_position += 1
-                panels = _grid_panels(image, serials, cameras)
-                attempted += 1
-                center_abs_pc = float(frame["exposure_pc"]) + exposure_center_offset_s
-                center_elapsed = center_abs_pc - tracker_t0
-                expected_mm = _expected_world_mm(
-                    center_elapsed,
-                    arm_states,
-                    car_locs,
-                    float(rk["t0"]),
-                    target["rk_to_pc_bias_s"],
-                    z_offset,
-                )
-                if expected_mm is None:
-                    continue
-                anchors = {
-                    serial: _project_raw(cameras[serial], expected_mm) for serial in serials
-                }
-                candidates = {
-                    serial: _marker_candidates(panels[serial], tuple(anchors[serial]))
-                    for serial in serials
-                }
-                fit = _solve_marker_4cam(candidates, cameras, expected_mm)
-                if fit is None:
-                    continue
-                dt_ms = 1000.0 * (
-                    center_elapsed - target["final_ht_pc_elapsed_s"]
-                )
-                observations.append(
-                    {
-                        "x": float(fit.point.xyz_mm[0] / 1000.0),
-                        "y": float(fit.point.xyz_mm[1] / 1000.0),
-                        "z": float(fit.point.xyz_mm[2] / 1000.0),
-                        "t": center_abs_pc,
-                        "elapsed_s": center_elapsed,
-                        "frame_idx": int(frame["idx"]),
-                        "video_frame_idx": video_index,
-                        "report_row": target["report_row"],
-                        "final_ht_pc_elapsed_s": target["final_ht_pc_elapsed_s"],
-                        "dt_ht_ms": dt_ms,
-                        "ht_side": "before" if dt_ms < 0.0 else "after",
-                        "n_cam": 4,
-                        "reproj_err": fit.point.rms_px,
-                        "reproj_max_px": fit.point.max_px,
-                        "loo_max_mm": max(fit.loo_delta_mm.values()),
-                        "heldout_max_px": max(fit.loo_heldout_px.values()),
-                        "expected_distance_mm": fit.expected_distance_mm,
-                        "black_marker": True,
-                    }
-                )
-            print(
-                f"[racket] row {target['report_row']}: "
-                f"{len(observations) - row_observations_before}/{len(target_frames)} frames",
-                flush=True,
+        # Pass 1: decode every frame that has an FK anchor; solve against it.
+        anchored = [job for job in jobs if job["fk_expected"] is not None]
+        read_frames(capture, anchored)
+        for job in anchored:
+            solved = _attempt_solve(
+                job["candidates"], cameras, serials, job["fk_expected"], None
             )
+            if solved is not None:
+                accept(job, solved)
+
+        # Pass 2: chain neighbour fits as trajectory anchors. Candidate-bearing
+        # frames retry without video; anchorless frames (car-loc holes) decode
+        # on demand once a trajectory anchor exists. The FK ladder already ran
+        # in pass 1, so pass 2 solves against the trajectory anchor only, and
+        # skips a frame whose anchor has not moved since its last attempt.
+        for _ in range(6):
+            progress = False
+            for job in jobs:
+                if job["accepted"] is not None:
+                    continue
+                traj = _traj_predict(
+                    row_fits(job["target"]["report_row"]), job["center_elapsed"]
+                )
+                if traj is None:
+                    continue
+                tried = job.get("traj_tried_mm")
+                if tried is not None and float(np.linalg.norm(traj - tried)) < 2.0:
+                    continue
+                job["traj_expected"] = traj
+                job["traj_tried_mm"] = traj
+                if job["candidates"] is None:
+                    read_frames(capture, [job])
+                solved = _attempt_solve(
+                    job["candidates"], cameras, serials, None, traj
+                )
+                if solved is not None:
+                    accept(job, solved)
+                    progress = True
+            if not progress:
+                break
     finally:
         capture.release()
+
+    observations = [job["accepted"] for job in jobs if job["accepted"] is not None]
+    attempted = sum(1 for job in jobs if job["candidates"] is not None)
+    for target, target_frames in windows:
+        row_accepted = sum(
+            1
+            for job in jobs
+            if job["accepted"] is not None and job["target"] is target
+        )
+        print(
+            f"[racket] row {target['report_row']}: "
+            f"{row_accepted}/{len(target_frames)} frames",
+            flush=True,
+        )
 
     observations.sort(key=lambda row: (row["t"], row["report_row"]))
     rows_with_observations = {row["report_row"] for row in observations}
@@ -773,6 +1018,8 @@ def measure(
         f"[racket] fixed black marker: {len(observations)}/{attempted} frames, "
         f"{len(rows_with_observations)}/{len(targets)} report rows, {elapsed:.1f}s"
     )
+    n_traj = sum(1 for row in observations if row.get("anchor") == "traj")
+    n_3cam = sum(1 for row in observations if row.get("n_cam") == 3)
     return {
         "config": {
             "measurement": "V04 fixed black marker center",
@@ -781,22 +1028,27 @@ def measure(
                 f"{exposure_center_offset_s * 1000.0:.3f} ms"
             ),
             "selection": (
-                f"+/-{FRAME_RADIUS} video frames around each report raw final HT "
-                "+ per-throw zPhase; "
-                f"four cameras; max reprojection {MARKER_MAX_REPROJ_PX:g} px; "
+                f"video frames from report raw final HT {-PRE_WINDOW_S:g}s to "
+                f"{POST_WINDOW_S:+g}s (per-throw zPhase applied); "
+                f"max reprojection {MARKER_MAX_REPROJ_PX:g} px; "
                 f"leave-one-out < {MARKER_MAX_LOO_MM:g} mm; held-out <= "
-                f"{MARKER_MAX_HELDOUT_PX:g} px; FK search distance <= "
-                f"{MARKER_MAX_EXPECTED_DISTANCE_MM:g} mm"
+                f"{MARKER_MAX_HELDOUT_PX:g} px; 4-cam FK search distance <= "
+                f"{MARKER_MAX_EXPECTED_DISTANCE_MM:g} mm; 3-cam and "
+                "neighbour-trajectory-anchored recoveries <= "
+                f"{MARKER_MAX_EXPECTED_RECOVERY_MM:g} mm (rows carry n_cam/anchor"
+                "/dropped_serial provenance)"
             ),
             "coordinate": (
-                "four-camera marker world position; report subtracts visual car "
+                "multi-camera marker world position; report subtracts visual car "
                 "center on field world axes"
             ),
         },
         "summary": {
             "racket_observations_3d": len(observations),
             "racket_frames_processed": attempted,
-            "racket_min_cams": 4,
+            "racket_min_cams": 3,
+            "racket_obs_traj_anchor": n_traj,
+            "racket_obs_3cam": n_3cam,
             "report_rows_scanned": len(targets),
             "report_rows_with_observations": len(rows_with_observations),
         },
@@ -813,13 +1065,18 @@ def main() -> int:
     parser.add_argument("--tables-json", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    payload = measure(
-        args.input,
-        args.video,
-        args.arm_json,
-        args.rk_tracking_json,
-        args.tables_json,
-    )
+    try:
+        payload = measure(
+            args.input,
+            args.video,
+            args.arm_json,
+            args.rk_tracking_json,
+            args.tables_json,
+        )
+    except NothingToMeasure as exc:
+        # 不写 --output：调用方（run_tracker 后处理）据此知道本场没有视觉拍心可合入报告。
+        print(f"[racket] skip fixed black marker: {exc}")
+        return 0
     args.output.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
     )
